@@ -20,7 +20,7 @@ from dotenv import load_dotenv
 
 from bot import (
     KalshiBot, KalshiClient, load_private_key, load_trades, POLL_INTERVAL,
-    resolve_trades, start_keep_alive,
+    resolve_trades, start_keep_alive, rebuild_trades_from_api,
 )
 
 load_dotenv()
@@ -193,6 +193,13 @@ def _bot_thread():
     try:
         pkey   = load_private_key(key_path)
         client = KalshiClient(api_key_id, pkey, dry_run=dry_run)
+
+        # Rebuild trade log from Kalshi API (survives Render redeploys)
+        try:
+            rebuild_trades_from_api(client)
+        except Exception as e:
+            print(f"[bot] Trade rebuild warning: {e}", flush=True)
+
         _bot   = KalshiBot(client, lag_stake, con_stake, daily_lim, dry_run)
         print("[bot] Bot initialized â warming up BTC price feed...", flush=True)
 

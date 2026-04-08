@@ -306,6 +306,156 @@ class BTCPriceFeed:
 # TRADE LOG
 # âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 
+
+def rebuild_trades_from_api(client):
+    """
+    Pull fill & settlement history from Kalshi API and rebuild bot_trades.json.
+    Called on startup so deploys never lose trade history.
+
+    - GET /portfolio/fills  -> every matched trade
+    - GET /portfolio/settlements -> market outcomes + revenue
+    - Cross-references by ticker to compute result/pnl
+
+    Fills placed outside the bot (manual UI trades) will show strategy="MANUAL".
+    """
+    print("[rebuild] Pulling trade history from Kalshi API...", flush=True)
+
+    # ── Fetch all fills (paginated) filtered to BTC 15-min markets ──────
+    all_fills = []
+    cursor = None
+    while True:
+        params = {"limit": 200}
+        if cursor:
+            params["cursor"] = cursor
+        try:
+            resp = client.get("/portfolio/fills", params=params)
+        except Exception as e:
+            print(f"[rebuild] Error fetching fills: {e}", flush=True)
+            return []
+        fills = resp.get("fills", [])
+        all_fills.extend(fills)
+        cursor = resp.get("cursor")
+        if not cursor or not fills:
+            break
+
+    # Filter to KXBTC15M tickers only
+    btc_fills = [f for f in all_fills if BTC_TICKER in (f.get("ticker", "") or "")]
+    print(f"[rebuild] Found {len(btc_fills)} BTC 15-min fills out of {len(all_fills)} total.", flush=True)
+
+    if not btc_fills:
+        return []
+
+    # ── Fetch settlements (paginated) ───────────────────────────────────
+    all_settlements = []
+    cursor = None
+    while True:
+        params = {"limit": 200}
+        if cursor:
+            params["cursor"] = cursor
+        try:
+            resp = client.get("/portfolio/settlements", params=params)
+        except Exception as e:
+            print(f"[rebuild] Error fetching settlements: {e}", flush=True)
+            break
+        setts = resp.get("settlements", [])
+        all_settlements.extend(setts)
+        cursor = resp.get("cursor")
+        if not cursor or not setts:
+            break
+
+    # Build lookup: ticker -> settlement info
+    settlement_map = {}
+    for s in all_settlements:
+        ticker = s.get("ticker") or s.get("market_ticker", "")
+        if BTC_TICKER in ticker:
+            settlement_map[ticker] = s
+
+    # ── Reconstruct trade records ───────────────────────────────────────
+    # Group fills by order_id to consolidate partial fills
+    from collections import defaultdict
+    orders = defaultdict(list)
+    for f in btc_fills:
+        orders[f.get("order_id", f.get("fill_id", ""))].append(f)
+
+    existing = load_trades()
+    existing_tickers_ts = {
+        (t.get("ticker", ""), t.get("timestamp", "")[:16])
+        for t in existing
+    }
+
+    new_trades = []
+    for order_id, fills in orders.items():
+        # Use first fill for metadata
+        f0 = fills[0]
+        ticker = f0.get("ticker", "")
+        side = f0.get("side", "")  # "yes" or "no"
+        ts = f0.get("created_time") or f0.get("ts", "")
+
+        # Skip if we already have this trade logged
+        if (ticker, ts[:16]) in existing_tickers_ts:
+            continue
+
+        # Aggregate across partial fills
+        total_count = sum(float(fi.get("count_fp", fi.get("count", 0))) for fi in fills)
+        if side == "yes":
+            price_dollars = float(f0.get("yes_price_dollars", 0))
+        else:
+            price_dollars = float(f0.get("no_price_dollars", 0))
+        price_cents = int(round(price_dollars * 100))
+        dollars = round(total_count * price_dollars, 2)
+
+        # Check settlement
+        sett = settlement_map.get(ticker)
+        outcome = None
+        result = None
+        pnl = None
+        if sett:
+            outcome = sett.get("market_result", None)
+            if outcome:
+                won = (side == outcome)
+                result = "WIN" if won else "LOSS"
+                if won and price_dollars > 0:
+                    pnl = round(dollars / price_dollars * (1 - price_dollars), 2)
+                else:
+                    pnl = -round(dollars, 2)
+
+        trade = {
+            "strategy":  "RECOVERED",
+            "ticker":    ticker,
+            "side":      side,
+            "price":     price_cents,
+            "count":     int(total_count) if total_count == int(total_count) else total_count,
+            "dollars":   dollars,
+            "reason":    f"Rebuilt from Kalshi API (order {order_id[:8]}...)",
+            "timestamp": ts,
+            "dry_run":   False,
+            "order":     {"order_id": order_id, "recovered": True},
+            "outcome":   outcome,
+            "result":    result,
+            "pnl":       pnl,
+        }
+        new_trades.append(trade)
+
+    if new_trades:
+        all_trades = existing + new_trades
+        all_trades.sort(key=lambda t: t.get("timestamp", ""))
+        with open(LOG_FILE, "w") as f:
+            json.dump(all_trades, f, indent=2)
+        wins = sum(1 for t in new_trades if t.get("result") == "WIN")
+        losses = sum(1 for t in new_trades if t.get("result") == "LOSS")
+        pending = sum(1 for t in new_trades if not t.get("result"))
+        total_pnl = sum(t.get("pnl", 0) for t in new_trades if t.get("pnl"))
+        print(
+            f"[rebuild] Recovered {len(new_trades)} trades: "
+            f"{wins}W / {losses}L / {pending} pending  |  P&L: ${total_pnl:.2f}",
+            flush=True,
+        )
+    else:
+        print("[rebuild] No new trades to recover (log is up to date).", flush=True)
+
+    return new_trades
+
+
 def load_trades():
     if os.path.exists(LOG_FILE):
         with open(LOG_FILE) as f:
