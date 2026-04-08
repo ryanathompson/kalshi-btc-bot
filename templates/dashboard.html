@@ -241,7 +241,7 @@
       padding: 8px 20px;
       background: rgba(255,255,255,.015);
       border-top: 1px solid var(--border);
-      font-size: 11px;
+  	   font-size: 11px;
       color: var(--muted);
     }
     .info-bar b { color: var(--text); }
@@ -276,6 +276,49 @@
       text-align: right;
       padding: 4px 0;
     }
+
+    /* ── P&L STATS BAR ── */
+    .pnl-bar {
+      display: grid;
+      grid-template-columns: repeat(8, 1fr);
+      gap: 10px;
+    }
+    @media (max-width: 1100px) {
+      .pnl-bar { grid-template-columns: repeat(4, 1fr); }
+    }
+    @media (max-width: 600px) {
+      .pnl-bar { grid-template-columns: repeat(2, 1fr); }
+    }
+    .pnl-cell {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 14px 16px;
+    }
+    .pnl-label {
+      font-size: 10px;
+      font-weight: 600;
+      letter-spacing: .07em;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin-bottom: 6px;
+    }
+    .pnl-value {
+      font-size: 20px;
+      font-weight: 700;
+      color: var(--text);
+      line-height: 1.1;
+    }
+    .pnl-value.pos { color: var(--green); }
+    .pnl-value.neg { color: var(--red); }
+    .pnl-sub {
+      font-size: 11px;
+      color: var(--muted);
+      margin-top: 3px;
+    }
+    .pnl-sub.pos { color: var(--green); }
+    .pnl-sub.neg { color: var(--red); }
+    .pnl-sub .open-lbl { color: var(--blue); }
   </style>
 </head>
 <body>
@@ -302,6 +345,50 @@
   <!-- ERROR / HALT BANNERS -->
   <div id="error-banner"></div>
   <div id="halt-banner"></div>
+
+  <!-- P&L STATS BAR -->
+  <div class="pnl-bar">
+    <div class="pnl-cell">
+      <div class="pnl-label">Trades</div>
+      <div class="pnl-value" id="pnl-trades">—</div>
+      <div class="pnl-sub" id="pnl-trades-sub"></div>
+    </div>
+    <div class="pnl-cell">
+      <div class="pnl-label">Won / Lost</div>
+      <div class="pnl-value" id="pnl-wl">—</div>
+      <div class="pnl-sub" id="pnl-wl-sub"></div>
+    </div>
+    <div class="pnl-cell">
+      <div class="pnl-label">Win Rate</div>
+      <div class="pnl-value" id="pnl-wr">—</div>
+      <div class="pnl-sub" id="pnl-wr-sub"></div>
+    </div>
+    <div class="pnl-cell">
+      <div class="pnl-label">Cost Basis</div>
+      <div class="pnl-value" id="pnl-cost">—</div>
+      <div class="pnl-sub" id="pnl-cost-sub"></div>
+    </div>
+    <div class="pnl-cell">
+      <div class="pnl-label">Open Exposure</div>
+      <div class="pnl-value" id="pnl-open">—</div>
+      <div class="pnl-sub" id="pnl-open-sub"></div>
+    </div>
+    <div class="pnl-cell">
+      <div class="pnl-label">Realized P&amp;L</div>
+      <div class="pnl-value" id="pnl-realized">—</div>
+      <div class="pnl-sub" id="pnl-realized-sub"></div>
+    </div>
+    <div class="pnl-cell">
+      <div class="pnl-label">ROI</div>
+      <div class="pnl-value" id="pnl-roi">—</div>
+      <div class="pnl-sub" id="pnl-roi-sub"></div>
+    </div>
+    <div class="pnl-cell">
+      <div class="pnl-label">Total P&amp;L</div>
+      <div class="pnl-value" id="pnl-total">—</div>
+      <div class="pnl-sub" id="pnl-total-sub"></div>
+    </div>
+  </div>
 
   <!-- STAT CARDS -->
   <div class="cards">
@@ -408,6 +495,88 @@
   }
   function pill(text, cls) {
     return `<span class="pill pill-${cls}">${text}</span>`;
+  }
+
+  function renderPnlBar(d) {
+    const s     = d.all_stats;
+    const opens = d.open_trades || [];
+
+    const totalSettled = s ? s.total   : 0;
+    const openCount    = opens.length;
+    const totalTrades  = totalSettled + openCount;
+    const openExposure = opens.reduce((sum, t) => sum + (t.dollars || 0), 0);
+    const realizedPnl  = s ? s.pnl     : null;
+    const wagered      = s ? s.wagered : null;
+    const roi          = s ? s.roi     : null;
+    const wins         = s ? s.wins    : null;
+    const losses       = s ? s.losses  : null;
+    const wr           = s ? s.wr      : null;
+
+    function set(id, html) { document.getElementById(id).innerHTML = html; }
+    function vcls(id, c)   { document.getElementById(id).className = 'pnl-value ' + c; }
+    function scls(id, c)   { document.getElementById(id).className = 'pnl-sub ' + c; }
+
+    // Trades
+    set('pnl-trades', totalTrades || '—');
+    set('pnl-trades-sub', openCount
+      ? `<span class="open-lbl">${openCount} open</span>`
+      : (totalSettled ? `${totalSettled} settled` : ''));
+
+    // Won / Lost
+    if (wins != null) {
+      set('pnl-wl',
+        `<span style="color:var(--green)">${wins}</span>` +
+        ` / <span style="color:var(--red)">${losses}</span>`);
+      set('pnl-wl-sub', totalSettled ? `${totalSettled} settled` : '');
+    }
+
+    // Win Rate
+    if (wr != null) {
+      vcls('pnl-wr', wr >= 50 ? 'pos' : 'neg');
+      set('pnl-wr', wr + '%');
+      set('pnl-wr-sub', wins + 'W / ' + losses + 'L');
+    }
+
+    // Cost Basis
+    if (wagered != null) {
+      set('pnl-cost', fmt$(wagered));
+      set('pnl-cost-sub', totalSettled + ' settled trades');
+    }
+
+    // Open Exposure
+    if (openCount > 0) {
+      set('pnl-open', fmt$(openExposure));
+      set('pnl-open-sub',
+        `<span class="open-lbl">${openCount} open position${openCount !== 1 ? 's' : ''}</span>`);
+    } else {
+      set('pnl-open', '—');
+      set('pnl-open-sub', 'no open positions');
+    }
+
+    // Realized P&L
+    if (realizedPnl != null) {
+      vcls('pnl-realized', realizedPnl >= 0 ? 'pos' : 'neg');
+      set('pnl-realized', (realizedPnl >= 0 ? '+' : '') + fmt$(realizedPnl));
+      set('pnl-realized-sub', totalSettled + ' settled trades');
+    }
+
+    // ROI
+    if (roi != null) {
+      vcls('pnl-roi', roi >= 0 ? 'pos' : 'neg');
+      set('pnl-roi', (roi >= 0 ? '+' : '') + roi.toFixed(2) + '%');
+      scls('pnl-roi-sub', '');
+      set('pnl-roi-sub', wagered ? 'on ' + fmt$(wagered) : '');
+    }
+
+    // Total P&L
+    if (realizedPnl != null) {
+      vcls('pnl-total', realizedPnl >= 0 ? 'pos' : 'neg');
+      set('pnl-total', (realizedPnl >= 0 ? '+' : '') + fmt$(realizedPnl));
+      scls('pnl-total-sub', realizedPnl >= 0 ? 'pos' : 'neg');
+      set('pnl-total-sub', roi != null
+        ? (roi >= 0 ? '+' : '') + roi.toFixed(1) + '% ROI'
+        : '');
+    }
   }
 
   function renderStats(id, emptyId, data) {
@@ -573,6 +742,9 @@
       } else {
         hb.style.display = 'none';
       }
+
+      // P&L bar
+      renderPnlBar(d);
 
       // Stats cards
       renderStats('lag-stats', 'lag-empty', d.lag_stats);
