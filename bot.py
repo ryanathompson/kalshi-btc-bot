@@ -535,7 +535,13 @@ class RiskManager:
             pass
 
         return True, "OK"
-ass KalshiBot:
+
+
+# ─────────────────────────────────────────────────────────────
+# MAIN BOT LOOP
+# ─────────────────────────────────────────────────────────────
+
+class KalshiBot:
     def __init__(self, client, lag_stake, consensus_stake,
                  daily_loss_limit, dry_run):
         self.client    = client
