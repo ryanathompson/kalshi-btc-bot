@@ -19,7 +19,8 @@ from flask import Flask, render_template, jsonify
 from dotenv import load_dotenv
 
 from bot import (
-    KalshiBot, KalshiClient, load_private_key, load_trades, POLL_INTERVAL
+    KalshiBot, KalshiClient, load_private_key, load_trades, POLL_INTERVAL,
+    resolve_trades,
 )
 
 load_dotenv()
@@ -145,6 +146,20 @@ def api_status():
     })
 
 
+@app.route("/api/resolve", methods=["POST"])
+def api_resolve():
+    """Manually trigger resolve_trades() â useful for debugging stuck trades."""
+    if _bot is None:
+        return jsonify({"error": "Bot not initialized"}), 503
+    try:
+        n = resolve_trades(_bot.client)
+        trades = load_trades()
+        open_count = sum(1 for t in trades if not t.get("result"))
+        return jsonify({"resolved": n, "open_remaining": open_count})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 # âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 # BOT BACKGROUND THREAD
 # âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
@@ -195,6 +210,8 @@ def _bot_thread():
                 time.sleep(5)
         print("[bot] Warmup done â entering main loop", flush=True)
 
+        _last_resolve = 0
+
         while True:
             try:
                 _bot.run_once()
@@ -211,6 +228,16 @@ def _bot_thread():
 
             except Exception as e:
                 _state.error = str(e)
+
+            # Resolve settled trades every 60 s
+            if time.time() - _last_resolve >= 60:
+                try:
+                    n = resolve_trades(_bot.client)
+                    if n:
+                        print(f"[bot] Resolved {n} trade(s).", flush=True)
+                except Exception as re:
+                    print(f"[bot] resolve error: {re}", flush=True)
+                _last_resolve = time.time()
 
             time.sleep(POLL_INTERVAL)
 
