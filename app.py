@@ -166,21 +166,26 @@ def _bot_thread():
     _state.con_stake   = con_stake
     _state.daily_limit = daily_lim
 
+    print("[bot] Thread started â initializing...", flush=True)
     try:
         pkey   = load_private_key(key_path)
         client = KalshiClient(api_key_id, pkey, dry_run=dry_run)
         _bot   = KalshiBot(client, lag_stake, con_stake, daily_lim, dry_run)
+        print("[bot] Bot initialized â warming up BTC price feed...", flush=True)
 
-        # Warm up BTC feed â print progress so Render logs show the bot is alive
-        print("[bot] Warming up BTC price feed...", flush=True)
+        # Warm up BTC feed with a hard per-fetch deadline.
+        # IMPORTANT: do NOT use 'with ThreadPoolExecutor as ex:' â its __exit__
+        # calls shutdown(wait=True), which blocks forever if the fetch thread
+        # is stuck in an OS-level TCP hang.  Use shutdown(wait=False) instead.
         for i in range(3):
-            # Hard 8-second wall-clock deadline per fetch (handles OS-level TCP hangs)
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-                fut = ex.submit(_bot.btc.fetch)
-                try:
-                    p = fut.result(timeout=8)
-                except Exception:
-                    p = None
+            ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            fut = ex.submit(_bot.btc.fetch)
+            try:
+                p = fut.result(timeout=8)   # hard wall-clock deadline
+            except Exception:
+                p = None
+            finally:
+                ex.shutdown(wait=False)     # abandon hung thread, don't block
             if p:
                 _state.btc_price = p
                 print(f"[bot] Warmup fetch {i+1}/3: BTC=${p:,.0f}", flush=True)
