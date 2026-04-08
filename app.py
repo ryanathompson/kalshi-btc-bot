@@ -20,7 +20,7 @@ from dotenv import load_dotenv
 
 from bot import (
     KalshiBot, KalshiClient, load_private_key, load_trades, POLL_INTERVAL,
-    resolve_trades,
+    resolve_trades, start_keep_alive,
 )
 
 load_dotenv()
@@ -92,6 +92,11 @@ def _strat_stats(trades, name=None):
 @app.route("/")
 def index():
     return render_template("dashboard.html")
+
+
+@app.route("/health")
+def health():
+    return "ok", 200
 
 
 @app.route("/api/status")
@@ -168,6 +173,9 @@ def _bot_thread():
     global _bot
     _state.running    = True
     _state.started_at = datetime.datetime.utcnow().isoformat()
+
+    # Start self-ping to prevent Render free-tier spin-down
+    start_keep_alive()
 
     api_key_id = os.getenv("KALSHI_API_KEY_ID")
     key_path   = os.getenv("KALSHI_PRIVATE_KEY_PATH", "./kalshi.key")

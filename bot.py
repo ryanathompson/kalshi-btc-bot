@@ -46,6 +46,7 @@ import uuid
 import json
 import base64
 import datetime
+import threading
 import requests
 import argparse
 from collections import deque
@@ -85,6 +86,41 @@ LAG_MAX_REPRICE_AGE = 90     # seconds since last Kalshi price change to conside
 CONSENSUS_MAX_PRICE = 0.55   # only trade consensus when price <= 55Â¢
 MOMENTUM_WINDOW     = 60     # seconds for BTC momentum calculation
 MIN_BOOK_SUM        = 0.97   # yes+no must sum >= 0.97 (liquid market check)
+
+
+# ═══════════════════════════════════════════════════════════
+# KEEP-ALIVE (prevents Render free-tier spin-down)
+# ═══════════════════════════════════════════════════════════
+
+def start_keep_alive(interval=780):
+    """
+    Ping our own Render URL every `interval` seconds (default 13 min)
+    to prevent the free-tier 15-min inactivity spin-down.
+
+    Uses RENDER_EXTERNAL_URL (set automatically by Render) or
+    SELF_URL as a manual fallback.  Does nothing if neither is set
+    (i.e. running locally).
+    """
+    url = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("SELF_URL")
+    if not url:
+        print("  [keep-alive] No RENDER_EXTERNAL_URL or SELF_URL — skipping.")
+        return
+
+    if not url.startswith("http"):
+        url = "https://" + url
+
+    def _ping():
+        while True:
+            try:
+                requests.get(url + "/health", timeout=10)
+            except Exception:
+                pass
+            time.sleep(interval)
+
+    t = threading.Thread(target=_ping, daemon=True, name="keep-alive")
+    t.start()
+    print(f"  [keep-alive] Pinging {url}/health every {interval}s")
+
 
 # âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 # AUTH
@@ -817,6 +853,7 @@ def main():
         daily_loss_limit= daily_limit,
         dry_run         = dry_run,
     )
+    start_keep_alive()
     bot.run()
 
 
