@@ -67,7 +67,7 @@ BASE_URL       = "https://api.elections.kalshi.com/trade-api/v2"
 DEMO_URL       = "https://demo-api.kalshi.co/trade-api/v2"
 BTC_TICKER     = "KXBTC15M"
 ETH_TICKER     = "KXETH15M"
-COINBASE_URL   = "https://api.coinbase.com/v2/prices/BTC-USD/spot"
+BINANCE_URL    = "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT"
 POLL_INTERVAL  = 5          # seconds between polls
 LOG_FILE       = "bot_trades.json"
 
@@ -210,8 +210,8 @@ class BTCPriceFeed:
 
     def fetch(self):
         try:
-            r = requests.get(COINBASE_URL, timeout=5)
-            price = float(r.json()["data"]["amount"])
+            r = requests.get(BINANCE_URL, timeout=5)
+            price = float(r.json()["price"])
             self.history.append((time.time(), price))
             return price
         except Exception:
@@ -524,6 +524,7 @@ class KalshiBot:
         self.risk      = RiskManager(daily_loss_limit)
         self.dry       = dry_run
         self.traded_this_market = set()  # prevent double-trading same market
+        self._last_markets = []          # exposed for dashboard
 
     def _log_signal(self, signal, order_result):
         record = {
@@ -566,6 +567,8 @@ class KalshiBot:
         if not markets:
             print(Fore.YELLOW + "  No open BTC 15-min markets right now")
             return
+
+        self._last_markets = markets  # expose for dashboard
 
         # 3. Update consensus previous result
         try:
