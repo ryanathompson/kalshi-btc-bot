@@ -690,12 +690,23 @@ class KalshiBot:
             self.btc.fetch()
             time.sleep(5)
 
+        _last_resolve = 0
+
         while True:
             try:
                 self.run_once()
                 # Clear traded set every 15 min
                 if int(time.time()) % 900 < POLL_INTERVAL:
                     self.traded_this_market.clear()
+                # Resolve settled trades every 60 s
+                if time.time() - _last_resolve >= 60:
+                    try:
+                        n = resolve_trades(self.client)
+                        if n:
+                            print(f"[bot] Resolved {n} trade(s).", flush=True)
+                    except Exception as re:
+                        print(f"[bot] resolve error: {re}", flush=True)
+                    _last_resolve = time.time()
                 time.sleep(POLL_INTERVAL)
             except KeyboardInterrupt:
                 print(Fore.YELLOW + "\n\nBot stopped.")
