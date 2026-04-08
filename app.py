@@ -1,5 +1,5 @@
 """
-Kalshi BTC Bot — Flask Dashboard
+Kalshi BTC Bot â Flask Dashboard
 =================================
 Runs the dual-strategy bot in a background thread and serves a live
 dashboard at / with auto-refreshing stats, open trades, and trade history.
@@ -9,9 +9,11 @@ Procfile:  web: gunicorn app:app --workers 1 --threads 4 --timeout 120
 """
 
 import os
+import sys
 import time
 import threading
 import datetime
+import concurrent.futures
 
 from flask import Flask, render_template, jsonify
 from dotenv import load_dotenv
@@ -24,9 +26,9 @@ load_dotenv()
 
 app = Flask(__name__)
 
-# ─────────────────────────────────────────────────────────────
+# âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 # SHARED STATE  (written by bot thread, read by Flask routes)
-# ─────────────────────────────────────────────────────────────
+# âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 
 class BotState:
     def __init__(self):
@@ -49,12 +51,12 @@ _state = BotState()
 _bot   = None   # KalshiBot instance (set once the thread starts successfully)
 
 
-# ─────────────────────────────────────────────────────────────
+# âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 # HELPER: compute per-strategy stats from trade log
-# ─────────────────────────────────────────────────────────────
+# âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 
 def _strat_stats(trades, name=None):
-    """Return stats dict for settled trades. name=None → all strategies."""
+    """Return stats dict for settled trades. name=None â all strategies."""
     if name:
         subset = [t for t in trades if t.get("result") and t.get("strategy") == name]
     else:
@@ -82,9 +84,9 @@ def _strat_stats(trades, name=None):
     }
 
 
-# ─────────────────────────────────────────────────────────────
+# âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 # FLASK ROUTES
-# ─────────────────────────────────────────────────────────────
+# âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 
 @app.route("/")
 def index():
@@ -113,12 +115,12 @@ def api_status():
             else:
                 age = f"{int(age_s // 3600)}h ago"
         except Exception:
-            age = ts[:16] if ts else "—"
+            age = ts[:16] if ts else "â"
         return {**t, "age": age}
 
     def fmt_hist(t):
         ts = t.get("timestamp", "")
-        return {**t, "ts_short": ts[:16].replace("T", " ") if ts else "—"}
+        return {**t, "ts_short": ts[:16].replace("T", " ") if ts else "â"}
 
     return jsonify({
         "running":      _state.running,
@@ -143,9 +145,9 @@ def api_status():
     })
 
 
-# ─────────────────────────────────────────────────────────────
+# âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 # BOT BACKGROUND THREAD
-# ─────────────────────────────────────────────────────────────
+# âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 
 def _bot_thread():
     global _bot
@@ -169,12 +171,24 @@ def _bot_thread():
         client = KalshiClient(api_key_id, pkey, dry_run=dry_run)
         _bot   = KalshiBot(client, lag_stake, con_stake, daily_lim, dry_run)
 
-        # Warm up BTC feed (15 seconds)
-        for _ in range(3):
-            p = _bot.btc.fetch()
+        # Warm up BTC feed â print progress so Render logs show the bot is alive
+        print("[bot] Warming up BTC price feed...", flush=True)
+        for i in range(3):
+            # Hard 8-second wall-clock deadline per fetch (handles OS-level TCP hangs)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                fut = ex.submit(_bot.btc.fetch)
+                try:
+                    p = fut.result(timeout=8)
+                except Exception:
+                    p = None
             if p:
                 _state.btc_price = p
-            time.sleep(5)
+                print(f"[bot] Warmup fetch {i+1}/3: BTC=${p:,.0f}", flush=True)
+            else:
+                print(f"[bot] Warmup fetch {i+1}/3: failed (will retry in main loop)", flush=True)
+            if i < 2:
+                time.sleep(5)
+        print("[bot] Warmup done â entering main loop", flush=True)
 
         while True:
             try:
@@ -205,12 +219,12 @@ if os.getenv("KALSHI_API_KEY_ID"):
     _t = threading.Thread(target=_bot_thread, daemon=True)
     _t.start()
 else:
-    _state.error = "KALSHI_API_KEY_ID not set — bot is not running."
+    _state.error = "KALSHI_API_KEY_ID not set â bot is not running."
 
 
-# ─────────────────────────────────────────────────────────────
-# ENTRY POINT  (dev server — production uses gunicorn)
-# ─────────────────────────────────────────────────────────────
+# âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+# ENTRY POINT  (dev server â production uses gunicorn)
+# âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))
