@@ -3,12 +3,12 @@ Kalshi BTC 15-Minute Dual Strategy Bot
 =======================================
 Runs two strategies in parallel on Kalshi's KXBTC15M markets:
 
-  STRATEGY 1 — LAG BOT
+  STRATEGY 1 â LAG BOT
     Detects when Kalshi contract prices haven't caught up to live BTC
     price moves on Coinbase. When BTC moves sharply but Kalshi hasn't
     repriced yet, trades into the mispricing.
 
-  STRATEGY 2 — CONSENSUS BOT
+  STRATEGY 2 â CONSENSUS BOT
     Combines two signals:
       - MOMENTUM: BTC price direction over last 60 seconds
       - PREVIOUS: Result of the last settled 15-min market
@@ -30,10 +30,10 @@ SETUP:
 
 GETTING YOUR API KEY:
     1. Log in to kalshi.com
-    2. Account & Security → API Keys → Create Key
+    2. Account & Security â API Keys â Create Key
     3. Save the .key file and Key ID to your .env
 
-⚠️  RISK WARNING:
+â ï¸  RISK WARNING:
     This bot places REAL trades with REAL money.
     Start with small stakes. Never risk more than you can afford to lose.
     Past strategy performance does not guarantee future results.
@@ -59,9 +59,9 @@ from cryptography.hazmat.primitives.asymmetric import padding
 load_dotenv()
 init(autoreset=True)
 
-# ─────────────────────────────────────────────────────────────
+# âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 # CONFIGURATION
-# ─────────────────────────────────────────────────────────────
+# âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 
 BASE_URL       = "https://api.elections.kalshi.com/trade-api/v2"
 DEMO_URL       = "https://demo-api.kalshi.co/trade-api/v2"
@@ -82,24 +82,24 @@ LOG_FILE       = "bot_trades.json"
 # Strategy thresholds (tune these after paper trading)
 LAG_THRESHOLD_PCT   = 0.003  # BTC must move >0.3% in 90s for lag signal
 LAG_MAX_REPRICE_AGE = 90     # seconds since last Kalshi price change to consider stale
-CONSENSUS_MAX_PRICE = 0.55   # only trade consensus when price <= 55¢
+CONSENSUS_MAX_PRICE = 0.55   # only trade consensus when price <= 55Â¢
 MOMENTUM_WINDOW     = 60     # seconds for BTC momentum calculation
 MIN_BOOK_SUM        = 0.97   # yes+no must sum >= 0.97 (liquid market check)
 
-# ─────────────────────────────────────────────────────────────
+# âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 # AUTH
-# ─────────────────────────────────────────────────────────────
+# âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 
 def load_private_key(path=None):
     """
     Load RSA private key. Tries three sources in order:
 
-    1. KALSHI_PRIVATE_KEY_PEM  — raw PEM content (paste the key directly,
+    1. KALSHI_PRIVATE_KEY_PEM  â raw PEM content (paste the key directly,
        with real newlines or literal \\n).  Easiest to set in Render.
-    2. KALSHI_PRIVATE_KEY_BASE64 — base64-encoded PEM (legacy option).
+    2. KALSHI_PRIVATE_KEY_BASE64 â base64-encoded PEM (legacy option).
     3. File at KALSHI_PRIVATE_KEY_PATH (default: ./kalshi.key).
     """
-    # ── Option 1: raw PEM pasted directly into Render env var ──────────────
+    # ââ Option 1: raw PEM pasted directly into Render env var ââââââââââââââ
     pem_raw = os.getenv("KALSHI_PRIVATE_KEY_PEM")
     if pem_raw:
         # Render may store literal \n as the two-char sequence; normalise both.
@@ -108,7 +108,7 @@ def load_private_key(path=None):
             pem_bytes, password=None, backend=default_backend()
         )
 
-    # ── Option 2: base64-encoded PEM ───────────────────────────────────────
+    # ââ Option 2: base64-encoded PEM âââââââââââââââââââââââââââââââââââââââ
     b64 = os.getenv("KALSHI_PRIVATE_KEY_BASE64")
     if b64:
         pem_bytes = base64.b64decode(b64.strip())
@@ -116,7 +116,7 @@ def load_private_key(path=None):
             pem_bytes, password=None, backend=default_backend()
         )
 
-    # ── Option 3: key file ─────────────────────────────────────────────────
+    # ââ Option 3: key file âââââââââââââââââââââââââââââââââââââââââââââââââ
     if path and os.path.exists(path):
         with open(path, "rb") as f:
             return serialization.load_pem_private_key(
@@ -156,9 +156,9 @@ def auth_headers(private_key, api_key_id, method, path):
     }
 
 
-# ─────────────────────────────────────────────────────────────
+# âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 # KALSHI CLIENT
-# ─────────────────────────────────────────────────────────────
+# âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 
 class KalshiClient:
     def __init__(self, api_key_id, private_key, dry_run=True):
@@ -204,7 +204,7 @@ class KalshiClient:
 
     def get_balance(self):
         d = self.get("/portfolio/balance")
-        return d.get("balance", 0) / 100  # cents → dollars
+        return d.get("balance", 0) / 100  # cents â dollars
 
     def place_order(self, ticker, side, price_cents, count, strategy_tag=""):
         order = {
@@ -218,15 +218,16 @@ class KalshiClient:
         }
         if self.dry:
             return {"dry_run": True, "order": order}
-        r = self.post("/trade-api/v2/portfolio/orders", order)
+        r = self.post("/portfolio/orders", order)
         if r.status_code == 201:
             return r.json()
+        print(f"  Order failed: HTTP {r.status_code} â {r.text}", flush=True)
         return {"error": r.text, "status": r.status_code}
 
 
-# ─────────────────────────────────────────────────────────────
+# âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 # PRICE DATA
-# ─────────────────────────────────────────────────────────────
+# âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 
 class BTCPriceFeed:
     """Rolling BTC price history from Coinbase (free, no auth)."""
@@ -265,9 +266,9 @@ class BTCPriceFeed:
         return None
 
 
-# ─────────────────────────────────────────────────────────────
+# âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 # TRADE LOG
-# ─────────────────────────────────────────────────────────────
+# âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 
 def load_trades():
     if os.path.exists(LOG_FILE):
@@ -348,9 +349,9 @@ def print_stats():
         print(tabulate(rows, tablefmt="rounded_outline"))
 
 
-# ─────────────────────────────────────────────────────────────
+# âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 # STRATEGY 1: LAG BOT
-# ─────────────────────────────────────────────────────────────
+# âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 
 class LagStrategy:
     """
@@ -364,7 +365,7 @@ class LagStrategy:
     def __init__(self, stake_dollars):
         self.stake    = stake_dollars
         self.name     = "LAG"
-        self.last_kalshi_prices = {}  # ticker → (yes, no, timestamp)
+        self.last_kalshi_prices = {}  # ticker â (yes, no, timestamp)
 
     def evaluate(self, market, btc_feed):
         ticker  = market["ticker"]
@@ -413,16 +414,16 @@ class LagStrategy:
         }
 
 
-# ─────────────────────────────────────────────────────────────
+# âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 # STRATEGY 2: CONSENSUS BOT
-# ─────────────────────────────────────────────────────────────
+# âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 
 class ConsensusStrategy:
     """
     Only trades when MOMENTUM and PREVIOUS signals agree.
 
-    MOMENTUM: BTC up/down in last 60s → trade YES/NO
-    PREVIOUS: last settled market result → trade same side
+    MOMENTUM: BTC up/down in last 60s â trade YES/NO
+    PREVIOUS: last settled market result â trade same side
     CONSENSUS: only fire when both agree AND price <= threshold
     """
     def __init__(self, stake_dollars):
@@ -486,9 +487,9 @@ class ConsensusStrategy:
         }
 
 
-# ─────────────────────────────────────────────────────────────
+# âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 # RISK MANAGEMENT
-# ─────────────────────────────────────────────────────────────
+# âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 
 class RiskManager:
     """
@@ -537,9 +538,9 @@ class RiskManager:
         return True, "OK"
 
 
-# ─────────────────────────────────────────────────────────────
+# âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 # MAIN BOT LOOP
-# ─────────────────────────────────────────────────────────────
+# âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 
 class KalshiBot:
     def __init__(self, client, lag_stake, consensus_stake,
@@ -570,9 +571,9 @@ class KalshiBot:
         color = Fore.CYAN if signal["strategy"] == "LAG" else Fore.MAGENTA
         tag   = "[DRY]" if dry else "[LIVE]"
         print(
-            f"\n{color}► {signal['strategy']} {tag}{Style.RESET_ALL}  "
+            f"\n{color}âº {signal['strategy']} {tag}{Style.RESET_ALL}  "
             f"{signal['ticker']}  "
-            f"{signal['side'].upper()} @ {signal['price']}¢  "
+            f"{signal['side'].upper()} @ {signal['price']}Â¢  "
             f"x{signal['count']} = ${signal['dollars']:.2f}\n"
             f"  Reason: {signal['reason']}"
         )
@@ -606,7 +607,7 @@ class KalshiBot:
         # 4. Risk check
         ok, reason = self.risk.check(self.client)
         if not ok:
-            print(Fore.RED + f"  🛑 Risk halt: {reason}")
+            print(Fore.RED + f"  ð Risk halt: {reason}")
             return
 
         # 5. Evaluate strategies on each market
@@ -617,7 +618,7 @@ class KalshiBot:
             if ticker in self.traded_this_market:
                 continue
 
-            # Time remaining check — skip if < 3 min left (too close to settlement)
+            # Time remaining check â skip if < 3 min left (too close to settlement)
             close_time = market.get("close_time")
             if close_time:
                 try:
@@ -659,6 +660,11 @@ class KalshiBot:
                         order_result = {"error": str(e)}
                         print(Fore.RED + f"  Order error: {e}")
 
+                # Only log the trade if the order was actually placed
+                if "error" in order_result and not order_result.get("dry_run"):
+                    print(Fore.RED + f"  Order rejected â not logging as open trade.")
+                    continue
+
                 self._log_signal(signal, order_result)
                 self.traded_this_market.add(ticker)
                 break  # one strategy per market per cycle
@@ -666,7 +672,7 @@ class KalshiBot:
         # Status line
         ts         = datetime.datetime.now().strftime("%H:%M:%S")
         change     = self.btc.pct_change(60)
-        change_str = f"{change*100:+.3f}%" if change else "—"
+        change_str = f"{change*100:+.3f}%" if change else "â"
         print(
             f"  [{ts}]  BTC ${btc_price:,.0f}  1m:{change_str}  "
             f"Markets:{len(markets)}  "
@@ -675,7 +681,7 @@ class KalshiBot:
         )
 
     def run(self):
-        print(Fore.GREEN + Style.BRIGHT + "\n🤖 KALSHI DUAL STRATEGY BOT STARTED")
+        print(Fore.GREEN + Style.BRIGHT + "\nð¤ KALSHI DUAL STRATEGY BOT STARTED")
         mode = "DRY RUN" if self.dry else "LIVE TRADING"
         print(f"   Mode: {Fore.YELLOW}{mode}{Style.RESET_ALL}")
         print(f"   LAG stake:       ${self.lag.stake}/trade")
@@ -718,9 +724,9 @@ class KalshiBot:
                 time.sleep(POLL_INTERVAL * 2)
 
 
-# ─────────────────────────────────────────────────────────────
+# âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 # ENTRY POINT
-# ─────────────────────────────────────────────────────────────
+# âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 
 def main():
     parser = argparse.ArgumentParser(description="Kalshi BTC 15-min Dual Strategy Bot")
@@ -743,7 +749,7 @@ def main():
     key_path   = os.getenv("KALSHI_PRIVATE_KEY_PATH", "./kalshi.key")
     dry_run    = args.dry_run or os.getenv("DRY_RUN", "false").lower() == "true"
 
-    # Stakes — CLI > .env > interactive prompt
+    # Stakes â CLI > .env > interactive prompt
     def get_stake(arg_val, env_key, label):
         if arg_val is not None:
             return arg_val
@@ -776,7 +782,7 @@ def main():
         print(Fore.RED + f"Private key not found. Set KALSHI_PRIVATE_KEY_BASE64 or place key at {key_path}")
         return
 
-    print(Fore.CYAN + "\n⚙  KALSHI DUAL STRATEGY BOT — CONFIGURATION\n")
+    print(Fore.CYAN + "\nâ  KALSHI DUAL STRATEGY BOT â CONFIGURATION\n")
 
     lag_stake   = get_stake(args.lag_stake,   "LAG_STAKE",       "LAG strategy")
     con_stake   = get_stake(args.con_stake,   "CONSENSUS_STAKE", "CONSENSUS strategy")
@@ -784,7 +790,7 @@ def main():
                   input("  Daily loss limit in dollars (bot halts if exceeded): $").strip())
 
     if not dry_run:
-        print(f"\n{Fore.RED}▲  LIVE TRADING MODE{Style.RESET_ALL}")
+        print(f"\n{Fore.RED}â²  LIVE TRADING MODE{Style.RESET_ALL}")
         print(f"   LAG stake:       ${lag_stake}/trade")
         print(f"   CONSENSUS stake: ${con_stake}/trade")
         print(f"   Daily loss limit: ${daily_limit}")
@@ -799,7 +805,7 @@ def main():
     # Verify connection
     try:
         bal = client.get_balance()
-        print(Fore.GREEN + f"\n  ✓ Connected to Kalshi  |  Balance: ${bal:.2f}")
+        print(Fore.GREEN + f"\n  â Connected to Kalshi  |  Balance: ${bal:.2f}")
     except Exception as e:
         print(Fore.RED + f"  Connection failed: {e}")
         return
