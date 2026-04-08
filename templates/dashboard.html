@@ -1,0 +1,598 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Kalshi BTC Bot</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🤖</text></svg>">
+  <style>
+    :root {
+      --bg:      #0d1117;
+      --panel:   #161b22;
+      --border:  #30363d;
+      --text:    #e6edf3;
+      --muted:   #8b949e;
+      --green:   #3fb950;
+      --red:     #f85149;
+      --yellow:  #d29922;
+      --blue:    #58a6ff;
+      --cyan:    #79c0ff;
+      --purple:  #bc8cff;
+      --orange:  #ffa657;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 14px;
+      line-height: 1.5;
+    }
+
+    /* ── HEADER ── */
+    header {
+      background: var(--panel);
+      border-bottom: 1px solid var(--border);
+      padding: 12px 24px;
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      position: sticky;
+      top: 0;
+      z-index: 100;
+    }
+    header h1 {
+      font-size: 16px;
+      font-weight: 600;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      padding: 2px 10px;
+      border-radius: 12px;
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: .04em;
+      text-transform: uppercase;
+    }
+    .badge-live    { background: rgba(63,185,80,.15);  color: var(--green);  border: 1px solid rgba(63,185,80,.3); }
+    .badge-dry     { background: rgba(210,153,34,.15); color: var(--yellow); border: 1px solid rgba(210,153,34,.3); }
+    .badge-halted  { background: rgba(248,81,73,.15);  color: var(--red);    border: 1px solid rgba(248,81,73,.3); }
+    .badge-offline { background: rgba(139,148,158,.1); color: var(--muted);  border: 1px solid var(--border); }
+    .dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+    .dot.pulse { animation: pulse 2s infinite; }
+    @keyframes pulse {
+      0%,100% { opacity: 1; }
+      50%      { opacity: .4; }
+    }
+
+    header .ticker {
+      margin-left: auto;
+      font-size: 13px;
+      color: var(--muted);
+      display: flex;
+      align-items: center;
+      gap: 20px;
+    }
+    header .ticker .val { color: var(--text); font-weight: 600; }
+    header .ticker .up  { color: var(--green); }
+    header .ticker .dn  { color: var(--red); }
+
+    /* ── MAIN LAYOUT ── */
+    main {
+      max-width: 1280px;
+      margin: 0 auto;
+      padding: 20px 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+    }
+
+    /* ── STAT CARDS ── */
+    .cards {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 14px;
+    }
+    @media (max-width: 860px) {
+      .cards { grid-template-columns: 1fr; }
+    }
+
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 16px 20px;
+    }
+    .card-title {
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin-bottom: 14px;
+    }
+    .card-lag    .card-title { color: var(--cyan); }
+    .card-con    .card-title { color: var(--purple); }
+    .card-all    .card-title { color: var(--blue); }
+
+    .stat-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px 20px;
+    }
+    .stat-item label {
+      display: block;
+      font-size: 10px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: .06em;
+      margin-bottom: 3px;
+    }
+    .stat-item .val {
+      font-size: 18px;
+      font-weight: 700;
+    }
+    .stat-item .val.pos { color: var(--green); }
+    .stat-item .val.neg { color: var(--red); }
+    .stat-item .val.neu { color: var(--text); }
+    .empty-card {
+      color: var(--muted);
+      font-size: 12px;
+      text-align: center;
+      padding: 16px 0;
+    }
+
+    /* ── SECTION ── */
+    .section {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      overflow: hidden;
+    }
+    .section-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 12px 20px;
+      border-bottom: 1px solid var(--border);
+    }
+    .section-title {
+      font-size: 12px;
+      font-weight: 600;
+      letter-spacing: .06em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+    .section-count {
+      background: rgba(88,166,255,.12);
+      color: var(--blue);
+      border-radius: 10px;
+      padding: 1px 8px;
+      font-size: 11px;
+      font-weight: 600;
+    }
+
+    /* ── TABLE ── */
+    .tbl-wrap { overflow-x: auto; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+    }
+    thead th {
+      background: rgba(255,255,255,.03);
+      padding: 8px 14px;
+      text-align: left;
+      font-size: 10px;
+      font-weight: 600;
+      letter-spacing: .07em;
+      text-transform: uppercase;
+      color: var(--muted);
+      border-bottom: 1px solid var(--border);
+    }
+    tbody tr {
+      border-bottom: 1px solid rgba(48,54,61,.6);
+      transition: background .1s;
+    }
+    tbody tr:last-child { border-bottom: none; }
+    tbody tr:hover { background: rgba(255,255,255,.025); }
+    tbody td {
+      padding: 9px 14px;
+      color: var(--text);
+    }
+    .empty-row td {
+      text-align: center;
+      color: var(--muted);
+      padding: 24px;
+      font-size: 12px;
+    }
+
+    .pill {
+      display: inline-block;
+      padding: 1px 8px;
+      border-radius: 10px;
+      font-size: 11px;
+      font-weight: 600;
+    }
+    .pill-yes    { background: rgba(63,185,80,.12);  color: var(--green);  }
+    .pill-no     { background: rgba(248,81,73,.12);  color: var(--red);    }
+    .pill-lag    { background: rgba(121,192,255,.1); color: var(--cyan);   }
+    .pill-con    { background: rgba(188,140,255,.1); color: var(--purple); }
+    .pill-win    { background: rgba(63,185,80,.12);  color: var(--green);  }
+    .pill-loss   { background: rgba(248,81,73,.12);  color: var(--red);    }
+    .pill-dry    { background: rgba(210,153,34,.1);  color: var(--yellow); }
+
+    .pos-num { color: var(--green); }
+    .neg-num { color: var(--red); }
+    .muted   { color: var(--muted); }
+
+    /* ── INFO BAR ── */
+    .info-bar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px 20px;
+      padding: 8px 20px;
+      background: rgba(255,255,255,.015);
+      border-top: 1px solid var(--border);
+      font-size: 11px;
+      color: var(--muted);
+    }
+    .info-bar b { color: var(--text); }
+
+    /* ── ERROR BANNER ── */
+    #error-banner {
+      display: none;
+      background: rgba(248,81,73,.1);
+      border: 1px solid rgba(248,81,73,.3);
+      border-radius: 6px;
+      padding: 10px 16px;
+      color: var(--red);
+      font-size: 12px;
+    }
+
+    /* ── HALT BANNER ── */
+    #halt-banner {
+      display: none;
+      background: rgba(248,81,73,.1);
+      border: 1px solid rgba(248,81,73,.3);
+      border-radius: 6px;
+      padding: 10px 16px;
+      color: var(--red);
+      font-size: 13px;
+      font-weight: 600;
+    }
+
+    /* ── LAST UPDATE ── */
+    #last-update {
+      font-size: 11px;
+      color: var(--muted);
+      text-align: right;
+      padding: 4px 0;
+    }
+  </style>
+</head>
+<body>
+
+<!-- HEADER -->
+<header>
+  <h1>🤖 Kalshi BTC Bot</h1>
+  <span id="mode-badge" class="badge badge-offline"><span class="dot"></span> Loading</span>
+
+  <div class="ticker">
+    <div>
+      BTC
+      <span class="val" id="btc-price">—</span>
+      <span id="btc-change">—</span>
+    </div>
+    <div>Markets <span class="val" id="market-count">—</span></div>
+    <div>Prev <span class="val" id="prev-result">—</span></div>
+    <div>Stakes $<span class="val" id="lag-stake">—</span> / $<span class="val" id="con-stake">—</span></div>
+  </div>
+</header>
+
+<main>
+
+  <!-- ERROR / HALT BANNERS -->
+  <div id="error-banner"></div>
+  <div id="halt-banner"></div>
+
+  <!-- STAT CARDS -->
+  <div class="cards">
+    <div class="card card-lag" id="card-lag">
+      <div class="card-title">⚡ LAG Strategy</div>
+      <div class="empty-card" id="lag-empty">No settled trades yet</div>
+      <div class="stat-grid" id="lag-stats" style="display:none"></div>
+    </div>
+    <div class="card card-con" id="card-con">
+      <div class="card-title">🔮 Consensus Strategy</div>
+      <div class="empty-card" id="con-empty">No settled trades yet</div>
+      <div class="stat-grid" id="con-stats" style="display:none"></div>
+    </div>
+    <div class="card card-all">
+      <div class="card-title">📊 Combined</div>
+      <div class="empty-card" id="all-empty">No settled trades yet</div>
+      <div class="stat-grid" id="all-stats" style="display:none"></div>
+    </div>
+  </div>
+
+  <!-- OPEN TRADES -->
+  <div class="section">
+    <div class="section-header">
+      <span class="section-title">Open Positions</span>
+      <span class="section-count" id="open-count">0</span>
+    </div>
+    <div class="tbl-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Strategy</th>
+            <th>Ticker</th>
+            <th>Side</th>
+            <th>Price</th>
+            <th>Contracts</th>
+            <th>Dollars</th>
+            <th>Mode</th>
+            <th>Opened</th>
+          </tr>
+        </thead>
+        <tbody id="open-tbody">
+          <tr class="empty-row"><td colspan="8">No open positions</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- TRADE HISTORY -->
+  <div class="section">
+    <div class="section-header">
+      <span class="section-title">Trade History</span>
+      <span class="section-count" id="hist-count">0</span>
+    </div>
+    <div class="tbl-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Time</th>
+            <th>Strategy</th>
+            <th>Ticker</th>
+            <th>Side</th>
+            <th>Price</th>
+            <th>Contracts</th>
+            <th>Dollars</th>
+            <th>Result</th>
+            <th>P&amp;L</th>
+            <th>Reason</th>
+          </tr>
+        </thead>
+        <tbody id="hist-tbody">
+          <tr class="empty-row"><td colspan="10">No settled trades yet</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- INFO BAR -->
+  <div class="info-bar">
+    <span>Started: <b id="started-at">—</b></span>
+    <span>Last cycle: <b id="last-cycle">—</b></span>
+    <span>Daily limit: $<b id="daily-limit">—</b></span>
+  </div>
+
+  <div id="last-update">Updating…</div>
+
+</main>
+
+<script>
+  function fmt$(n) {
+    if (n == null) return '—';
+    return '$' + Math.abs(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2});
+  }
+  function fmtPct(n) {
+    if (n == null) return '—';
+    const sign = n >= 0 ? '+' : '';
+    return sign + n.toFixed(2) + '%';
+  }
+  function timeAgo(iso) {
+    if (!iso) return '—';
+    const s = (Date.now() - new Date(iso + 'Z').getTime()) / 1000;
+    if (s < 60)   return Math.round(s) + 's ago';
+    if (s < 3600) return Math.round(s/60) + 'm ago';
+    return Math.round(s/3600) + 'h ago';
+  }
+  function pill(text, cls) {
+    return `<span class="pill pill-${cls}">${text}</span>`;
+  }
+
+  function renderStats(id, emptyId, data) {
+    const el = document.getElementById(id);
+    const em = document.getElementById(emptyId);
+    if (!data) {
+      el.style.display = 'none';
+      em.style.display = 'block';
+      return;
+    }
+    em.style.display = 'none';
+    el.style.display = 'grid';
+    const pnlCls = data.pnl >= 0 ? 'pos' : 'neg';
+    el.innerHTML = `
+      <div class="stat-item">
+        <label>Win / Loss</label>
+        <div class="val neu">${data.wins} / ${data.losses}</div>
+      </div>
+      <div class="stat-item">
+        <label>Win Rate</label>
+        <div class="val ${data.wr >= 50 ? 'pos' : 'neg'}">${data.wr}%</div>
+      </div>
+      <div class="stat-item">
+        <label>Wagered</label>
+        <div class="val neu">${fmt$(data.wagered)}</div>
+      </div>
+      <div class="stat-item">
+        <label>P&amp;L</label>
+        <div class="val ${pnlCls}">${data.pnl >= 0 ? '+' : ''}${fmt$(data.pnl)}</div>
+      </div>
+      <div class="stat-item">
+        <label>ROI</label>
+        <div class="val ${pnlCls}">${data.pnl >= 0 ? '+' : ''}${data.roi.toFixed(2)}%</div>
+      </div>
+      <div class="stat-item">
+        <label>Settled</label>
+        <div class="val neu">${data.total}</div>
+      </div>
+    `;
+  }
+
+  function renderOpen(trades) {
+    const tbody = document.getElementById('open-tbody');
+    document.getElementById('open-count').textContent = trades.length;
+    if (!trades.length) {
+      tbody.innerHTML = '<tr class="empty-row"><td colspan="8">No open positions</td></tr>';
+      return;
+    }
+    tbody.innerHTML = trades.map(t => {
+      const modePill = t.dry_run ? pill('DRY', 'dry') : pill('LIVE', 'yes');
+      const stratPill = pill(t.strategy, t.strategy === 'LAG' ? 'lag' : 'con');
+      const sidePill  = pill(t.side?.toUpperCase(), t.side === 'yes' ? 'yes' : 'no');
+      return `<tr>
+        <td>${stratPill}</td>
+        <td class="muted">${t.ticker || '—'}</td>
+        <td>${sidePill}</td>
+        <td>${t.price != null ? t.price + '¢' : '—'}</td>
+        <td>${t.count ?? '—'}</td>
+        <td>${fmt$(t.dollars)}</td>
+        <td>${modePill}</td>
+        <td class="muted">${t.age || '—'}</td>
+      </tr>`;
+    }).join('');
+  }
+
+  function renderHistory(trades) {
+    const tbody = document.getElementById('hist-tbody');
+    document.getElementById('hist-count').textContent = trades.length;
+    if (!trades.length) {
+      tbody.innerHTML = '<tr class="empty-row"><td colspan="10">No settled trades yet</td></tr>';
+      return;
+    }
+    tbody.innerHTML = trades.map(t => {
+      const stratPill  = pill(t.strategy, t.strategy === 'LAG' ? 'lag' : 'con');
+      const sidePill   = pill(t.side?.toUpperCase(), t.side === 'yes' ? 'yes' : 'no');
+      const resultPill = pill(t.result, t.result === 'WIN' ? 'win' : 'loss');
+      const pnl = t.pnl;
+      const pnlStr = pnl != null
+        ? `<span class="${pnl >= 0 ? 'pos-num' : 'neg-num'}">${pnl >= 0 ? '+' : ''}${fmt$(pnl)}</span>`
+        : '—';
+      return `<tr>
+        <td class="muted">${t.ts_short || '—'}</td>
+        <td>${stratPill}</td>
+        <td class="muted">${t.ticker || '—'}</td>
+        <td>${sidePill}</td>
+        <td>${t.price != null ? t.price + '¢' : '—'}</td>
+        <td>${t.count ?? '—'}</td>
+        <td>${fmt$(t.dollars)}</td>
+        <td>${resultPill}</td>
+        <td>${pnlStr}</td>
+        <td class="muted" style="max-width:220px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${(t.reason||'').replace(/"/g,'')}">${t.reason || '—'}</td>
+      </tr>`;
+    }).join('');
+  }
+
+  async function refresh() {
+    try {
+      const r   = await fetch('/api/status');
+      const d   = await r.json();
+
+      // Mode badge
+      const badge = document.getElementById('mode-badge');
+      if (d.halted) {
+        badge.className = 'badge badge-halted';
+        badge.innerHTML = '<span class="dot"></span> HALTED';
+      } else if (!d.running) {
+        badge.className = 'badge badge-offline';
+        badge.innerHTML = '<span class="dot"></span> Offline';
+      } else if (d.dry_run) {
+        badge.className = 'badge badge-dry';
+        badge.innerHTML = '<span class="dot pulse"></span> DRY RUN';
+      } else {
+        badge.className = 'badge badge-live';
+        badge.innerHTML = '<span class="dot pulse"></span> LIVE';
+      }
+
+      // BTC ticker
+      if (d.btc_price != null) {
+        document.getElementById('btc-price').textContent =
+          '$' + d.btc_price.toLocaleString('en-US', {maximumFractionDigits:0});
+      }
+      const chg = d.btc_change;
+      const chgEl = document.getElementById('btc-change');
+      if (chg != null) {
+        chgEl.textContent = (chg >= 0 ? '+' : '') + chg.toFixed(3) + '%';
+        chgEl.className   = chg >= 0 ? 'up' : 'dn';
+      }
+
+      document.getElementById('market-count').textContent = d.market_count ?? '—';
+      const prev = d.prev_result;
+      const prevEl = document.getElementById('prev-result');
+      prevEl.textContent = prev ? prev.toUpperCase() : '—';
+      prevEl.style.color = prev === 'yes' ? 'var(--green)' : prev === 'no' ? 'var(--red)' : 'var(--muted)';
+
+      document.getElementById('lag-stake').textContent  = d.lag_stake ?? '—';
+      document.getElementById('con-stake').textContent  = d.con_stake ?? '—';
+      document.getElementById('daily-limit').textContent = d.daily_limit ?? '—';
+
+      // Started / last cycle
+      const saEl = document.getElementById('started-at');
+      if (d.started_at) {
+        const dt = new Date(d.started_at + 'Z');
+        saEl.textContent = dt.toLocaleString();
+      }
+      if (d.last_cycle) {
+        document.getElementById('last-cycle').textContent = timeAgo(d.last_cycle);
+      }
+
+      // Error banner
+      const eb = document.getElementById('error-banner');
+      if (d.error) {
+        eb.style.display = 'block';
+        eb.textContent   = '⚠ ' + d.error;
+      } else {
+        eb.style.display = 'none';
+      }
+
+      // Halt banner
+      const hb = document.getElementById('halt-banner');
+      if (d.halted) {
+        hb.style.display = 'block';
+        hb.textContent   = '🛑 Bot halted: ' + d.halt_reason;
+      } else {
+        hb.style.display = 'none';
+      }
+
+      // Stats cards
+      renderStats('lag-stats', 'lag-empty', d.lag_stats);
+      renderStats('con-stats', 'con-empty', d.con_stats);
+      renderStats('all-stats', 'all-empty', d.all_stats);
+
+      // Tables
+      renderOpen(d.open_trades || []);
+      renderHistory(d.history   || []);
+
+      document.getElementById('last-update').textContent =
+        'Last updated: ' + new Date().toLocaleTimeString();
+
+    } catch (err) {
+      document.getElementById('last-update').textContent = '⚠ Failed to fetch — retrying…';
+    }
+  }
+
+  refresh();
+  setInterval(refresh, 5000);
+</script>
+</body>
+</html>
