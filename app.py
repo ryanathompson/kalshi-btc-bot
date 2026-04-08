@@ -215,15 +215,18 @@ def _bot_thread():
             time.sleep(POLL_INTERVAL)
 
     except Exception as e:
+        print(f"[bot] FATAL: {e}", flush=True)
         _state.error   = str(e)
         _state.running = False
 
 
-# Start bot thread automatically when credentials are present
-if os.getenv("KALSHI_API_KEY_ID"):
-    _t = threading.Thread(target=_bot_thread, daemon=True)
-    _t.start()
-else:
+# NOTE: The bot thread is NOT started here at module level.
+# Starting threads during gunicorn's master import causes them to run in the
+# master process, not the forked worker.  Threads don't survive fork(), so the
+# worker ends up serving HTTP with _state.running=True but no bot thread.
+# Instead, the thread is started in gunicorn.conf.py via post_worker_init,
+# which fires inside each forked worker after it has fully initialized.
+if not os.getenv("KALSHI_API_KEY_ID"):
     _state.error = "KALSHI_API_KEY_ID not set â bot is not running."
 
 
