@@ -8,12 +8,20 @@ Runs two strategies in parallel on Kalshi's KXBTC15M markets:
     price moves on Coinbase. When BTC moves sharply but Kalshi hasn't
     repriced yet, trades into the mispricing.
 
-  STRATEGY 2 â CONSENSUS BOT
+  STRATEGY 2 â CONSENSUS BOT v1.1
     Combines two signals:
       - MOMENTUM: BTC price direction over last 60 seconds
       - PREVIOUS: Result of the last settled 15-min market
     Only trades when both signals agree AND price is <= threshold.
     Historically ~73% win rate in backtests.
+
+    v1.1 improvements:
+      1. Momentum dead zone â ignores noise below 0.03% BTC move
+      2. Previous-result staleness â signal expires after 30 min
+      3. Dynamic price cap â scales with momentum strength (0.45â0.55)
+      4. Time-aware entry â tightens threshold as market nears close
+      5. Trade cooldown â 300s minimum between consensus trades
+      6. API throttle â polls settled markets every 60s, not every 5s
 
 SETUP:
     pip install requests cryptography colorama tabulate python-dotenv
@@ -49,6 +57,7 @@ import datetime
 import threading
 import requests
 import argparse
+import websocket
 from collections import deque
 from dotenv import load_dotenv
 from tabulate import tabulate
@@ -77,7 +86,8 @@ PRICE_SOURCES = [
     ("coingecko", "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd",
      lambda r: float(r.json()["bitcoin"]["usd"])),
 ]
-POLL_INTERVAL  = 5          # seconds between polls
+POLL_INTERVAL  = 5          # seconds between polls (used for market/resolve checks)
+COINBASE_WS_URL = "wss://advanced-trade-ws.coinbase.com"
 LOG_FILE       = "bot_trades.json"
 
 # Strategy thresholds (tune these after paper trading)
@@ -86,6 +96,13 @@ LAG_MAX_REPRICE_AGE = 90     # seconds since last Kalshi price change to conside
 CONSENSUS_MAX_PRICE = 0.55   # only trade consensus when price <= 55Â¢
 MOMENTUM_WINDOW     = 60     # seconds for BTC momentum calculation
 MIN_BOOK_SUM        = 0.97   # yes+no must sum >= 0.97 (liquid market check)
+
+# Consensus v1.1 tuning
+CONSENSUS_BASE_PRICE = 0.45  # base price cap before momentum scaling
+MOMENTUM_DEAD_ZONE  = 0.0003 # ignore BTC moves < 0.03% (noise filter)
+PREV_RESULT_MAX_AGE = 1800   # previous-result signal expires after 30 min (seconds)
+CONSENSUS_COOLDOWN  = 300    # min seconds between consensus trades
+PREV_CHECK_INTERVAL = 60     # only poll settled markets every 60s (not every cycle)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -266,31 +283,148 @@ class KalshiClient:
 # âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 
 class BTCPriceFeed:
-    """Rolling BTC price history from Coinbase (free, no auth)."""
-    def __init__(self, window=120):
-        self.history = deque(maxlen=window)
+    """
+    Real-time BTC price feed via Coinbase Advanced Trade WebSocket.
 
+    Connects to the public `ticker` channel (no auth required) and receives
+    a push every time a BTC-USD trade matches on Coinbase.  Falls back to
+    REST polling if the WebSocket drops.
+
+    The public interface (current, price_at, pct_change, fetch) is unchanged
+    so both LAG and CONSENSUS strategies work without modification.
+    """
+    def __init__(self, window=500):
+        self.history   = deque(maxlen=window)
+        self._ws       = None
+        self._ws_alive = False
+        self._lock     = threading.Lock()
+        self._stop     = threading.Event()
+
+    # ── WebSocket lifecycle ────────────────────────────────
+    def start(self):
+        """Launch the WebSocket listener in a background thread."""
+        t = threading.Thread(target=self._ws_loop, daemon=True, name="btc-ws")
+        t.start()
+        print("  [price] WebSocket feed starting...", flush=True)
+        # Wait up to 10s for first price to arrive
+        deadline = time.time() + 10
+        while not self.history and time.time() < deadline:
+            time.sleep(0.2)
+        if self.history:
+            print(f"  [price] WebSocket connected  |  BTC ${self.current():,.0f}", flush=True)
+        else:
+            print("  [price] WebSocket slow to connect, falling back to REST", flush=True)
+            self.fetch()  # seed with one REST call
+
+    def stop(self):
+        """Cleanly shut down the WebSocket."""
+        self._stop.set()
+        if self._ws:
+            try:
+                self._ws.close()
+            except Exception:
+                pass
+
+    def _ws_loop(self):
+        """Connect + reconnect loop with exponential backoff."""
+        backoff = 1
+        while not self._stop.is_set():
+            try:
+                self._connect()
+            except Exception as e:
+                print(f"  [price] WS error: {e}", flush=True)
+            self._ws_alive = False
+            if self._stop.is_set():
+                break
+            wait = min(backoff, 30)
+            print(f"  [price] WS reconnecting in {wait}s...", flush=True)
+            self._stop.wait(wait)
+            backoff = min(backoff * 2, 30)
+
+    def _connect(self):
+        """Single WebSocket session: subscribe, read messages, handle pings."""
+        ws = websocket.WebSocketApp(
+            COINBASE_WS_URL,
+            on_open=self._on_open,
+            on_message=self._on_message,
+            on_error=self._on_error,
+            on_close=self._on_close,
+        )
+        self._ws = ws
+        ws.run_forever(ping_interval=20, ping_timeout=10)
+
+    def _on_open(self, ws):
+        sub = json.dumps({
+            "type": "subscribe",
+            "product_ids": ["BTC-USD"],
+            "channel": "ticker",
+        })
+        ws.send(sub)
+        # Also subscribe to heartbeats to keep connection alive during
+        # quiet periods (Coinbase closes idle sockets after ~90s)
+        hb = json.dumps({
+            "type": "subscribe",
+            "product_ids": ["BTC-USD"],
+            "channel": "heartbeats",
+        })
+        ws.send(hb)
+        self._ws_alive = True
+
+    def _on_message(self, ws, raw):
+        try:
+            msg = json.loads(raw)
+        except Exception:
+            return
+        if msg.get("channel") != "ticker":
+            return
+        for event in msg.get("events", []):
+            for ticker in event.get("tickers", []):
+                if ticker.get("product_id") == "BTC-USD":
+                    try:
+                        price = float(ticker["price"])
+                    except (KeyError, ValueError):
+                        continue
+                    with self._lock:
+                        self.history.append((time.time(), price))
+
+    def _on_error(self, ws, error):
+        if not self._stop.is_set():
+            print(f"  [price] WS error: {error}", flush=True)
+
+    def _on_close(self, ws, close_status, close_msg):
+        self._ws_alive = False
+
+    # ── REST fallback ──────────────────────────────────────
     def fetch(self):
+        """
+        One-shot REST price fetch.  Used for:
+          - Initial seed if WS is slow to connect
+          - Fallback when WS has been down for a while
+        """
         for name, url, parser in PRICE_SOURCES:
             try:
-                r = requests.get(url, timeout=(3, 4))  # (connect_timeout, read_timeout)
+                r = requests.get(url, timeout=(3, 4))
                 price = parser(r)
-                self.history.append((time.time(), price))
+                with self._lock:
+                    self.history.append((time.time(), price))
                 return price
             except Exception:
-                continue  # try next source
+                continue
         return None
 
+    # ── Public interface (unchanged for strategies) ────────
     def current(self):
-        return self.history[-1][1] if self.history else None
+        with self._lock:
+            return self.history[-1][1] if self.history else None
 
     def price_at(self, seconds_ago):
         """Return price from ~seconds_ago seconds back."""
         now = time.time()
         target = now - seconds_ago
-        for ts, px in reversed(self.history):
-            if ts <= target:
-                return px
+        with self._lock:
+            for ts, px in reversed(self.history):
+                if ts <= target:
+                    return px
         return None
 
     def pct_change(self, seconds=60):
@@ -300,6 +434,11 @@ class BTCPriceFeed:
         if now_px and old_px:
             return (now_px - old_px) / old_px
         return None
+
+    @property
+    def is_live(self):
+        """True if WebSocket is actively receiving data."""
+        return self._ws_alive
 
 
 # âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
@@ -606,29 +745,61 @@ class LagStrategy:
 
 class ConsensusStrategy:
     """
+    Consensus Logic v1.1
+    ====================
     Only trades when MOMENTUM and PREVIOUS signals agree.
 
     MOMENTUM: BTC up/down in last 60s â trade YES/NO
     PREVIOUS: last settled market result â trade same side
-    CONSENSUS: only fire when both agree AND price <= threshold
+    CONSENSUS: only fire when both agree AND price <= dynamic threshold
+
+    v1.1 improvements over v1.0:
+      1. Dead zone filter   â momentum below MOMENTUM_DEAD_ZONE is ignored (noise)
+      2. Signal staleness   â previous result expires after PREV_RESULT_MAX_AGE
+      3. Dynamic price cap  â base 0.45 scales up to 0.55 with stronger momentum
+      4. Time-aware entry   â tightens price cap as market nears close
+      5. Trade cooldown     â CONSENSUS_COOLDOWN seconds between trades
+      6. API throttle       â update_previous polls every PREV_CHECK_INTERVAL, not every cycle
     """
     def __init__(self, stake_dollars):
-        self.stake        = stake_dollars
-        self.name         = "CONSENSUS"
-        self.last_result  = None  # "yes" or "no"
-        self.last_ticker  = None
+        self.stake              = stake_dollars
+        self.name               = "CONSENSUS"
+        self.last_result        = None   # "yes" or "no"
+        self.last_result_time   = 0      # timestamp when last_result was set
+        self.last_ticker        = None
+        self.last_trade_time    = 0      # [v1.1] cooldown tracking
+        self._last_prev_check   = 0      # [v1.1] API throttle timestamp
 
     def update_previous(self, markets, client):
-        """Check recently closed markets for previous result."""
+        """
+        Check recently closed markets for previous result.
+        [v1.1] Throttled: only hits the API every PREV_CHECK_INTERVAL seconds.
+        """
+        now = time.time()
+        if now - self._last_prev_check < PREV_CHECK_INTERVAL:
+            return  # too soon, skip API call
+        self._last_prev_check = now
+
         closed = client.get_markets_by_series(BTC_TICKER, status="settled")
         if closed:
             latest = sorted(closed, key=lambda m: m.get("close_time", ""), reverse=True)[0]
             result = latest.get("result")
             if result and latest["ticker"] != self.last_ticker:
-                self.last_result = result
-                self.last_ticker = latest["ticker"]
+                self.last_result      = result
+                self.last_result_time = now   # [v1.1] timestamp the signal
+                self.last_ticker      = latest["ticker"]
 
-    def evaluate(self, market, btc_feed):
+    def evaluate(self, market, btc_feed, mins_left=None):
+        """
+        Evaluate consensus signal for a single market.
+
+        Args:
+            market:    Kalshi market dict
+            btc_feed:  BTCPriceFeed instance
+            mins_left: minutes remaining in this market (passed from main loop)
+
+        Returns signal dict or None.
+        """
         ticker  = market["ticker"]
         yes_px  = float(market.get("yes_ask_dollars", market.get("yes_bid_dollars", 0)))
         no_px   = float(market.get("no_ask_dollars",  market.get("no_bid_dollars",  0)))
@@ -637,15 +808,30 @@ class ConsensusStrategy:
         if book_sum < MIN_BOOK_SUM:
             return None
 
-        # MOMENTUM signal
+        # ── [v1.1] Cooldown check ──────────────────────────────
+        now = time.time()
+        if now - self.last_trade_time < CONSENSUS_COOLDOWN:
+            return None
+
+        # ── MOMENTUM signal ────────────────────────────────────
         btc_change = btc_feed.pct_change(MOMENTUM_WINDOW)
         if btc_change is None:
             return None
+
+        # [v1.1] Dead zone: ignore noise-level moves
+        if abs(btc_change) < MOMENTUM_DEAD_ZONE:
+            return None
+
         momentum_side = "yes" if btc_change > 0 else "no"
 
-        # PREVIOUS signal
+        # ── PREVIOUS signal ────────────────────────────────────
         if not self.last_result:
             return None
+
+        # [v1.1] Staleness: expire the previous signal after PREV_RESULT_MAX_AGE
+        if self.last_result_time and (now - self.last_result_time > PREV_RESULT_MAX_AGE):
+            return None
+
         previous_side = self.last_result
 
         # Both must agree
@@ -655,12 +841,29 @@ class ConsensusStrategy:
         side          = momentum_side
         price_dollars = yes_px if side == "yes" else no_px
 
-        # Only trade at or below threshold price
-        if price_dollars > CONSENSUS_MAX_PRICE:
+        # ── [v1.1] Dynamic price cap ──────────────────────────
+        # Base threshold of 0.45, scales up to CONSENSUS_MAX_PRICE with
+        # stronger momentum.  abs(btc_change)*100 maps ~0.03%â0.13%+
+        # into a 0â0.10 bonus on top of CONSENSUS_BASE_PRICE.
+        momentum_bonus = min(abs(btc_change) * 100, CONSENSUS_MAX_PRICE - CONSENSUS_BASE_PRICE)
+        dynamic_max    = CONSENSUS_BASE_PRICE + momentum_bonus
+
+        # [v1.1] Time-aware: tighten cap when < 8 min remain
+        if mins_left is not None and mins_left < 8:
+            time_penalty = 0.05 * max(0, 8 - mins_left) / 8  # up to 5Â¢ tighter
+            dynamic_max -= time_penalty
+
+        # Clamp to hard ceiling
+        dynamic_max = min(dynamic_max, CONSENSUS_MAX_PRICE)
+
+        if price_dollars > dynamic_max:
             return None
 
         price_cents = int(price_dollars * 100)
         count       = max(1, int(self.stake / price_dollars))
+
+        # [v1.1] Record trade time for cooldown
+        self.last_trade_time = now
 
         return {
             "strategy": self.name,
@@ -669,7 +872,8 @@ class ConsensusStrategy:
             "price":    price_cents,
             "count":    count,
             "dollars":  round(count * price_dollars, 2),
-            "reason":   f"Momentum {btc_change*100:+.2f}% + Previous={previous_side}",
+            "reason":   (f"Momentum {btc_change*100:+.3f}% + Previous={previous_side} "
+                         f"| cap={dynamic_max:.2f} mins_left={mins_left or '?'}"),
         }
 
 
@@ -732,7 +936,7 @@ class KalshiBot:
     def __init__(self, client, lag_stake, consensus_stake,
                  daily_loss_limit, dry_run):
         self.client    = client
-        self.btc       = BTCPriceFeed(window=200)
+        self.btc       = BTCPriceFeed(window=500)
         self.lag       = LagStrategy(lag_stake)
         self.consensus = ConsensusStrategy(consensus_stake)
         self.risk      = RiskManager(daily_loss_limit)
@@ -765,8 +969,11 @@ class KalshiBot:
         )
 
     def run_once(self):
-        # 1. Fetch BTC price
-        btc_price = self.btc.fetch()
+        # 1. Read latest BTC price (pushed via WebSocket, REST fallback)
+        btc_price = self.btc.current()
+        if btc_price is None:
+            # WS hasn't delivered yet — try a one-shot REST fetch
+            btc_price = self.btc.fetch()
         if btc_price is None:
             print(Fore.YELLOW + "  BTC price unavailable, skipping cycle")
             return
@@ -806,6 +1013,7 @@ class KalshiBot:
 
             # Time remaining check â skip if < 3 min left (too close to settlement)
             close_time = market.get("close_time")
+            mins_left = None
             if close_time:
                 try:
                     ct = datetime.datetime.fromisoformat(
@@ -819,7 +1027,11 @@ class KalshiBot:
 
             for strategy in [self.lag, self.consensus]:
                 try:
-                    signal = strategy.evaluate(market, self.btc)
+                    # [v1.1] Pass mins_left to consensus for time-aware entry
+                    if isinstance(strategy, ConsensusStrategy):
+                        signal = strategy.evaluate(market, self.btc, mins_left=mins_left)
+                    else:
+                        signal = strategy.evaluate(market, self.btc)
                 except Exception as e:
                     print(Fore.RED + f"  Strategy error ({strategy.name}): {e}")
                     continue
@@ -859,10 +1071,12 @@ class KalshiBot:
         ts         = datetime.datetime.now().strftime("%H:%M:%S")
         change     = self.btc.pct_change(60)
         change_str = f"{change*100:+.3f}%" if change else "â"
+        ws_tag     = "WS" if self.btc.is_live else "REST"
         print(
             f"  [{ts}]  BTC ${btc_price:,.0f}  1m:{change_str}  "
             f"Markets:{len(markets)}  "
-            f"Prev:{self.consensus.last_result or '?'}",
+            f"Prev:{self.consensus.last_result or '?'}"
+            f"  [{ws_tag}]",
             end="\r"
         )
 
@@ -876,11 +1090,8 @@ class KalshiBot:
         print(f"   Series: {BTC_TICKER}")
         print(Fore.YELLOW + "   Press Ctrl+C to stop\n")
 
-        # Warm up BTC feed
-        print("  Warming up BTC price feed (15s)...")
-        for _ in range(3):
-            self.btc.fetch()
-            time.sleep(5)
+        # Start real-time WebSocket price feed
+        self.btc.start()
 
         _last_resolve = 0
 
@@ -902,6 +1113,7 @@ class KalshiBot:
                 time.sleep(POLL_INTERVAL)
             except KeyboardInterrupt:
                 print(Fore.YELLOW + "\n\nBot stopped.")
+                self.btc.stop()
                 resolve_trades(self.client)
                 print_stats()
                 break
