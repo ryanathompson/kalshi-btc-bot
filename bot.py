@@ -327,19 +327,20 @@ class BTCPriceFeed:
 
     def _ws_loop(self):
         """Connect + reconnect loop with exponential backoff."""
-        backoff = 1
+        self._backoff = 1
         while not self._stop.is_set():
             try:
+                print(f"  [price] WS connecting to {COINBASE_WS_URL}...", flush=True)
                 self._connect()
             except Exception as e:
-                print(f"  [price] WS error: {e}", flush=True)
+                print(f"  [price] WS connection failed: {type(e).__name__}: {e}", flush=True)
             self._ws_alive = False
             if self._stop.is_set():
                 break
-            wait = min(backoff, 30)
-            print(f"  [price] WS reconnecting in {wait}s...", flush=True)
+            wait = min(self._backoff, 30)
+            print(f"  [price] WS disconnected, retrying in {wait}s (REST fallback active)...", flush=True)
             self._stop.wait(wait)
-            backoff = min(backoff * 2, 30)
+            self._backoff = min(self._backoff * 2, 30)
 
     def _connect(self):
         """Single WebSocket session: subscribe, read messages, handle pings."""
@@ -369,6 +370,8 @@ class BTCPriceFeed:
         })
         ws.send(hb)
         self._ws_alive = True
+        self._backoff  = 1  # reset backoff on successful connect
+        print("  [price] WS connected, subscribed to ticker + heartbeats", flush=True)
 
     def _on_message(self, ws, raw):
         try:
@@ -393,6 +396,8 @@ class BTCPriceFeed:
 
     def _on_close(self, ws, close_status, close_msg):
         self._ws_alive = False
+        if close_status or close_msg:
+            print(f"  [price] WS closed: status={close_status} msg={close_msg}", flush=True)
 
     # ── REST fallback ──────────────────────────────────────
     def fetch(self):
@@ -970,10 +975,10 @@ class KalshiBot:
 
     def run_once(self):
         # 1. Read latest BTC price (pushed via WebSocket, REST fallback)
+        if not self.btc.is_live:
+            # WS is down — poll REST every cycle to keep prices fresh
+            self.btc.fetch()
         btc_price = self.btc.current()
-        if btc_price is None:
-            # WS hasn't delivered yet — try a one-shot REST fetch
-            btc_price = self.btc.fetch()
         if btc_price is None:
             print(Fore.YELLOW + "  BTC price unavailable, skipping cycle")
             return
