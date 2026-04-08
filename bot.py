@@ -896,23 +896,34 @@ class RiskManager:
         self.max_open     = max_open_trades
         self._halted      = False
         self._halt_reason = ""
+        self._halt_date   = None          # date the halt was triggered
 
     def check(self, client):
+        today = datetime.date.today()
+
+        # Auto-reset halt at midnight — new day, clean slate
+        if self._halted and self._halt_date and today > self._halt_date:
+            print(f"  ♻ New trading day — clearing yesterday's halt ({self._halt_reason})")
+            self._halted      = False
+            self._halt_reason = ""
+            self._halt_date   = None
+
         if self._halted:
             return False, self._halt_reason
 
         trades = load_trades()
-        today  = datetime.date.today().isoformat()
+        today_str = today.isoformat()
 
         # Daily loss check
         today_settled = [
             t for t in trades
-            if t.get("result") and t.get("timestamp", "")[:10] == today
+            if t.get("result") and t.get("timestamp", "")[:10] == today_str
         ]
         daily_pnl = sum(t.get("pnl", 0) for t in today_settled if t.get("pnl"))
         if daily_pnl <= -abs(self.daily_limit):
             self._halted      = True
             self._halt_reason = f"Daily loss limit hit (${daily_pnl:.2f})"
+            self._halt_date   = today
             return False, self._halt_reason
 
         # Open trade count
