@@ -524,7 +524,7 @@
   <h1>🤖 Kalshi BTC Bot</h1>
   <span id="mode-badge" class="badge badge-offline"><span class="dot"></span> Loading</span>
   <div id="halt-controls" class="halt-controls">
-    <span id="halt-countdown" title="Time until automatic halt reset at 00:00 UTC">--:--:--</span>
+    <span id="halt-countdown" title="Time until automatic halt reset at 00:00 ET">--:--:--</span>
     <button id="reset-halt-btn" type="button" title="Force-clear the halt right now">Reset Now</button>
   </div>
 
@@ -700,6 +700,21 @@
 </main>
 
 <script>
+  // ── Dashboard timezone ────────────────────────────────────
+  // All times shown to the operator are rendered in US Eastern,
+  // regardless of the browser's locale.
+  const DASH_TZ = 'America/New_York';
+  const _etFmt  = new Intl.DateTimeFormat('en-US', {
+    timeZone:     DASH_TZ,
+    year:         'numeric',
+    month:        '2-digit',
+    day:          '2-digit',
+    hour:         '2-digit',
+    minute:       '2-digit',
+    second:       '2-digit',
+    hour12:       false,
+  });
+
   function fmt$(n) {
     if (n == null) return '—';
     return '$' + Math.abs(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2});
@@ -709,9 +724,22 @@
     const sign = n >= 0 ? '+' : '';
     return sign + n.toFixed(2) + '%';
   }
+  // Robust ISO parser: handles naive (treated as UTC), 'Z'-suffixed,
+  // and numeric-offset timestamps. Returns ms-since-epoch or NaN.
+  function parseTs(s) {
+    if (!s) return NaN;
+    const hasTz = /[zZ]|[+\-]\d\d:?\d\d$/.test(s);
+    return new Date(hasTz ? s : s + 'Z').getTime();
+  }
+  function fmtEt(iso) {
+    const ms = parseTs(iso);
+    if (!isFinite(ms)) return '—';
+    return _etFmt.format(new Date(ms)) + ' ET';
+  }
   function timeAgo(iso) {
-    if (!iso) return '—';
-    const s = (Date.now() - new Date(iso + 'Z').getTime()) / 1000;
+    const ms = parseTs(iso);
+    if (!isFinite(ms)) return '—';
+    const s = (Date.now() - ms) / 1000;
     if (s < 60)   return Math.round(s) + 's ago';
     if (s < 3600) return Math.round(s/60) + 'm ago';
     return Math.round(s/3600) + 'h ago';
@@ -1113,11 +1141,10 @@
       document.getElementById('con-stake').textContent  = d.con_stake ?? '—';
       document.getElementById('daily-limit').textContent = d.daily_limit ?? '—';
 
-      // Started / last cycle
+      // Started / last cycle (always rendered in ET)
       const saEl = document.getElementById('started-at');
       if (d.started_at) {
-        const dt = new Date(d.started_at + 'Z');
-        saEl.textContent = dt.toLocaleString();
+        saEl.textContent = fmtEt(d.started_at);
       }
       if (d.last_cycle) {
         document.getElementById('last-cycle').textContent = timeAgo(d.last_cycle);
@@ -1177,7 +1204,7 @@
       Are you <strong>sure</strong> you want to force-clear the bot's halt state?
       This bypasses the risk-manager stop and allows new trades to be placed
       <strong>immediately</strong>. The halt would otherwise auto-clear at
-      <strong>00:00 UTC</strong>. Only do this if you have reviewed the halt reason
+      <strong>00:00 ET</strong>. Only do this if you have reviewed the halt reason
       and accept the risk.
     </p>
     <div class="modal-actions">
@@ -1198,20 +1225,34 @@
     const cancel   = document.getElementById('reset-cancel');
     const confirm  = document.getElementById('reset-confirm');
 
+    // Compute the wall-clock parts of "now" as observed in US Eastern.
+    // We use Intl.DateTimeFormat so the browser handles EDT/EST transitions.
+    const _etParts = new Intl.DateTimeFormat('en-US', {
+      timeZone: 'America/New_York',
+      hour12:   false,
+      hour:     '2-digit',
+      minute:   '2-digit',
+      second:   '2-digit',
+    });
+    function _etHMS() {
+      const parts = _etParts.formatToParts(new Date());
+      const get = t => parseInt(parts.find(p => p.type === t).value, 10);
+      // 'hour' may come back as '24' at midnight — normalize to 0.
+      let h = get('hour'); if (h === 24) h = 0;
+      return { h, m: get('minute'), s: get('second') };
+    }
+
     function tick() {
-      const now = new Date();
-      // Reset fires at 00:00 UTC (RiskManager uses server local time which is UTC on Render)
-      const next = Date.UTC(
-        now.getUTCFullYear(),
-        now.getUTCMonth(),
-        now.getUTCDate() + 1,
-        0, 0, 0
-      );
-      let secs = Math.max(0, Math.floor((next - now.getTime()) / 1000));
-      const h = String(Math.floor(secs / 3600)).padStart(2, '0');
-      const m = String(Math.floor((secs % 3600) / 60)).padStart(2, '0');
-      const s = String(secs % 60).padStart(2, '0');
-      cdEl.textContent = `${h}:${m}:${s}`;
+      // Reset fires at 00:00 America/New_York (handled server-side by RiskManager).
+      // We compute the countdown from ET wall-clock so DST transitions are correct.
+      const { h, m, s } = _etHMS();
+      const secsIntoDay = h * 3600 + m * 60 + s;
+      let secs = (24 * 3600) - secsIntoDay;
+      if (secs <= 0) secs = 0;
+      const hh = String(Math.floor(secs / 3600)).padStart(2, '0');
+      const mm = String(Math.floor((secs % 3600) / 60)).padStart(2, '0');
+      const ss = String(secs % 60).padStart(2, '0');
+      cdEl.textContent = `${hh}:${mm}:${ss}`;
     }
 
     // Exposed so refresh() can toggle visibility based on d.halted

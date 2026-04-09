@@ -56,6 +56,56 @@ import base64
 import datetime
 import threading
 import requests
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:                                    # pragma: no cover
+    from backports.zoneinfo import ZoneInfo            # type: ignore
+
+# ─── Trading timezone ───────────────────────────────────────────────────
+# All human-facing times, trade log timestamps, and daily-rollover logic
+# use US Eastern Time. ZoneInfo handles EDT/EST transitions automatically.
+ET = ZoneInfo("America/New_York")
+
+
+def now_et():
+    """Current time as an aware datetime in US Eastern (EDT/EST)."""
+    return datetime.datetime.now(ET)
+
+
+def today_et():
+    """Current calendar date in US Eastern."""
+    return now_et().date()
+
+
+def parse_trade_ts(ts):
+    """Parse a trade-log timestamp to a tz-aware datetime.
+
+    Trade records come in three flavors:
+      - New bot-logged trades:  ET-aware ISO ('...-04:00' or '-05:00')
+      - Legacy bot-logged:      Naive UTC from datetime.utcnow().isoformat()
+      - Recovered via rebuild:  UTC with 'Z' suffix from Kalshi API
+
+    Returns None if the string cannot be parsed.
+    """
+    if not ts:
+        return None
+    try:
+        s = ts
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        dt = datetime.datetime.fromisoformat(s)
+        # Naive legacy records → assume UTC (that's what utcnow() produced)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        return dt
+    except Exception:
+        return None
+
+
+def trade_date_et(ts):
+    """Calendar date (in ET) that a trade timestamp falls on, or None."""
+    dt = parse_trade_ts(ts)
+    return dt.astimezone(ET).date() if dt else None
 import argparse
 import websocket
 from collections import deque
@@ -198,7 +248,9 @@ def sign(private_key, timestamp, method, path):
 
 
 def auth_headers(private_key, api_key_id, method, path):
-    ts = str(int(datetime.datetime.now().timestamp() * 1000))
+    # Kalshi API signing timestamp must be POSIX epoch ms — use an
+    # explicitly-UTC datetime so this is correct regardless of server TZ.
+    ts = str(int(datetime.datetime.now(datetime.timezone.utc).timestamp() * 1000))
     from urllib.parse import urlparse
     sign_path = urlparse(BASE_URL + path).path
     return {
@@ -582,7 +634,12 @@ def rebuild_trades_from_api(client):
 
     if new_trades:
         all_trades = existing + new_trades
-        all_trades.sort(key=lambda t: t.get("timestamp", ""))
+        # Sort by parsed epoch (handles mixed ET-aware, naive-UTC, and
+        # Kalshi 'Z' timestamps correctly — string sort would not).
+        def _chrono(t):
+            dt = parse_trade_ts(t.get("timestamp"))
+            return dt.timestamp() if dt else 0
+        all_trades.sort(key=_chrono)
         with open(LOG_FILE, "w") as f:
             json.dump(all_trades, f, indent=2)
         wins = sum(1 for t in new_trades if t.get("result") == "WIN")
@@ -897,35 +954,34 @@ class RiskManager:
         self._halted      = False
         self._halt_reason = ""
         self._halt_date   = None          # date the halt was triggered
-        self._override_date = None        # date of manual daily-loss override (bypass until next UTC midnight)
+        self._override_date = None        # date of manual daily-loss override (bypass until next ET midnight)
 
     def check(self, client):
-        today = datetime.date.today()
+        today = today_et()
 
-        # Auto-reset halt at midnight — new day, clean slate
+        # Auto-reset halt at ET midnight — new trading day, clean slate
         if self._halted and self._halt_date and today > self._halt_date:
-            print(f"  ♻ New trading day — clearing yesterday's halt ({self._halt_reason})")
+            print(f"  ♻ New trading day (ET) — clearing yesterday's halt ({self._halt_reason})")
             self._halted      = False
             self._halt_reason = ""
             self._halt_date   = None
 
-        # Auto-clear manual daily-loss override at midnight too
+        # Auto-clear manual daily-loss override at ET midnight too
         if self._override_date and today > self._override_date:
-            print(f"  ♻ New trading day — clearing manual daily-loss override")
+            print(f"  ♻ New trading day (ET) — clearing manual daily-loss override")
             self._override_date = None
 
         if self._halted:
             return False, self._halt_reason
 
         trades = load_trades()
-        today_str = today.isoformat()
 
         # Daily loss check — skipped for the rest of today if the operator
         # manually reset the halt via the dashboard (Reset Now button).
         if self._override_date != today:
             today_settled = [
                 t for t in trades
-                if t.get("result") and t.get("timestamp", "")[:10] == today_str
+                if t.get("result") and trade_date_et(t.get("timestamp")) == today
             ]
             daily_pnl = sum(t.get("pnl", 0) for t in today_settled if t.get("pnl"))
             if daily_pnl <= -abs(self.daily_limit):
@@ -971,7 +1027,7 @@ class KalshiBot:
     def _log_signal(self, signal, order_result):
         record = {
             **signal,
-            "timestamp":  datetime.datetime.utcnow().isoformat(),
+            "timestamp":  now_et().isoformat(),
             "dry_run":    self.dry,
             "order":      order_result,
             "outcome":    None,
@@ -1092,7 +1148,7 @@ class KalshiBot:
                 break  # one strategy per market per cycle
 
         # Status line
-        ts         = datetime.datetime.now().strftime("%H:%M:%S")
+        ts         = now_et().strftime("%H:%M:%S")
         change     = self.btc.pct_change(60)
         change_str = f"{change*100:+.3f}%" if change else "â"
         ws_tag     = "WS" if self.btc.is_live else "REST"

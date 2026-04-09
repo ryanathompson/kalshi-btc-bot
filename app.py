@@ -21,6 +21,7 @@ from dotenv import load_dotenv
 from bot import (
     KalshiBot, KalshiClient, load_private_key, load_trades, POLL_INTERVAL,
     resolve_trades, start_keep_alive, rebuild_trades_from_api,
+    ET, now_et, today_et, parse_trade_ts,
 )
 
 load_dotenv()
@@ -85,28 +86,28 @@ def _strat_stats(trades, name=None):
     }
 
 
-def _to_utc_ms(ts):
-    """Parse a trade timestamp to epoch ms (UTC), tolerant of formats.
+def _to_epoch_ms(ts):
+    """Parse any trade-log timestamp format to epoch ms (UTC).
 
-    Bot-logged trades use naive UTC (datetime.utcnow().isoformat() — no suffix).
-    Rebuilt trades from Kalshi use ISO-8601 with explicit 'Z' or a numeric
-    offset (e.g. '2026-04-09T08:15:00.123456Z' or '...+00:00'). Return None
-    if unparseable so the caller can drop the point.
+    Delegates to bot.parse_trade_ts which knows about ET-aware, naive-UTC,
+    and Kalshi 'Z'-suffixed formats. Returns None if unparseable.
     """
-    if not ts:
-        return None
-    try:
-        s = ts
-        # Python <3.11: fromisoformat doesn't accept trailing 'Z'
-        if s.endswith("Z"):
-            s = s[:-1] + "+00:00"
-        dt = datetime.datetime.fromisoformat(s)
-        # Naive → assume UTC (that's what bot.py writes with utcnow())
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=datetime.timezone.utc)
-        return int(dt.timestamp() * 1000)
-    except Exception:
-        return None
+    dt = parse_trade_ts(ts)
+    return int(dt.timestamp() * 1000) if dt else None
+
+
+def _fmt_et(ts, short=True):
+    """Format a trade timestamp as a human-readable ET string.
+
+    short=True  → 'YYYY-MM-DD HH:MM ET'  (for tables)
+    short=False → 'YYYY-MM-DD HH:MM:SS ET' (for detail views)
+    """
+    dt = parse_trade_ts(ts)
+    if not dt:
+        return "—"
+    et = dt.astimezone(ET)
+    fmt = "%Y-%m-%d %H:%M" if short else "%Y-%m-%d %H:%M:%S"
+    return et.strftime(fmt) + " ET"
 
 
 def _pnl_points(trades):
@@ -123,7 +124,7 @@ def _pnl_points(trades):
             continue
         if t.get("pnl") is None:
             continue
-        ms = _to_utc_ms(t.get("timestamp"))
+        ms = _to_epoch_ms(t.get("timestamp"))
         if ms is None:
             continue
         settled.append((ms, float(t.get("pnl") or 0)))
@@ -161,29 +162,40 @@ def api_status():
     trades = load_trades()
 
     open_trades = [t for t in trades if not t.get("result")]
+
+    # Sort by parsed epoch ms, not raw string — bot-logged (ET-aware),
+    # legacy (naive UTC), and recovered (UTC 'Z') timestamps do NOT sort
+    # correctly lexicographically against one another.
+    def _sort_key(t):
+        ms = _to_epoch_ms(t.get("timestamp"))
+        return ms if ms is not None else -1
     history = sorted(
         [t for t in trades if t.get("result")],
-        key=lambda t: t.get("timestamp", ""),
+        key=_sort_key,
         reverse=True,
     )[:100]
 
-    # Format open trades for display
+    # Format open trades for display — 'age' is wall-clock delta,
+    # independent of storage TZ, so we compute it from parsed UTC.
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+
     def fmt_open(t):
-        ts = t.get("timestamp", "")
-        try:
-            dt = datetime.datetime.fromisoformat(ts)
-            age_s = (datetime.datetime.utcnow() - dt).total_seconds()
-            if age_s < 3600:
+        dt = parse_trade_ts(t.get("timestamp"))
+        if dt is None:
+            age = "—"
+        else:
+            age_s = (now_utc - dt).total_seconds()
+            if age_s < 0:
+                age = "just now"
+            elif age_s < 3600:
                 age = f"{int(age_s // 60)}m ago"
             else:
                 age = f"{int(age_s // 3600)}h ago"
-        except Exception:
-            age = ts[:16] if ts else "â"
-        return {**t, "age": age}
+        return {**t, "age": age, "ts_et": _fmt_et(t.get("timestamp"))}
 
     def fmt_hist(t):
-        ts = t.get("timestamp", "")
-        return {**t, "ts_short": ts[:16].replace("T", " ") if ts else "â"}
+        # Always show ET so bot-logged and recovered trades use the same clock.
+        return {**t, "ts_short": _fmt_et(t.get("timestamp"))}
 
     return jsonify({
         "running":      _state.running,
@@ -227,7 +239,7 @@ def api_resolve():
 def api_reset_halt():
     """Manually clear the RiskManager halt state.
 
-    The halt is normally auto-cleared at UTC midnight (new trading day).
+    The halt is normally auto-cleared at ET midnight (new trading day).
     This endpoint lets the operator force an immediate reset from the
     dashboard after reviewing the halt reason.
     """
@@ -241,13 +253,13 @@ def api_reset_halt():
         # CRITICAL: also set the manual override for today, otherwise the
         # main loop's next risk.check() (within POLL_INTERVAL seconds) will
         # recompute today's PnL from the trade log and re-halt immediately
-        # with the same reason. The override auto-clears at UTC midnight.
-        _bot.risk._override_date = datetime.date.today()
+        # with the same reason. The override auto-clears at ET midnight.
+        _bot.risk._override_date = today_et()
         # Mirror into shared state so the dashboard updates immediately
         _state.halted      = False
         _state.halt_reason = ""
         print(f"[bot] Halt manually reset via dashboard (was: {prev_reason}) "
-              f"— daily-loss check bypassed until UTC midnight", flush=True)
+              f"— daily-loss check bypassed until next ET midnight", flush=True)
         return jsonify({"ok": True, "was": prev_reason})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -260,7 +272,7 @@ def api_reset_halt():
 def _bot_thread():
     global _bot
     _state.running    = True
-    _state.started_at = datetime.datetime.utcnow().isoformat()
+    _state.started_at = now_et().isoformat()
 
     # Start self-ping to prevent Render free-tier spin-down
     start_keep_alive()
@@ -326,7 +338,7 @@ def _bot_thread():
                 _state.prev_result  = _bot.consensus.last_result
                 _state.halted       = _bot.risk._halted
                 _state.halt_reason  = _bot.risk._halt_reason
-                _state.last_cycle   = datetime.datetime.utcnow().isoformat()
+                _state.last_cycle   = now_et().isoformat()
                 _state.error        = None
 
             except Exception as e:
