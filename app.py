@@ -85,26 +85,57 @@ def _strat_stats(trades, name=None):
     }
 
 
+def _to_utc_ms(ts):
+    """Parse a trade timestamp to epoch ms (UTC), tolerant of formats.
+
+    Bot-logged trades use naive UTC (datetime.utcnow().isoformat() — no suffix).
+    Rebuilt trades from Kalshi use ISO-8601 with explicit 'Z' or a numeric
+    offset (e.g. '2026-04-09T08:15:00.123456Z' or '...+00:00'). Return None
+    if unparseable so the caller can drop the point.
+    """
+    if not ts:
+        return None
+    try:
+        s = ts
+        # Python <3.11: fromisoformat doesn't accept trailing 'Z'
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        dt = datetime.datetime.fromisoformat(s)
+        # Naive → assume UTC (that's what bot.py writes with utcnow())
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        return int(dt.timestamp() * 1000)
+    except Exception:
+        return None
+
+
 def _pnl_points(trades):
     """Chronological cumulative-P&L series across ALL settled trades.
 
-    Returns [{"t": iso_timestamp, "pnl": cumulative_pnl, "delta": trade_pnl}, ...]
-    sorted by timestamp ascending. The frontend uses this to render the
-    time-windowed Profit/Loss tracker card (1D / 1W / 1M / ALL).
+    Returns [{"ts": epoch_ms_utc, "pnl": cumulative_pnl, "delta": trade_pnl}, ...]
+    sorted by timestamp ascending. Timestamps are normalized to epoch ms so
+    the frontend doesn't have to worry about mixed ISO formats across
+    bot-logged trades (naive UTC) and API-rebuilt trades (ISO with 'Z').
     """
-    settled = [
-        t for t in trades
-        if t.get("result") and t.get("pnl") is not None and t.get("timestamp")
-    ]
-    settled.sort(key=lambda t: t.get("timestamp", ""))
+    settled = []
+    for t in trades:
+        if not t.get("result"):
+            continue
+        if t.get("pnl") is None:
+            continue
+        ms = _to_utc_ms(t.get("timestamp"))
+        if ms is None:
+            continue
+        settled.append((ms, float(t.get("pnl") or 0)))
+
+    settled.sort(key=lambda pair: pair[0])
 
     points = []
     cum = 0.0
-    for t in settled:
-        delta = float(t.get("pnl") or 0)
-        cum  += delta
+    for ms, delta in settled:
+        cum += delta
         points.append({
-            "t":     t.get("timestamp", ""),
+            "ts":    ms,
             "pnl":   round(cum, 2),
             "delta": round(delta, 2),
         })

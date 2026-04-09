@@ -748,9 +748,13 @@
 
     rangeEl.textContent = _rangeLabel(range);
 
-    // Parse all points once (server timestamps are UTC ISO, append Z)
+    // Server already normalizes to epoch-ms UTC in `ts` (handles both
+    // naive-UTC bot trades AND ISO-with-Z recovered trades from the Kalshi API).
+    // Fall back to parsing `t` for any stale payloads still in flight.
     const parsed = pts.map(p => ({
-      ts:  new Date(p.t + 'Z').getTime(),
+      ts:  typeof p.ts === 'number' ? p.ts
+         : p.t ? new Date(/[zZ]|[+\-]\d\d:?\d\d$/.test(p.t) ? p.t : p.t + 'Z').getTime()
+         : NaN,
       cum: p.pnl,
     })).filter(p => isFinite(p.ts));
 
