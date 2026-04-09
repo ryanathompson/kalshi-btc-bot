@@ -700,6 +700,72 @@ def resolve_trades(client):
     return changed
 
 
+def update_fill_times(client):
+    """
+    Back-fill fill_timestamp + fill_latency_s on any live-logged trades that
+    have been placed but whose fill metadata hasn't been recorded yet.
+
+    Runs on the same 60s cadence as resolve_trades() and pulls only the most
+    recent page of fills (limit=200) so it's cheap at steady state.  Kalshi
+    emits fill.created_time which is the actual match time — joined against
+    the trade's bot-side placement timestamp, that gives us per-trade resting
+    latency without any post-hoc API reconciliation.
+
+    Side effects: writes back to bot_trades.json if anything changed.
+    Returns the number of trades updated.
+
+    Skips:
+      - dry-run trades (never had a real order_id)
+      - trades already back-filled (fill_timestamp is not None)
+      - trades without a recorded order_id (legacy / rebuilt records)
+    """
+    trades = load_trades()
+    pending = [
+        t for t in trades
+        if not t.get("dry_run")
+        and t.get("order_id")
+        and not t.get("fill_timestamp")
+    ]
+    if not pending:
+        return 0
+
+    try:
+        resp = client.get("/portfolio/fills", params={"limit": 200})
+    except Exception as e:
+        print(f"[fill-sync] Error fetching fills: {e}", flush=True)
+        return 0
+
+    fills = resp.get("fills", []) or []
+
+    # For each order_id, keep the earliest fill timestamp (handles partials).
+    first_fill_ts = {}
+    for f in fills:
+        oid = f.get("order_id")
+        ts  = f.get("created_time")
+        if not oid or not ts:
+            continue
+        prev = first_fill_ts.get(oid)
+        if prev is None or ts < prev:
+            first_fill_ts[oid] = ts
+
+    updated = 0
+    for t in pending:
+        fill_ts = first_fill_ts.get(t.get("order_id"))
+        if not fill_ts:
+            continue
+        t["fill_timestamp"] = fill_ts
+        placed_dt = parse_trade_ts(t.get("timestamp"))
+        fill_dt   = parse_trade_ts(fill_ts)
+        if placed_dt and fill_dt:
+            t["fill_latency_s"] = round((fill_dt - placed_dt).total_seconds(), 2)
+        updated += 1
+
+    if updated:
+        with open(LOG_FILE, "w") as f:
+            json.dump(trades, f, indent=2)
+    return updated
+
+
 def print_stats():
     trades = load_trades()
     settled = [t for t in trades if t.get("result")]
@@ -1025,14 +1091,28 @@ class KalshiBot:
         self._last_markets = []          # exposed for dashboard
 
     def _log_signal(self, signal, order_result):
+        # Extract order_id from Kalshi's response so update_fill_times()
+        # can later join this trade against /portfolio/fills by order_id.
+        # Kalshi wraps the created order under an "order" key on 201.
+        order_id = None
+        if isinstance(order_result, dict):
+            inner = order_result.get("order")
+            if isinstance(inner, dict):
+                order_id = inner.get("order_id")
+            if not order_id:
+                order_id = order_result.get("order_id")
+
         record = {
             **signal,
-            "timestamp":  now_et().isoformat(),
-            "dry_run":    self.dry,
-            "order":      order_result,
-            "outcome":    None,
-            "result":     None,
-            "pnl":        None,
+            "timestamp":       now_et().isoformat(),  # placement time (bot-side)
+            "dry_run":         self.dry,
+            "order":           order_result,
+            "order_id":        order_id,
+            "fill_timestamp":  None,   # populated by update_fill_times()
+            "fill_latency_s":  None,   # populated by update_fill_times()
+            "outcome":         None,
+            "result":          None,
+            "pnl":             None,
         }
         save_trade(record)
         return record
@@ -1181,7 +1261,7 @@ class KalshiBot:
                 # Clear traded set every 15 min
                 if int(time.time()) % 900 < POLL_INTERVAL:
                     self.traded_this_market.clear()
-                # Resolve settled trades every 60 s
+                # Resolve settled trades + back-fill fill timestamps every 60s
                 if time.time() - _last_resolve >= 60:
                     try:
                         n = resolve_trades(self.client)
@@ -1189,6 +1269,12 @@ class KalshiBot:
                             print(f"[bot] Resolved {n} trade(s).", flush=True)
                     except Exception as re:
                         print(f"[bot] resolve error: {re}", flush=True)
+                    try:
+                        f = update_fill_times(self.client)
+                        if f:
+                            print(f"[bot] Back-filled fill times on {f} trade(s).", flush=True)
+                    except Exception as fe:
+                        print(f"[bot] fill-sync error: {fe}", flush=True)
                     _last_resolve = time.time()
                 time.sleep(POLL_INTERVAL)
             except KeyboardInterrupt:
