@@ -85,6 +85,32 @@ def _strat_stats(trades, name=None):
     }
 
 
+def _pnl_points(trades):
+    """Chronological cumulative-P&L series across ALL settled trades.
+
+    Returns [{"t": iso_timestamp, "pnl": cumulative_pnl, "delta": trade_pnl}, ...]
+    sorted by timestamp ascending. The frontend uses this to render the
+    time-windowed Profit/Loss tracker card (1D / 1W / 1M / ALL).
+    """
+    settled = [
+        t for t in trades
+        if t.get("result") and t.get("pnl") is not None and t.get("timestamp")
+    ]
+    settled.sort(key=lambda t: t.get("timestamp", ""))
+
+    points = []
+    cum = 0.0
+    for t in settled:
+        delta = float(t.get("pnl") or 0)
+        cum  += delta
+        points.append({
+            "t":     t.get("timestamp", ""),
+            "pnl":   round(cum, 2),
+            "delta": round(delta, 2),
+        })
+    return points
+
+
 # âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 # FLASK ROUTES
 # âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
@@ -148,6 +174,7 @@ def api_status():
         "lag_stats":    _strat_stats(trades, "LAG"),
         "con_stats":    _strat_stats(trades, "CONSENSUS"),
         "all_stats":    _strat_stats(trades),
+        "pnl_points":   _pnl_points(trades),
     })
 
 

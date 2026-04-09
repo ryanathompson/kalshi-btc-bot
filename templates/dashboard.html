@@ -320,6 +320,102 @@
     .pnl-sub.neg { color: var(--red); }
     .pnl-sub .open-lbl { color: var(--blue); }
 
+    /* ── PROFIT/LOSS TRACKER CARD (time-windowed w/ sparkline) ── */
+    .pnl-tracker {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 20px 24px 18px;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+    .pnl-tracker-top {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 16px;
+      flex-wrap: wrap;
+    }
+    .pnl-tracker-left  { display: flex; flex-direction: column; gap: 4px; }
+    .pnl-tracker-label {
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+      color: var(--muted);
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+    #pnl-trend-arrow {
+      font-size: 11px;
+      line-height: 1;
+      color: var(--muted);
+    }
+    .pnl-tracker-value {
+      font-size: 34px;
+      font-weight: 800;
+      letter-spacing: -.02em;
+      line-height: 1.1;
+      color: var(--text);
+    }
+    .pnl-tracker-value.pos { color: var(--green); }
+    .pnl-tracker-value.neg { color: var(--red); }
+    .pnl-tracker-range {
+      font-size: 11px;
+      color: var(--muted);
+      margin-top: 2px;
+    }
+    .pnl-tracker-tabs {
+      display: inline-flex;
+      background: rgba(255,255,255,.03);
+      border: 1px solid var(--border);
+      border-radius: 9px;
+      padding: 3px;
+      gap: 2px;
+      align-self: flex-start;
+    }
+    .pnl-tab {
+      background: transparent;
+      border: none;
+      color: var(--muted);
+      font-family: inherit;
+      font-size: 12px;
+      font-weight: 700;
+      padding: 5px 14px;
+      border-radius: 6px;
+      cursor: pointer;
+      letter-spacing: .03em;
+      transition: background .12s, color .12s;
+    }
+    .pnl-tab:hover { color: var(--text); }
+    .pnl-tab.active {
+      background: rgba(88,166,255,.15);
+      color: var(--blue);
+    }
+    .pnl-spark-wrap {
+      position: relative;
+      width: 100%;
+      height: 96px;
+    }
+    .pnl-spark {
+      width: 100%;
+      height: 100%;
+      display: block;
+      overflow: visible;
+    }
+    .pnl-spark-empty {
+      display: none;
+      position: absolute;
+      inset: 0;
+      align-items: center;
+      justify-content: center;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .pnl-spark-empty.active { display: flex; }
+
     /* -- HALT CONTROLS (countdown + reset button) -- */
     .halt-controls {
       display: none;
@@ -449,6 +545,29 @@
   <!-- ERROR / HALT BANNERS -->
   <div id="error-banner"></div>
   <div id="halt-banner"></div>
+
+  <!-- PROFIT / LOSS TRACKER (time-windowed w/ sparkline) -->
+  <div class="pnl-tracker" id="pnl-tracker">
+    <div class="pnl-tracker-top">
+      <div class="pnl-tracker-left">
+        <div class="pnl-tracker-label">
+          <span id="pnl-trend-arrow">▲</span> Profit/Loss
+        </div>
+        <div class="pnl-tracker-value" id="pnl-trend-value">—</div>
+        <div class="pnl-tracker-range" id="pnl-trend-range">Past Day</div>
+      </div>
+      <div class="pnl-tracker-tabs" role="tablist" aria-label="Profit/Loss range">
+        <button class="pnl-tab active" type="button" data-range="1D">1D</button>
+        <button class="pnl-tab"        type="button" data-range="1W">1W</button>
+        <button class="pnl-tab"        type="button" data-range="1M">1M</button>
+        <button class="pnl-tab"        type="button" data-range="ALL">ALL</button>
+      </div>
+    </div>
+    <div class="pnl-spark-wrap">
+      <svg class="pnl-spark" id="pnl-spark" preserveAspectRatio="none" viewBox="0 0 400 96"></svg>
+      <div class="pnl-spark-empty" id="pnl-spark-empty">No settled trades in this range</div>
+    </div>
+  </div>
 
   <!-- P&L STATS BAR -->
   <div class="pnl-bar">
@@ -600,6 +719,175 @@
   function pill(text, cls) {
     return `<span class="pill pill-${cls}">${text}</span>`;
   }
+
+  // ── Profit/Loss tracker (time-windowed) ───────────────────
+  const _pnlTracker = { range: '1D', points: [] };
+
+  function _rangeMs(r) {
+    switch (r) {
+      case '1D':  return 24 * 60 * 60 * 1000;
+      case '1W':  return 7  * 24 * 60 * 60 * 1000;
+      case '1M':  return 30 * 24 * 60 * 60 * 1000;
+      case 'ALL': return Infinity;
+    }
+    return 24 * 60 * 60 * 1000;
+  }
+  function _rangeLabel(r) {
+    return ({'1D':'Past Day','1W':'Past Week','1M':'Past Month','ALL':'All Time'})[r] || '';
+  }
+
+  function renderPnlTracker() {
+    const range    = _pnlTracker.range;
+    const pts      = _pnlTracker.points || [];
+    const now      = Date.now();
+    const window   = _rangeMs(range);
+    const valueEl  = document.getElementById('pnl-trend-value');
+    const arrowEl  = document.getElementById('pnl-trend-arrow');
+    const rangeEl  = document.getElementById('pnl-trend-range');
+    const emptyEl  = document.getElementById('pnl-spark-empty');
+
+    rangeEl.textContent = _rangeLabel(range);
+
+    // Parse all points once (server timestamps are UTC ISO, append Z)
+    const parsed = pts.map(p => ({
+      ts:  new Date(p.t + 'Z').getTime(),
+      cum: p.pnl,
+    })).filter(p => isFinite(p.ts));
+
+    // Cumulative P&L at the moment the window opens (0 for ALL)
+    const startTs  = isFinite(window) ? (now - window) : -Infinity;
+    let   startCum = 0;
+    const inRange  = [];
+    for (const p of parsed) {
+      if (p.ts < startTs) startCum = p.cum;
+      else                inRange.push(p);
+    }
+
+    // Headline = delta from window-start to most recent settled trade in range
+    const headline = inRange.length
+      ? (inRange[inRange.length - 1].cum - startCum)
+      : 0;
+
+    // Render headline
+    const sign = headline >= 0 ? '+' : '-';
+    const abs  = Math.abs(headline).toLocaleString('en-US', {
+      minimumFractionDigits: 2, maximumFractionDigits: 2,
+    });
+    valueEl.textContent = sign + '$' + abs;
+    valueEl.className   = 'pnl-tracker-value ' +
+      (headline > 0 ? 'pos' : headline < 0 ? 'neg' : '');
+    arrowEl.textContent = headline > 0 ? '▲' : headline < 0 ? '▼' : '•';
+    arrowEl.style.color = headline > 0 ? 'var(--green)'
+                        : headline < 0 ? 'var(--red)'
+                        : 'var(--muted)';
+
+    // Build the sparkline series (relative to window start)
+    if (!inRange.length) {
+      emptyEl.classList.add('active');
+      _drawSpark([]);
+      return;
+    }
+    emptyEl.classList.remove('active');
+
+    const series = [];
+    // Anchor a zero point at the start of the window so the line shows
+    // true "change over period"; for ALL, anchor at the first trade.
+    if (isFinite(window)) {
+      series.push({ ts: startTs, v: 0 });
+    } else {
+      series.push({ ts: inRange[0].ts, v: 0 });
+    }
+    for (const p of inRange) {
+      series.push({ ts: p.ts, v: p.cum - startCum });
+    }
+    // Carry the latest value forward to "now" so the line extends to the edge
+    const last = series[series.length - 1];
+    if (last.ts < now) series.push({ ts: now, v: last.v });
+
+    _drawSpark(series);
+  }
+
+  function _drawSpark(series) {
+    const svg = document.getElementById('pnl-spark');
+    svg.innerHTML = '';
+    if (series.length < 2) return;
+
+    const W = 400, H = 96, PAD_X = 4, PAD_Y = 8;
+    const xs = series.map(p => p.ts);
+    const ys = series.map(p => p.v);
+
+    const xMin = Math.min(...xs);
+    const xMax = Math.max(...xs);
+    let yMin = Math.min(...ys, 0);
+    let yMax = Math.max(...ys, 0);
+    if (yMin === yMax) { yMin -= 1; yMax += 1; }
+
+    const xRange = (xMax - xMin) || 1;
+    const yRange = (yMax - yMin) || 1;
+    const x = t => PAD_X + (t - xMin) / xRange * (W - 2 * PAD_X);
+    const y = v => H - PAD_Y - (v - yMin) / yRange * (H - 2 * PAD_Y);
+
+    const tail    = ys[ys.length - 1];
+    const stroke  = tail >= 0 ? 'var(--green)' : 'var(--red)';
+    const fillCol = tail >= 0 ? 'rgba(63,185,80,.14)' : 'rgba(248,81,73,.14)';
+
+    const ns = 'http://www.w3.org/2000/svg';
+
+    // Zero baseline (only if span crosses 0)
+    if (yMin < 0 && yMax > 0) {
+      const zy = y(0);
+      const line = document.createElementNS(ns, 'line');
+      line.setAttribute('x1', PAD_X);
+      line.setAttribute('x2', W - PAD_X);
+      line.setAttribute('y1', zy);
+      line.setAttribute('y2', zy);
+      line.setAttribute('stroke', 'rgba(139,148,158,.35)');
+      line.setAttribute('stroke-dasharray', '3 3');
+      line.setAttribute('stroke-width', '1');
+      svg.appendChild(line);
+    }
+
+    // Path: step line (we only know value AT each trade; keeps it monotone)
+    let d = `M ${x(xs[0])} ${y(ys[0])}`;
+    for (let i = 1; i < series.length; i++) {
+      const px = x(xs[i]);
+      const py = y(ys[i]);
+      // Horizontal then vertical = stair-step; smoother than diagonal hops
+      d += ` L ${px} ${y(ys[i - 1])} L ${px} ${py}`;
+    }
+
+    // Area fill
+    const area = d
+      + ` L ${x(xs[xs.length - 1])} ${H - PAD_Y}`
+      + ` L ${x(xs[0])} ${H - PAD_Y} Z`;
+
+    const areaEl = document.createElementNS(ns, 'path');
+    areaEl.setAttribute('d', area);
+    areaEl.setAttribute('fill', fillCol);
+    areaEl.setAttribute('stroke', 'none');
+    svg.appendChild(areaEl);
+
+    const lineEl = document.createElementNS(ns, 'path');
+    lineEl.setAttribute('d', d);
+    lineEl.setAttribute('fill', 'none');
+    lineEl.setAttribute('stroke', stroke);
+    lineEl.setAttribute('stroke-width', '2');
+    lineEl.setAttribute('stroke-linecap', 'round');
+    lineEl.setAttribute('stroke-linejoin', 'round');
+    svg.appendChild(lineEl);
+  }
+
+  // Wire up tab buttons once on load
+  document.addEventListener('DOMContentLoaded', () => {
+    document.querySelectorAll('.pnl-tab').forEach(btn => {
+      btn.addEventListener('click', () => {
+        document.querySelectorAll('.pnl-tab').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        _pnlTracker.range = btn.dataset.range;
+        renderPnlTracker();
+      });
+    });
+  });
 
   function renderPnlBar(d) {
     const s     = d.all_stats;
@@ -848,6 +1136,10 @@
       } else {
         hb.style.display = 'none';
       }
+
+      // P&L tracker (time-windowed card w/ sparkline)
+      _pnlTracker.points = d.pnl_points || [];
+      renderPnlTracker();
 
       // P&L bar
       renderPnlBar(d);
