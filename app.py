@@ -165,6 +165,30 @@ def api_resolve():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/reset_halt", methods=["POST"])
+def api_reset_halt():
+    """Manually clear the RiskManager halt state.
+
+    The halt is normally auto-cleared at UTC midnight (new trading day).
+    This endpoint lets the operator force an immediate reset from the
+    dashboard after reviewing the halt reason.
+    """
+    if _bot is None:
+        return jsonify({"error": "Bot not initialized"}), 503
+    try:
+        prev_reason = _bot.risk._halt_reason
+        _bot.risk._halted      = False
+        _bot.risk._halt_reason = ""
+        _bot.risk._halt_date   = None
+        # Mirror into shared state so the dashboard updates immediately
+        _state.halted      = False
+        _state.halt_reason = ""
+        print(f"[bot] Halt manually reset via dashboard (was: {prev_reason})", flush=True)
+        return jsonify({"ok": True, "was": prev_reason})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 # âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 # BOT BACKGROUND THREAD
 # âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ

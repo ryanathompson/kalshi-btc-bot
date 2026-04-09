@@ -319,6 +319,106 @@
     .pnl-sub.pos { color: var(--green); }
     .pnl-sub.neg { color: var(--red); }
     .pnl-sub .open-lbl { color: var(--blue); }
+
+    /* -- HALT CONTROLS (countdown + reset button) -- */
+    .halt-controls {
+      display: none;
+      align-items: center;
+      gap: 8px;
+    }
+    .halt-controls.active { display: inline-flex; }
+    #halt-countdown {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--red);
+      background: rgba(248,81,73,.08);
+      border: 1px solid rgba(248,81,73,.28);
+      border-radius: 10px;
+      padding: 3px 9px;
+      letter-spacing: .04em;
+    }
+    #reset-halt-btn {
+      background: rgba(248,81,73,.15);
+      color: var(--red);
+      border: 1px solid rgba(248,81,73,.45);
+      border-radius: 10px;
+      padding: 3px 11px;
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: .06em;
+      text-transform: uppercase;
+      cursor: pointer;
+      font-family: inherit;
+      transition: background .15s;
+    }
+    #reset-halt-btn:hover { background: rgba(248,81,73,.3); }
+    #reset-halt-btn:active { transform: translateY(1px); }
+
+    /* -- CONFIRM MODAL -- */
+    .modal-overlay {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,.72);
+      z-index: 1000;
+      align-items: center;
+      justify-content: center;
+      backdrop-filter: blur(2px);
+    }
+    .modal-overlay.active { display: flex; }
+    .modal {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-left: 3px solid var(--red);
+      border-radius: 10px;
+      padding: 22px 26px;
+      max-width: 440px;
+      width: calc(100% - 40px);
+      box-shadow: 0 24px 60px rgba(0,0,0,.55);
+    }
+    .modal h2 {
+      font-size: 15px;
+      font-weight: 700;
+      color: var(--red);
+      margin-bottom: 10px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      text-transform: uppercase;
+      letter-spacing: .04em;
+    }
+    .modal p {
+      font-size: 13px;
+      color: var(--muted);
+      line-height: 1.55;
+      margin-bottom: 20px;
+    }
+    .modal p strong { color: var(--text); }
+    .modal-actions {
+      display: flex;
+      justify-content: flex-end;
+      gap: 10px;
+    }
+    .modal-btn {
+      padding: 7px 16px;
+      border-radius: 6px;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      border: 1px solid var(--border);
+      background: transparent;
+      color: var(--text);
+      font-family: inherit;
+    }
+    .modal-btn:hover { background: rgba(255,255,255,.04); }
+    .modal-btn.danger {
+      background: var(--red);
+      color: #fff;
+      border-color: var(--red);
+    }
+    .modal-btn.danger:hover { background: #e0453c; }
+    .modal-btn[disabled] { opacity: .55; cursor: not-allowed; }
   </style>
 </head>
 <body>
@@ -327,6 +427,10 @@
 <header>
   <h1>🤖 Kalshi BTC Bot</h1>
   <span id="mode-badge" class="badge badge-offline"><span class="dot"></span> Loading</span>
+  <div id="halt-controls" class="halt-controls">
+    <span id="halt-countdown" title="Time until automatic halt reset at 00:00 UTC">--:--:--</span>
+    <button id="reset-halt-btn" type="button" title="Force-clear the halt right now">Reset Now</button>
+  </div>
 
   <div class="ticker">
     <div>
@@ -682,6 +786,7 @@
       if (d.halted) {
         badge.className = 'badge badge-halted';
         badge.innerHTML = '<span class="dot"></span> HALTED';
+        if (window.setHaltVisible) window.setHaltVisible(true);
       } else if (!d.running) {
         badge.className = 'badge badge-offline';
         badge.innerHTML = '<span class="dot"></span> Offline';
@@ -692,6 +797,7 @@
         badge.className = 'badge badge-live';
         badge.innerHTML = '<span class="dot pulse"></span> LIVE';
       }
+      if (!d.halted && window.setHaltVisible) window.setHaltVisible(false);
 
       // BTC ticker
       if (d.btc_price != null) {
@@ -765,6 +871,101 @@
 
   refresh();
   setInterval(refresh, 5000);
+</script>
+
+<!-- RESET CONFIRM MODAL -->
+<div id="reset-modal" class="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="reset-modal-title">
+  <div class="modal">
+    <h2 id="reset-modal-title">WARNING - Reset Halt?</h2>
+    <p>
+      Are you <strong>sure</strong> you want to force-clear the bot's halt state?
+      This bypasses the risk-manager stop and allows new trades to be placed
+      <strong>immediately</strong>. The halt would otherwise auto-clear at
+      <strong>00:00 UTC</strong>. Only do this if you have reviewed the halt reason
+      and accept the risk.
+    </p>
+    <div class="modal-actions">
+      <button class="modal-btn" id="reset-cancel" type="button">Cancel</button>
+      <button class="modal-btn danger" id="reset-confirm" type="button">Yes, Reset Now</button>
+    </div>
+  </div>
+</div>
+
+<script>
+  // Halt countdown + reset-now wiring
+  (function(){
+    let _countdownTimer = null;
+    const ctrl     = document.getElementById('halt-controls');
+    const cdEl     = document.getElementById('halt-countdown');
+    const modal    = document.getElementById('reset-modal');
+    const openBtn  = document.getElementById('reset-halt-btn');
+    const cancel   = document.getElementById('reset-cancel');
+    const confirm  = document.getElementById('reset-confirm');
+
+    function tick() {
+      const now = new Date();
+      // Reset fires at 00:00 UTC (RiskManager uses server local time which is UTC on Render)
+      const next = Date.UTC(
+        now.getUTCFullYear(),
+        now.getUTCMonth(),
+        now.getUTCDate() + 1,
+        0, 0, 0
+      );
+      let secs = Math.max(0, Math.floor((next - now.getTime()) / 1000));
+      const h = String(Math.floor(secs / 3600)).padStart(2, '0');
+      const m = String(Math.floor((secs % 3600) / 60)).padStart(2, '0');
+      const s = String(secs % 60).padStart(2, '0');
+      cdEl.textContent = `${h}:${m}:${s}`;
+    }
+
+    // Exposed so refresh() can toggle visibility based on d.halted
+    window.setHaltVisible = function(visible) {
+      if (visible) {
+        ctrl.classList.add('active');
+        if (!_countdownTimer) {
+          tick();
+          _countdownTimer = setInterval(tick, 1000);
+        }
+      } else {
+        ctrl.classList.remove('active');
+        if (_countdownTimer) {
+          clearInterval(_countdownTimer);
+          _countdownTimer = null;
+        }
+      }
+    };
+
+    function openModal()  { modal.classList.add('active'); }
+    function closeModal() { modal.classList.remove('active'); }
+
+    openBtn.addEventListener('click', openModal);
+    cancel.addEventListener('click', closeModal);
+    modal.addEventListener('click', (e) => { if (e.target === modal) closeModal(); });
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && modal.classList.contains('active')) closeModal();
+    });
+
+    confirm.addEventListener('click', async () => {
+      confirm.disabled = true;
+      const original = confirm.textContent;
+      confirm.textContent = 'Resetting...';
+      try {
+        const r = await fetch('/api/reset_halt', { method: 'POST' });
+        const j = await r.json();
+        if (r.ok && j.ok) {
+          closeModal();
+          if (typeof refresh === 'function') refresh();
+        } else {
+          alert('Reset failed: ' + (j.error || 'unknown error'));
+        }
+      } catch (err) {
+        alert('Reset request failed: ' + err);
+      } finally {
+        confirm.disabled = false;
+        confirm.textContent = original;
+      }
+    });
+  })();
 </script>
 </body>
 </html>
