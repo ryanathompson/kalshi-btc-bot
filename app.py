@@ -180,10 +180,16 @@ def api_reset_halt():
         _bot.risk._halted      = False
         _bot.risk._halt_reason = ""
         _bot.risk._halt_date   = None
+        # CRITICAL: also set the manual override for today, otherwise the
+        # main loop's next risk.check() (within POLL_INTERVAL seconds) will
+        # recompute today's PnL from the trade log and re-halt immediately
+        # with the same reason. The override auto-clears at UTC midnight.
+        _bot.risk._override_date = datetime.date.today()
         # Mirror into shared state so the dashboard updates immediately
         _state.halted      = False
         _state.halt_reason = ""
-        print(f"[bot] Halt manually reset via dashboard (was: {prev_reason})", flush=True)
+        print(f"[bot] Halt manually reset via dashboard (was: {prev_reason}) "
+              f"— daily-loss check bypassed until UTC midnight", flush=True)
         return jsonify({"ok": True, "was": prev_reason})
     except Exception as e:
         return jsonify({"error": str(e)}), 500

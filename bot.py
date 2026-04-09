@@ -897,6 +897,7 @@ class RiskManager:
         self._halted      = False
         self._halt_reason = ""
         self._halt_date   = None          # date the halt was triggered
+        self._override_date = None        # date of manual daily-loss override (bypass until next UTC midnight)
 
     def check(self, client):
         today = datetime.date.today()
@@ -908,23 +909,30 @@ class RiskManager:
             self._halt_reason = ""
             self._halt_date   = None
 
+        # Auto-clear manual daily-loss override at midnight too
+        if self._override_date and today > self._override_date:
+            print(f"  ♻ New trading day — clearing manual daily-loss override")
+            self._override_date = None
+
         if self._halted:
             return False, self._halt_reason
 
         trades = load_trades()
         today_str = today.isoformat()
 
-        # Daily loss check
-        today_settled = [
-            t for t in trades
-            if t.get("result") and t.get("timestamp", "")[:10] == today_str
-        ]
-        daily_pnl = sum(t.get("pnl", 0) for t in today_settled if t.get("pnl"))
-        if daily_pnl <= -abs(self.daily_limit):
-            self._halted      = True
-            self._halt_reason = f"Daily loss limit hit (${daily_pnl:.2f})"
-            self._halt_date   = today
-            return False, self._halt_reason
+        # Daily loss check — skipped for the rest of today if the operator
+        # manually reset the halt via the dashboard (Reset Now button).
+        if self._override_date != today:
+            today_settled = [
+                t for t in trades
+                if t.get("result") and t.get("timestamp", "")[:10] == today_str
+            ]
+            daily_pnl = sum(t.get("pnl", 0) for t in today_settled if t.get("pnl"))
+            if daily_pnl <= -abs(self.daily_limit):
+                self._halted      = True
+                self._halt_reason = f"Daily loss limit hit (${daily_pnl:.2f})"
+                self._halt_date   = today
+                return False, self._halt_reason
 
         # Open trade count
         open_trades = [t for t in trades if not t.get("result")]
