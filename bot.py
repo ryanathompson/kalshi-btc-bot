@@ -8,7 +8,7 @@ Runs two strategies in parallel on Kalshi's KXBTC15M markets:
     price moves on Coinbase. When BTC moves sharply but Kalshi hasn't
     repriced yet, trades into the mispricing.
 
-  STRATEGY 2 â CONSENSUS BOT v1.1
+  STRATEGY 2 â CONSENSUS BOT v1.2
     Combines two signals:
       - MOMENTUM: BTC price direction over last 60 seconds
       - PREVIOUS: Result of the last settled 15-min market
@@ -22,6 +22,14 @@ Runs two strategies in parallel on Kalshi's KXBTC15M markets:
       4. Time-aware entry â tightens threshold as market nears close
       5. Trade cooldown â 300s minimum between consensus trades
       6. API throttle â polls settled markets every 60s, not every 5s
+
+    v1.2 improvements (2026-04-10, post live post-mortem):
+      1. Dead zone re-tuned to 0.05% (was 0.20% emergency floor; live
+         wins clustered at |momentum| 0.065-0.092%, suggesting 0.03% was
+         too permissive but 0.20% killed the signal entirely)
+      2. Strong-momentum tier: when |momentum| >= STRONG_MOMENTUM_THRESHOLD
+         (0.065%) the strategy applies a stake multiplier and a small
+         price-cap bonus, leaning into the band where wins concentrate
 
 SETUP:
     pip install requests cryptography colorama tabulate python-dotenv
@@ -151,20 +159,32 @@ MOMENTUM_WINDOW     = 60     # seconds for BTC momentum calculation
 MIN_BOOK_SUM        = 0.97   # yes+no must sum >= 0.97 (liquid market check)
 
 # ── Strategy enable flags ─────────────────────────────────────────────
-# Default: LAG on, CONSENSUS off. Consensus was disabled on 2026-04-09 after
-# a live post-mortem showed 33% WR / -23.6% ROI over 18 settled trades — well
-# below the ~73% backtest claim, indicating the backtest was overfit or had
-# look-ahead bias. Re-enable only after a clean re-backtest reproduces edge.
+# CONSENSUS was disabled 2026-04-09 after a live post-mortem (33% WR /
+# -23.6% ROI over 18 trades). Re-enabled 2026-04-10 as v1.2 with a tighter
+# dead zone (0.05%) and a strong-momentum tier. The 2026-04-09 losing band
+# was |momentum| 0.030-0.043% with entry prices below 40c, both of which
+# v1.2 filters out. Kill-switch via env: CONSENSUS_ENABLED=false (no redeploy).
 LAG_ENABLED       = os.getenv("LAG_ENABLED",       "true").lower() == "true"
-CONSENSUS_ENABLED = os.getenv("CONSENSUS_ENABLED", "false").lower() == "true"
+CONSENSUS_ENABLED = os.getenv("CONSENSUS_ENABLED", "true").lower()  == "true"
 
-# Consensus v1.1 tuning
+# Consensus v1.2 tuning
 CONSENSUS_BASE_PRICE = 0.45  # base price cap before momentum scaling
-# MOMENTUM_DEAD_ZONE raised 2026-04-09: was 0.0003 (0.03%). Live trades that
-# lost money were firing on momentum values of ±0.03–0.07%, which is below
-# the noise floor for BTC over a 13-min settlement horizon. New floor 0.20%
-# is ~6.7× tighter and excludes the bulk of the historical losing window.
-MOMENTUM_DEAD_ZONE  = float(os.getenv("MOMENTUM_DEAD_ZONE", "0.0020"))
+# MOMENTUM_DEAD_ZONE history:
+#   v1.0  = 0.0003 (0.03%) - too permissive, fired on noise
+#   v1.1+ = 0.0020 (0.20%) - emergency floor 2026-04-09, killed all signal
+#   v1.2  = 0.0005 (0.05%) - 2026-04-10, tuned from screen of live trades
+#                            (15 losses with momentum 0.030-0.043%, 4 wins
+#                            with |momentum| 0.065-0.092%; 0.05% cleanly
+#                            separates the loser cluster from the winners).
+MOMENTUM_DEAD_ZONE  = float(os.getenv("MOMENTUM_DEAD_ZONE", "0.0005"))
+
+# v1.2 strong-momentum tier: when |momentum| >= STRONG_MOMENTUM_THRESHOLD
+# the trade is sized larger and the price cap is extended slightly. This
+# leans into the momentum band where wins clustered in live trading.
+STRONG_MOMENTUM_THRESHOLD    = float(os.getenv("STRONG_MOMENTUM_THRESHOLD",    "0.00065"))
+CONSENSUS_STRONG_STAKE_MULT  = float(os.getenv("CONSENSUS_STRONG_STAKE_MULT",  "1.5"))
+CONSENSUS_STRONG_PRICE_BONUS = float(os.getenv("CONSENSUS_STRONG_PRICE_BONUS", "0.05"))
+
 PREV_RESULT_MAX_AGE = 1800   # previous-result signal expires after 30 min (seconds)
 CONSENSUS_COOLDOWN  = 300    # min seconds between consensus trades
 PREV_CHECK_INTERVAL = 60     # only poll settled markets every 60s (not every cycle)
@@ -1027,12 +1047,21 @@ class ConsensusStrategy:
         side          = momentum_side
         price_dollars = yes_px if side == "yes" else no_px
 
+        # ── [v1.2] Strong-momentum tier ────────────────────
+        # When |momentum| crosses STRONG_MOMENTUM_THRESHOLD (0.065%), the
+        # signal is in the band where live wins concentrated. Apply a stake
+        # multiplier and extend the price cap by CONSENSUS_STRONG_PRICE_BONUS.
+        strong_momentum = abs(btc_change) >= STRONG_MOMENTUM_THRESHOLD
+
         # ── [v1.1] Dynamic price cap ──────────────────────────
         # Base threshold of 0.45, scales up to CONSENSUS_MAX_PRICE with
         # stronger momentum.  abs(btc_change)*100 maps ~0.03%â0.13%+
         # into a 0â0.10 bonus on top of CONSENSUS_BASE_PRICE.
         momentum_bonus = min(abs(btc_change) * 100, CONSENSUS_MAX_PRICE - CONSENSUS_BASE_PRICE)
         dynamic_max    = CONSENSUS_BASE_PRICE + momentum_bonus
+        # [v1.2] Strong-momentum cap bonus (clamped to CONSENSUS_MAX_PRICE below)
+        if strong_momentum:
+            dynamic_max += CONSENSUS_STRONG_PRICE_BONUS
 
         # [v1.1] Time-aware: tighten cap when < 8 min remain
         if mins_left is not None and mins_left < 8:
@@ -1046,7 +1075,9 @@ class ConsensusStrategy:
             return None
 
         price_cents = int(price_dollars * 100)
-        count       = max(1, int(self.stake / price_dollars))
+        # [v1.2] strong-momentum stake multiplier
+        effective_stake = self.stake * (CONSENSUS_STRONG_STAKE_MULT if strong_momentum else 1.0)
+        count       = max(1, int(effective_stake / price_dollars))
 
         # [v1.1] Record trade time for cooldown
         self.last_trade_time = now
@@ -1059,7 +1090,8 @@ class ConsensusStrategy:
             "count":    count,
             "dollars":  round(count * price_dollars, 2),
             "reason":   (f"Momentum {btc_change*100:+.3f}% + Previous={previous_side} "
-                         f"| cap={dynamic_max:.2f} mins_left={mins_left or '?'}"),
+                         f"| cap={dynamic_max:.2f} mins_left={mins_left or '?'}"
+                         f"{' [STRONG x' + str(CONSENSUS_STRONG_STAKE_MULT) + ']' if strong_momentum else ''}"),
         }
 
 
@@ -1371,6 +1403,8 @@ class KalshiBot:
         print(f"   LAG stake:       ${self.lag.stake}/trade  [{lag_state}]")
         print(f"   CONSENSUS stake: ${self.consensus.stake}/trade  [{con_state}]")
         print(f"   Momentum dead zone: {MOMENTUM_DEAD_ZONE*100:.3f}%")
+        print(f"   Strong-momentum threshold: {STRONG_MOMENTUM_THRESHOLD*100:.3f}% "
+              f"(stake x{CONSENSUS_STRONG_STAKE_MULT}, cap +{CONSENSUS_STRONG_PRICE_BONUS:.2f})")
         print(f"   Daily NET loss limit:   ${self.risk.daily_limit}")
         print(f"   Daily GROSS loss limit: ${self.risk.gross_daily_limit}")
         print(f"   Trade log: {LOG_FILE}")

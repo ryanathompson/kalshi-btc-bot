@@ -149,6 +149,118 @@
       padding: 16px 0;
     }
 
+    /* ── ENTRY-PRICE WIDGET ── */
+    .entry-price {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 16px 20px;
+    }
+    .entry-price-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 14px;
+    }
+    .entry-price-title {
+      font-size: 12px;
+      font-weight: 600;
+      letter-spacing: .06em;
+      text-transform: uppercase;
+      color: var(--cyan);
+    }
+    .entry-price-toggle {
+      display: flex;
+      gap: 4px;
+    }
+    .ep-tab {
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--muted);
+      padding: 3px 10px;
+      border-radius: 4px;
+      font-size: 10px;
+      letter-spacing: .04em;
+      text-transform: uppercase;
+      cursor: pointer;
+      font-family: inherit;
+    }
+    .ep-tab.active {
+      background: rgba(121,192,255,.1);
+      color: var(--cyan);
+      border-color: rgba(121,192,255,.4);
+    }
+    .ep-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+    }
+    .ep-table thead th {
+      font-size: 10px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: .07em;
+      color: var(--muted);
+      text-align: left;
+      padding-bottom: 8px;
+      border-bottom: 1px solid var(--border);
+    }
+    .ep-table thead th.right { text-align: right; }
+    .ep-table tbody td {
+      padding: 12px 0;
+      border-bottom: 1px solid rgba(48,54,61,.6);
+      vertical-align: middle;
+    }
+    .ep-table tbody tr:last-child td { border-bottom: none; }
+    .ep-band {
+      font-weight: 700;
+      color: var(--text);
+      font-size: 14px;
+    }
+    .ep-band .warn {
+      color: var(--yellow);
+      margin-left: 4px;
+      font-size: 11px;
+    }
+    .ep-trades, .ep-wl {
+      color: var(--text);
+      font-variant-numeric: tabular-nums;
+    }
+    .ep-wr-cell {
+      width: 38%;
+      text-align: right;
+      padding-left: 14px;
+    }
+    .ep-wr-num {
+      font-weight: 700;
+      font-size: 14px;
+      font-variant-numeric: tabular-nums;
+    }
+    .ep-wr-num.pos { color: var(--green); }
+    .ep-wr-num.neg { color: var(--red); }
+    .ep-wr-num.neu { color: var(--muted); }
+    .ep-bar {
+      margin-top: 5px;
+      height: 5px;
+      background: rgba(255,255,255,.05);
+      border-radius: 3px;
+      overflow: hidden;
+    }
+    .ep-bar-fill {
+      height: 100%;
+      transition: width .3s ease;
+      border-radius: 3px;
+    }
+    .ep-bar-fill.pos { background: var(--green); }
+    .ep-bar-fill.neg { background: var(--red); }
+    .ep-bar-fill.neu { background: rgba(255,255,255,.15); }
+    .entry-price-footer {
+      font-size: 10px;
+      color: var(--muted);
+      margin-top: 10px;
+      letter-spacing: .03em;
+    }
+
     /* ── SECTION ── */
     .section {
       background: var(--panel);
@@ -649,6 +761,35 @@
     </div>
   </div>
 
+  <!-- WIN RATE BY ENTRY PRICE -->
+  <div class="entry-price">
+    <div class="entry-price-header">
+      <div class="entry-price-title">💰 Win Rate by Entry Price</div>
+      <div class="entry-price-toggle" id="ep-toggle">
+        <button class="ep-tab active" type="button" data-scope="con">Consensus</button>
+        <button class="ep-tab" type="button" data-scope="all">All</button>
+      </div>
+    </div>
+    <table class="ep-table">
+      <thead>
+        <tr>
+          <th>Price Range</th>
+          <th>Trades</th>
+          <th>W/L</th>
+          <th class="right">Win Rate</th>
+        </tr>
+      </thead>
+      <tbody id="ep-tbody">
+        <tr><td colspan="4" class="empty-row" style="padding:18px 0;text-align:center;color:var(--muted);font-size:12px;">No settled trades yet</td></tr>
+      </tbody>
+    </table>
+    <div class="entry-price-footer">
+      Bands derived from live data: 1–24¢ and 25–39¢ have historically lost money.
+      Consensus 1.2 raises the dead zone to 0.05% and adds a strong-momentum tier
+      to lean into the 40–55¢ winning band.
+    </div>
+  </div>
+
   <!-- OPEN TRADES -->
   <div class="section">
     <div class="section-header">
@@ -1020,6 +1161,61 @@
     }
   }
 
+  // Win Rate by Entry Price widget state + renderer.
+  // Cache is populated on every refresh; the toggle re-renders from cache
+  // without waiting for the next 5s refresh tick.
+  let _entryPriceCache = { con: [], all: [] };
+  let _entryPriceScope = 'con';   // 'con' | 'all'
+
+  function _wrClass(wr) {
+    if (wr == null) return 'neu';
+    if (wr >= 50)   return 'pos';
+    return 'neg';
+  }
+
+  function renderEntryPrice() {
+    const tbody = document.getElementById('ep-tbody');
+    const bands = _entryPriceCache[_entryPriceScope] || [];
+    const anyTrades = bands.some(b => (b.trades || 0) > 0);
+
+    if (!anyTrades) {
+      tbody.innerHTML =
+        '<tr><td colspan="4" class="empty-row" style="padding:18px 0;text-align:center;color:var(--muted);font-size:12px;">' +
+        'No settled trades yet for this view</td></tr>';
+      return;
+    }
+
+    tbody.innerHTML = bands.map(b => {
+      const cls = _wrClass(b.wr);
+      const wrText = (b.wr == null) ? '—' : b.wr + '%';
+      const barWidth = (b.wr == null) ? 0 : Math.max(2, b.wr);
+      const warnSpan = b.warn ? '<span class="warn" title="Historically losing band">⚠</span>' : '';
+      return `
+        <tr>
+          <td class="ep-band">${b.label}${warnSpan}</td>
+          <td class="ep-trades">${b.trades || 0}</td>
+          <td class="ep-wl">${b.wins || 0}/${b.losses || 0}</td>
+          <td class="ep-wr-cell">
+            <div class="ep-wr-num ${cls}">${wrText}</div>
+            <div class="ep-bar"><div class="ep-bar-fill ${cls}" style="width:${barWidth}%"></div></div>
+          </td>
+        </tr>
+      `;
+    }).join('');
+  }
+
+  // Wire up the Consensus / All toggle once on load.
+  document.addEventListener('DOMContentLoaded', () => {
+    document.querySelectorAll('#ep-toggle .ep-tab').forEach(btn => {
+      btn.addEventListener('click', () => {
+        document.querySelectorAll('#ep-toggle .ep-tab').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        _entryPriceScope = btn.dataset.scope;
+        renderEntryPrice();
+      });
+    });
+  });
+
   function renderStats(id, emptyId, data) {
     const el = document.getElementById(id);
     const em = document.getElementById(emptyId);
@@ -1196,6 +1392,13 @@
       renderStats('lag-stats', 'lag-empty', d.lag_stats);
       renderStats('con-stats', 'con-empty', d.con_stats);
       renderStats('all-stats', 'all-empty', d.all_stats);
+
+      // Win Rate by Entry Price widget
+      _entryPriceCache = {
+        con: d.entry_price_stats_con || [],
+        all: d.entry_price_stats     || [],
+      };
+      renderEntryPrice();
 
       // Tables
       renderOpen(d.open_trades || []);

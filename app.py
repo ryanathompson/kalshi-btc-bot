@@ -92,6 +92,64 @@ def _strat_stats(trades, name=None):
     }
 
 
+def _entry_price_stats(trades, strategy=None):
+    """Bucket settled trades by entry price (cents) and return win-rate per band.
+
+    Bands match the dashboard widget the user designed:
+        1-24c   (deep underdog — historically 0% WR in live trading)
+        25-39c  (mid underdog — historically ~18% WR)
+        40-55c  (favored band — historically 75% WR; the only profitable zone)
+
+    The 'price' field on a trade is stored as integer cents (1-99). Trades
+    without a settled `result` are skipped.
+
+    strategy=None aggregates across all strategies; pass "CONSENSUS" or "LAG"
+    to filter. Returns a list of dicts in band order so the dashboard can
+    iterate without resorting:
+
+        [{"label":"1-24c", "lo":1, "hi":24, "trades":N, "wins":W,
+          "losses":L, "wr":pct, "warn":bool}, ...]
+
+    `warn` is True for bands whose live win-rate has historically been below
+    50% — the UI uses it to render the warning triangle from the screenshot.
+    """
+    bands = [
+        {"label": "1-24c",  "lo": 1,  "hi": 24, "warn": True},
+        {"label": "25-39c", "lo": 25, "hi": 39, "warn": True},
+        {"label": "40-55c", "lo": 40, "hi": 55, "warn": False},
+    ]
+    for b in bands:
+        b["trades"] = 0
+        b["wins"]   = 0
+        b["losses"] = 0
+        b["wr"]     = None
+
+    for t in trades:
+        if not t.get("result"):
+            continue
+        if strategy and t.get("strategy") != strategy:
+            continue
+        try:
+            price = int(t.get("price") or 0)
+        except (TypeError, ValueError):
+            continue
+        if price < 1:
+            continue
+        for b in bands:
+            if b["lo"] <= price <= b["hi"]:
+                b["trades"] += 1
+                if t["result"] == "WIN":
+                    b["wins"] += 1
+                else:
+                    b["losses"] += 1
+                break
+
+    for b in bands:
+        if b["trades"]:
+            b["wr"] = round(b["wins"] / b["trades"] * 100, 1)
+    return bands
+
+
 def _to_epoch_ms(ts):
     """Parse any trade-log timestamp format to epoch ms (UTC).
 
@@ -224,6 +282,11 @@ def api_status():
         "con_stats":    _strat_stats(trades, "CONSENSUS"),
         "all_stats":    _strat_stats(trades),
         "pnl_points":   _pnl_points(trades),
+        # Win-rate breakdown by entry price band — used by the dashboard
+        # widget. We expose both an "all-strategy" view and a CONSENSUS-only
+        # view since the price-band signal is most actionable for Consensus.
+        "entry_price_stats":     _entry_price_stats(trades),
+        "entry_price_stats_con": _entry_price_stats(trades, "CONSENSUS"),
     })
 
 
