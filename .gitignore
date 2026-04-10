@@ -1,0 +1,53 @@
+# ── Python ──────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ── Virtual environments ────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+
+# ── Secrets & credentials (NEVER COMMIT) ────────────────────────
+.env
+.env.*
+!.env.example
+kalshi.key
+*.pem
+*.p12
+*.pfx
+
+# ── Runtime data ────────────────────────────────────────────────
+# Trade log lives on Render ephemeral FS or persistent disk, not in git.
+# Committing it would leak trading history + cause merge conflicts.
+bot_trades.json
+bot_trades.*.json
+data/
+*.sqlite
+*.sqlite3
+
+# ── Backtest outputs ────────────────────────────────────────────
+*.replay.json
+backtest_output/
+
+# ── Editor / OS junk ────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ── Logs ────────────────────────────────────────────────────────
+*.log
+logs/

@@ -138,18 +138,33 @@ PRICE_SOURCES = [
 ]
 POLL_INTERVAL  = 5          # seconds between polls (used for market/resolve checks)
 COINBASE_WS_URL = "wss://advanced-trade-ws.coinbase.com"
-LOG_FILE       = "bot_trades.json"
+# LOG_FILE — overridable so production can point at a Render persistent disk
+# (e.g. TRADES_LOG_PATH=/var/data/bot_trades.json) instead of the ephemeral
+# project filesystem. Defaults to repo-local file for backwards compatibility.
+LOG_FILE       = os.getenv("TRADES_LOG_PATH", "bot_trades.json")
 
 # Strategy thresholds (tune these after paper trading)
 LAG_THRESHOLD_PCT   = 0.003  # BTC must move >0.3% in 90s for lag signal
 LAG_MAX_REPRICE_AGE = 90     # seconds since last Kalshi price change to consider stale
-CONSENSUS_MAX_PRICE = 0.55   # only trade consensus when price <= 55Â¢
+CONSENSUS_MAX_PRICE = 0.55   # only trade consensus when price <= 55¢
 MOMENTUM_WINDOW     = 60     # seconds for BTC momentum calculation
 MIN_BOOK_SUM        = 0.97   # yes+no must sum >= 0.97 (liquid market check)
 
+# ── Strategy enable flags ─────────────────────────────────────────────
+# Default: LAG on, CONSENSUS off. Consensus was disabled on 2026-04-09 after
+# a live post-mortem showed 33% WR / -23.6% ROI over 18 settled trades — well
+# below the ~73% backtest claim, indicating the backtest was overfit or had
+# look-ahead bias. Re-enable only after a clean re-backtest reproduces edge.
+LAG_ENABLED       = os.getenv("LAG_ENABLED",       "true").lower() == "true"
+CONSENSUS_ENABLED = os.getenv("CONSENSUS_ENABLED", "false").lower() == "true"
+
 # Consensus v1.1 tuning
 CONSENSUS_BASE_PRICE = 0.45  # base price cap before momentum scaling
-MOMENTUM_DEAD_ZONE  = 0.0003 # ignore BTC moves < 0.03% (noise filter)
+# MOMENTUM_DEAD_ZONE raised 2026-04-09: was 0.0003 (0.03%). Live trades that
+# lost money were firing on momentum values of ±0.03–0.07%, which is below
+# the noise floor for BTC over a 13-min settlement horizon. New floor 0.20%
+# is ~6.7× tighter and excludes the bulk of the historical losing window.
+MOMENTUM_DEAD_ZONE  = float(os.getenv("MOMENTUM_DEAD_ZONE", "0.0020"))
 PREV_RESULT_MAX_AGE = 1800   # previous-result signal expires after 30 min (seconds)
 CONSENSUS_COOLDOWN  = 300    # min seconds between consensus trades
 PREV_CHECK_INTERVAL = 60     # only poll settled markets every 60s (not every cycle)
@@ -312,6 +327,12 @@ class KalshiClient:
         return d.get("balance", 0) / 100  # cents â dollars
 
     def place_order(self, ticker, side, price_cents, count, strategy_tag=""):
+        # Tag the client_order_id with a 3-letter strategy prefix so that
+        # rebuild_trades_from_api() can recover strategy attribution after a
+        # redeploy (Render's filesystem is ephemeral and bot_trades.json
+        # gets wiped). The prefix is preserved by Kalshi on /portfolio/orders.
+        prefix = (strategy_tag or "UNK")[:3].upper()
+        client_order_id = f"{prefix}-{uuid.uuid4()}"
         order = {
             "ticker": ticker,
             "action": "buy",
@@ -319,7 +340,7 @@ class KalshiClient:
             "count": count,
             "type": "limit",
             f"{'yes' if side == 'yes' else 'no'}_price": price_cents,
-            "client_order_id": str(uuid.uuid4()),
+            "client_order_id": client_order_id,
         }
         if self.dry:
             return {"dry_run": True, "order": order}
@@ -541,6 +562,40 @@ def rebuild_trades_from_api(client):
     if not btc_fills:
         return []
 
+    # ── Fetch orders to recover strategy from client_order_id prefix ────
+    # client_order_id is set to "{PREFIX}-{uuid}" where PREFIX is the
+    # strategy tag (LAG / CON / etc.) — see KalshiClient.place_order().
+    # This is the persistence story for strategy attribution: even after a
+    # Render redeploy wipes bot_trades.json, rebuilding from Kalshi orders
+    # restores the strategy field correctly instead of bucketing everything
+    # as "RECOVERED".
+    PREFIX_TO_STRATEGY = {"LAG": "LAG", "CON": "CONSENSUS", "TAI": "TAIL"}
+    order_id_to_strategy = {}
+    cursor = None
+    while True:
+        params = {"limit": 200}
+        if cursor:
+            params["cursor"] = cursor
+        try:
+            resp = client.get("/portfolio/orders", params=params)
+        except Exception as e:
+            print(f"[rebuild] Error fetching orders (strategy attribution unavailable): {e}", flush=True)
+            break
+        page = resp.get("orders", []) or []
+        for o in page:
+            oid  = o.get("order_id")
+            coid = o.get("client_order_id") or ""
+            if not oid:
+                continue
+            prefix = coid.split("-", 1)[0].upper() if "-" in coid else ""
+            strat = PREFIX_TO_STRATEGY.get(prefix)
+            if strat:
+                order_id_to_strategy[oid] = strat
+        cursor = resp.get("cursor")
+        if not cursor or not page:
+            break
+    print(f"[rebuild] Recovered strategy tags for {len(order_id_to_strategy)} orders.", flush=True)
+
     # ── Fetch settlements (paginated) ───────────────────────────────────
     all_settlements = []
     cursor = None
@@ -615,8 +670,11 @@ def rebuild_trades_from_api(client):
                 else:
                     pnl = -round(dollars, 2)
 
+        # Recover strategy from client_order_id prefix if available;
+        # fall back to "RECOVERED" for legacy orders without a prefix.
+        recovered_strategy = order_id_to_strategy.get(order_id, "RECOVERED")
         trade = {
-            "strategy":  "RECOVERED",
+            "strategy":  recovered_strategy,
             "ticker":    ticker,
             "side":      side,
             "price":     price_cents,
@@ -1012,10 +1070,33 @@ class ConsensusStrategy:
 class RiskManager:
     """
     Hard stops to prevent runaway losses.
-    Tracks daily and rolling-window P&L from the log file.
+
+    Tracks THREE separate daily loss metrics, all in ET-day buckets:
+
+      1. NET daily P&L (existing).      Halts when net <= -DAILY_LOSS_LIMIT.
+         This is the headline number but is too lenient on its own — a single
+         lucky tail-bet win can let the bot bleed indefinitely without ever
+         tripping the net limit (proven by the 2026-04-09 post-mortem).
+
+      2. GROSS daily losses (NEW).      Halts when sum-of-losing-pnl <=
+         -DAILY_GROSS_LOSS_LIMIT, regardless of how many wins offset them.
+         This is the metric that catches "drip-drip-drip" bleeding strategies.
+         Default = 1.5 × net limit; override with env DAILY_GROSS_LOSS_LIMIT.
+
+      3. OPEN-exposure cap (NEW).        Halts new entries when the dollar
+         value of currently-OPEN positions plus today's realized losses
+         already meets the gross limit. This prevents the bot from stacking
+         4 simultaneous max-loss trades that don't show up in pnl until they
+         resolve (because t["pnl"] is None on unresolved trades).
     """
-    def __init__(self, daily_loss_limit, max_open_trades=4):
+    def __init__(self, daily_loss_limit, max_open_trades=4,
+                 gross_daily_loss_limit=None):
         self.daily_limit  = daily_loss_limit
+        self.gross_daily_limit = (
+            gross_daily_loss_limit
+            if gross_daily_loss_limit is not None
+            else 1.5 * daily_loss_limit
+        )
         self.max_open     = max_open_trades
         self._halted      = False
         self._halt_reason = ""
@@ -1041,20 +1122,52 @@ class RiskManager:
             return False, self._halt_reason
 
         trades = load_trades()
+        today_settled = [
+            t for t in trades
+            if t.get("result") and trade_date_et(t.get("timestamp")) == today
+        ]
+        today_open = [
+            t for t in trades
+            if not t.get("result") and trade_date_et(t.get("timestamp")) == today
+        ]
 
-        # Daily loss check — skipped for the rest of today if the operator
-        # manually reset the halt via the dashboard (Reset Now button).
+        # ── Gross loss + net loss limits ─────────────────────────────────
+        # Skipped for the rest of today if the operator manually reset the
+        # halt via the dashboard (Reset Now button).
         if self._override_date != today:
-            today_settled = [
-                t for t in trades
-                if t.get("result") and trade_date_et(t.get("timestamp")) == today
-            ]
-            daily_pnl = sum(t.get("pnl", 0) for t in today_settled if t.get("pnl"))
-            if daily_pnl <= -abs(self.daily_limit):
+            net_pnl = sum(t.get("pnl", 0) for t in today_settled if t.get("pnl"))
+            gross_loss = sum(t.get("pnl", 0) for t in today_settled
+                             if t.get("pnl") and t.get("pnl") < 0)
+            # Worst-case loss on open positions = full premium paid (assume
+            # they all settle losing). This is intentionally pessimistic.
+            open_exposure_loss = -sum(t.get("dollars", 0) for t in today_open)
+
+            if net_pnl <= -abs(self.daily_limit):
                 self._halted      = True
-                self._halt_reason = f"Daily loss limit hit (${daily_pnl:.2f})"
+                self._halt_reason = f"Daily NET loss limit hit (${net_pnl:.2f})"
                 self._halt_date   = today
                 return False, self._halt_reason
+
+            if gross_loss <= -abs(self.gross_daily_limit):
+                self._halted      = True
+                self._halt_reason = (
+                    f"Daily GROSS loss limit hit "
+                    f"(realized losses ${gross_loss:.2f} >= "
+                    f"${self.gross_daily_limit:.2f})"
+                )
+                self._halt_date   = today
+                return False, self._halt_reason
+
+            # Worst-case if every open trade lost
+            worst_case = gross_loss + open_exposure_loss
+            if worst_case <= -abs(self.gross_daily_limit):
+                # Don't permanently halt — block new entries only, since open
+                # trades may still resolve favorably. Gets re-evaluated next cycle.
+                return False, (
+                    f"Open-exposure pause: realized ${gross_loss:.2f} + "
+                    f"open ${open_exposure_loss:.2f} = ${worst_case:.2f} "
+                    f"would breach gross limit ${self.gross_daily_limit:.2f}"
+                )
 
         # Open trade count
         open_trades = [t for t in trades if not t.get("result")]
@@ -1080,12 +1193,13 @@ class RiskManager:
 
 class KalshiBot:
     def __init__(self, client, lag_stake, consensus_stake,
-                 daily_loss_limit, dry_run):
+                 daily_loss_limit, dry_run, gross_daily_loss_limit=None):
         self.client    = client
         self.btc       = BTCPriceFeed(window=500)
         self.lag       = LagStrategy(lag_stake)
         self.consensus = ConsensusStrategy(consensus_stake)
-        self.risk      = RiskManager(daily_loss_limit)
+        self.risk      = RiskManager(daily_loss_limit,
+                                     gross_daily_loss_limit=gross_daily_loss_limit)
         self.dry       = dry_run
         self.traded_this_market = set()  # prevent double-trading same market
         self._last_markets = []          # exposed for dashboard
@@ -1185,7 +1299,15 @@ class KalshiBot:
                 except Exception:
                     pass
 
-            for strategy in [self.lag, self.consensus]:
+            # ── Strategy enable flags (env-driven kill switches) ────
+            # CONSENSUS defaults OFF as of 2026-04-09 post-mortem.
+            active_strategies = []
+            if LAG_ENABLED:
+                active_strategies.append(self.lag)
+            if CONSENSUS_ENABLED:
+                active_strategies.append(self.consensus)
+
+            for strategy in active_strategies:
                 try:
                     # [v1.1] Pass mins_left to consensus for time-aware entry
                     if isinstance(strategy, ConsensusStrategy):
@@ -1244,9 +1366,14 @@ class KalshiBot:
         print(Fore.GREEN + Style.BRIGHT + "\nð¤ KALSHI DUAL STRATEGY BOT STARTED")
         mode = "DRY RUN" if self.dry else "LIVE TRADING"
         print(f"   Mode: {Fore.YELLOW}{mode}{Style.RESET_ALL}")
-        print(f"   LAG stake:       ${self.lag.stake}/trade")
-        print(f"   CONSENSUS stake: ${self.consensus.stake}/trade")
-        print(f"   Daily loss limit: ${self.risk.daily_limit}")
+        lag_state = "ENABLED" if LAG_ENABLED else "DISABLED"
+        con_state = "ENABLED" if CONSENSUS_ENABLED else "DISABLED"
+        print(f"   LAG stake:       ${self.lag.stake}/trade  [{lag_state}]")
+        print(f"   CONSENSUS stake: ${self.consensus.stake}/trade  [{con_state}]")
+        print(f"   Momentum dead zone: {MOMENTUM_DEAD_ZONE*100:.3f}%")
+        print(f"   Daily NET loss limit:   ${self.risk.daily_limit}")
+        print(f"   Daily GROSS loss limit: ${self.risk.gross_daily_limit}")
+        print(f"   Trade log: {LOG_FILE}")
         print(f"   Series: {BTC_TICKER}")
         print(Fore.YELLOW + "   Press Ctrl+C to stop\n")
 
@@ -1352,6 +1479,10 @@ def main():
     con_stake   = get_stake(args.con_stake,   "CONSENSUS_STAKE", "CONSENSUS strategy")
     daily_limit = args.daily_limit or float(os.getenv("DAILY_LOSS_LIMIT", 0) or
                   input("  Daily loss limit in dollars (bot halts if exceeded): $").strip())
+    # Gross-loss limit defaults to 1.5× the net limit if not explicitly set.
+    # This is the value that catches "drip-bleed" losing strategies whose
+    # net is propped up by occasional large winners.
+    gross_daily_limit = float(os.getenv("DAILY_GROSS_LOSS_LIMIT", 0)) or (1.5 * daily_limit)
 
     if not dry_run:
         print(f"\n{Fore.RED}â²  LIVE TRADING MODE{Style.RESET_ALL}")
@@ -1375,11 +1506,12 @@ def main():
         return
 
     bot = KalshiBot(
-        client          = client,
-        lag_stake       = lag_stake,
-        consensus_stake = con_stake,
-        daily_loss_limit= daily_limit,
-        dry_run         = dry_run,
+        client                 = client,
+        lag_stake              = lag_stake,
+        consensus_stake        = con_stake,
+        daily_loss_limit       = daily_limit,
+        gross_daily_loss_limit = gross_daily_limit,
+        dry_run                = dry_run,
     )
     start_keep_alive()
     bot.run()
