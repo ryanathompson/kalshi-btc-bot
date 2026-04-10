@@ -362,8 +362,8 @@
     <div class="field">
       <label for="interval">BTC precision</label>
       <select id="interval">
-        <option value="1m" selected>1-minute (fast)</option>
-        <option value="1s">1-second (slow, precise)</option>
+        <option value="1m" selected>1-minute (recommended)</option>
+        <option value="1s">1-second (max 3 days)</option>
       </select>
     </div>
     <button id="run-btn" class="run-btn">Run Analysis</button>
@@ -532,12 +532,79 @@
     statusLine.textContent = 'Failed';
   }
 
+  // Parse a response as JSON, but if the server returned an HTML error page
+  // (e.g. gunicorn timeout), surface that cleanly instead of a cryptic
+  // "Unexpected token '<'" parse error.
+  async function parseJsonOrThrow(resp) {
+    const text = await resp.text();
+    try {
+      return JSON.parse(text);
+    } catch (e) {
+      const preview = text.slice(0, 200).replace(/\s+/g, ' ');
+      throw new Error(
+        `Server returned non-JSON response (HTTP ${resp.status}). ` +
+        `This usually means the request timed out at the gateway. ` +
+        `First 200 chars: ${preview}`
+      );
+    }
+  }
+
+  let pollTimer = null;
+  const ORIG_BTN_LABEL = 'Run Analysis';
+
+  function setRunning(isRunning) {
+    runBtn.disabled = isRunning;
+    if (isRunning) {
+      runBtn.innerHTML = '<span class="spinner"></span>Running…';
+    } else {
+      runBtn.textContent = ORIG_BTN_LABEL;
+    }
+  }
+
+  async function pollStatusOnce() {
+    const resp = await fetch('/api/analysis/status');
+    return parseJsonOrThrow(resp);
+  }
+
+  function stopPolling() {
+    if (pollTimer) {
+      clearTimeout(pollTimer);
+      pollTimer = null;
+    }
+  }
+
+  async function pollLoop() {
+    try {
+      const snap = await pollStatusOnce();
+      if (snap.state === 'running') {
+        statusLine.className = '';
+        statusLine.textContent = snap.progress || 'Running…';
+        pollTimer = setTimeout(pollLoop, 2000);
+        return;
+      }
+      if (snap.state === 'done' && snap.result) {
+        renderResult(snap.result);
+        setRunning(false);
+        return;
+      }
+      if (snap.state === 'error') {
+        showError(snap.error || 'Unknown error');
+        setRunning(false);
+        return;
+      }
+      // idle — nothing to do
+      setRunning(false);
+    } catch (e) {
+      showError(e.message || String(e));
+      setRunning(false);
+    }
+  }
+
   async function runAnalysis() {
-    runBtn.disabled = true;
-    const origLabel = runBtn.textContent;
-    runBtn.innerHTML = '<span class="spinner"></span>Running…';
+    stopPolling();
+    setRunning(true);
     statusLine.className = '';
-    statusLine.textContent = 'Fetching BTC klines and Kalshi markets — may take 30–90s on a fresh run…';
+    statusLine.textContent = 'Queuing run…';
     errorBanner.classList.remove('show');
 
     try {
@@ -551,29 +618,42 @@
         headers: { 'Content-Type': 'application/json' },
         body:    JSON.stringify(body),
       });
-      const json = await resp.json();
-      if (json.status !== 'ok') {
-        showError(json.error || 'Unknown error');
+      const json = await parseJsonOrThrow(resp);
+
+      // 4xx from the server (validation, already running, etc.)
+      if (!resp.ok && json.status !== 'started') {
+        showError(json.error || `HTTP ${resp.status}`);
+        setRunning(false);
         return;
       }
-      renderResult(json);
+
+      // Kick off polling
+      statusLine.textContent = 'Started. Polling for progress…';
+      pollTimer = setTimeout(pollLoop, 1000);
     } catch (e) {
       showError(e.message || String(e));
-    } finally {
-      runBtn.disabled = false;
-      runBtn.textContent = origLabel;
+      setRunning(false);
     }
   }
 
   runBtn.addEventListener('click', runAnalysis);
 
-  // Load the last run on page load (if any) so refreshing keeps the view.
+  // On page load: check if there's a run in progress or a recent result.
   (async () => {
     try {
-      const resp = await fetch('/api/analysis/last');
-      const json = await resp.json();
-      if (json.status === 'ok' && json.result) {
-        renderResult(json.result);
+      const snap = await pollStatusOnce();
+      if (snap.state === 'running') {
+        setRunning(true);
+        statusLine.textContent = snap.progress || 'Running…';
+        pollTimer = setTimeout(pollLoop, 2000);
+        return;
+      }
+      if (snap.state === 'done' && snap.result) {
+        renderResult(snap.result);
+        return;
+      }
+      if (snap.state === 'error' && snap.error) {
+        showError(snap.error);
       }
     } catch (e) {
       // silent — empty state stays

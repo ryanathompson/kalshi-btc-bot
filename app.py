@@ -276,14 +276,124 @@ def api_reset_halt():
 # ─────────────────────────────────────────────────────────────
 #
 # The page answers one question: "Is Consensus safe to re-enable?"
-# It runs the same paranoid replay the CLI does, but in-process from
-# the dashboard, with file-based caching so repeated clicks are fast.
+#
+# Why a background thread + polling instead of a blocking request:
+# Render runs gunicorn with --timeout 120. A fresh 14-day @1s fetch
+# hits Binance with ~1200 paginated requests and takes well over two
+# minutes, so a synchronous request gets killed mid-flight and the
+# client sees an HTML error page instead of JSON. Running in a
+# background thread decouples fetch duration from the HTTP timeout.
 
-# Lock so two concurrent clicks don't both blast Binance/Kalshi at once.
+# Cap 1-second interval to prevent accidental multi-minute fetches that
+# Binance will rate-limit anyway. 1-minute can span much longer.
+MAX_DAYS_1S = 3
+MAX_DAYS_1M = 60
+
+# Analysis state — mutated only by the background worker thread.
+# All reads from Flask routes go through the lock.
 _analysis_lock = threading.Lock()
+_analysis_state = {
+    "state":      "idle",   # "idle" | "running" | "done" | "error"
+    "progress":   "",       # human-readable status line
+    "started_at": None,     # ISO timestamp
+    "finished_at": None,    # ISO timestamp
+    "result":     None,     # final result dict when state == "done"
+    "error":      None,     # error string when state == "error"
+    "params":     None,     # {start, end, interval}
+}
+_analysis_thread = None     # Thread handle for the current/last run
 
-# In-memory cache of the LAST run, lets us re-render on refresh.
-_last_analysis_result = None
+
+def _set_progress(msg: str):
+    """Thread-safe progress string update."""
+    with _analysis_lock:
+        _analysis_state["progress"] = msg
+    print(f"[analysis] {msg}", flush=True)
+
+
+def _run_analysis_worker(start: str, end: str, interval: str):
+    """
+    Background worker that runs the full fetch+sweep+interpret pipeline
+    and mutates _analysis_state as it progresses. Must not raise — it
+    captures all exceptions into the state dict.
+    """
+    global _analysis_state
+    try:
+        # Build a Kalshi client — reuse the bot's if available.
+        _set_progress("Building Kalshi client…")
+        client = _bot.client if _bot is not None else None
+        if client is None:
+            api_key_id = os.getenv("KALSHI_API_KEY_ID")
+            key_path   = os.getenv("KALSHI_PRIVATE_KEY_PATH", "./kalshi.key")
+            if not api_key_id:
+                raise RuntimeError(
+                    "Bot isn't initialized and no Kalshi credentials are "
+                    "set. Analysis needs Kalshi API access.")
+            pkey = load_private_key(key_path)
+            client = KalshiClient(api_key_id, pkey, dry_run=True)
+
+        _set_progress(
+            f"Fetching BTC klines and Kalshi markets ({start} → {end}, {interval})…"
+        )
+        history = fetch_history(
+            start=start,
+            end=end,
+            interval=interval,
+            with_kalshi=True,
+            cache_dir="data",
+            max_cache_age_hours=6.0,
+            kalshi_client=client,
+        )
+
+        btc_n    = len(history.get("btc") or [])
+        market_n = len(history.get("kalshi_markets") or [])
+        cache_hit = bool(history.get("_cache_hit"))
+        _set_progress(
+            f"Fetched {btc_n:,} BTC samples and {market_n:,} Kalshi markets"
+            + (" (from cache)" if cache_hit else "")
+            + ". Running sweep…"
+        )
+
+        rows = run_sweep(
+            history,
+            dead_zones=DEFAULT_SWEEP_DEAD_ZONES,
+            base_price=DEFAULT_BASE_PRICE,
+            max_price=DEFAULT_MAX_PRICE,
+        )
+        _set_progress(f"Sweep done ({len(rows)} thresholds). Computing verdict…")
+        verdict = interpret_sweep(rows)
+
+        result = {
+            "status":       "ok",
+            "start":        start,
+            "end":          end,
+            "interval":     interval,
+            "cache_hit":    cache_hit,
+            "cache_age_s":  history.get("_cache_age_s"),
+            "btc_count":    btc_n,
+            "market_count": market_n,
+            "sweep":        rows,
+            "verdict":      verdict,
+            "ran_at":       datetime.datetime.utcnow().isoformat() + "Z",
+        }
+
+        with _analysis_lock:
+            _analysis_state["state"]       = "done"
+            _analysis_state["progress"]    = "Complete."
+            _analysis_state["result"]      = result
+            _analysis_state["finished_at"] = datetime.datetime.utcnow().isoformat() + "Z"
+        print(f"[analysis] Done: verdict={verdict.get('verdict')}", flush=True)
+
+    except BaseException as e:
+        # BaseException (not Exception) so we also catch SystemExit / KeyboardInterrupt
+        # — otherwise a SystemExit from the replay engine would silently kill the
+        # worker thread and leave the state stuck in "running" forever.
+        traceback.print_exc()
+        with _analysis_lock:
+            _analysis_state["state"]       = "error"
+            _analysis_state["error"]       = str(e) or type(e).__name__
+            _analysis_state["progress"]    = f"Failed: {e}"
+            _analysis_state["finished_at"] = datetime.datetime.utcnow().isoformat() + "Z"
 
 
 @app.route("/analysis")
@@ -291,129 +401,108 @@ def analysis_page():
     return render_template("analysis.html")
 
 
-@app.route("/api/analysis/last")
-def api_analysis_last():
-    """Return the most recent analysis result, if any."""
-    if _last_analysis_result is None:
-        return jsonify({"status": "empty"})
-    return jsonify({"status": "ok", "result": _last_analysis_result})
+@app.route("/api/analysis/status")
+def api_analysis_status():
+    """Poll endpoint. Returns the full state dict."""
+    with _analysis_lock:
+        snap = dict(_analysis_state)
+    return jsonify(snap)
 
 
 @app.route("/api/analysis/run", methods=["POST"])
 def api_analysis_run():
-    """Run a fetch+sweep+interpret pipeline for the analysis page."""
-    global _last_analysis_result
+    """
+    Kick off an analysis run in a background thread and return immediately.
 
-    if not _analysis_lock.acquire(blocking=False):
+    Returns 202 with {state: "running"} on success, or 409/400 on errors.
+    The client then polls /api/analysis/status until state is "done" or "error".
+    """
+    global _analysis_thread, _analysis_state
+
+    body = request.get_json(silent=True) or {}
+    today = datetime.date.today()
+    default_start = (today - datetime.timedelta(days=14)).isoformat()
+    default_end   = today.isoformat()
+
+    start    = body.get("start")    or default_start
+    end      = body.get("end")      or default_end
+    interval = body.get("interval") or "1m"
+
+    if interval not in ("1s", "1m"):
         return jsonify({
             "status": "error",
-            "error": "Another analysis run is already in progress. "
-                     "Wait a few seconds and try again.",
-        }), 429
+            "error": f"Invalid interval {interval!r}. Must be '1s' or '1m'.",
+        }), 400
 
     try:
-        body = request.get_json(silent=True) or {}
-        today = datetime.date.today()
-        default_start = (today - datetime.timedelta(days=14)).isoformat()
-        default_end   = today.isoformat()
+        d_start = datetime.date.fromisoformat(start)
+        d_end   = datetime.date.fromisoformat(end)
+    except ValueError as e:
+        return jsonify({
+            "status": "error",
+            "error": f"Invalid date format (expected YYYY-MM-DD): {e}",
+        }), 400
 
-        start    = body.get("start")    or default_start
-        end      = body.get("end")      or default_end
-        interval = body.get("interval") or "1m"
+    if d_start >= d_end:
+        return jsonify({
+            "status": "error",
+            "error": "Start date must be before end date.",
+        }), 400
 
-        if interval not in ("1s", "1m"):
+    span_days = (d_end - d_start).days
+    if interval == "1s" and span_days > MAX_DAYS_1S:
+        return jsonify({
+            "status": "error",
+            "error": (
+                f"1-second precision is capped at {MAX_DAYS_1S} days "
+                f"(you requested {span_days}). Use 1-minute precision for "
+                f"longer windows — it's nearly as good for this strategy and "
+                f"runs in seconds instead of minutes."
+            ),
+        }), 400
+    if interval == "1m" and span_days > MAX_DAYS_1M:
+        return jsonify({
+            "status": "error",
+            "error": (
+                f"Date range is capped at {MAX_DAYS_1M} days "
+                f"(you requested {span_days})."
+            ),
+        }), 400
+
+    # Reject if another run is already in flight.
+    with _analysis_lock:
+        if _analysis_state["state"] == "running":
             return jsonify({
                 "status": "error",
-                "error": f"Invalid interval {interval!r}. Must be '1s' or '1m'.",
-            }), 400
+                "state":  "running",
+                "error": "Another analysis run is already in progress. "
+                         "Wait for it to finish and try again.",
+            }), 409
 
-        try:
-            datetime.date.fromisoformat(start)
-            datetime.date.fromisoformat(end)
-        except ValueError as e:
-            return jsonify({
-                "status": "error",
-                "error": f"Invalid date format (expected YYYY-MM-DD): {e}",
-            }), 400
+        # Reset state for the new run.
+        _analysis_state.update({
+            "state":       "running",
+            "progress":    "Starting…",
+            "started_at":  datetime.datetime.utcnow().isoformat() + "Z",
+            "finished_at": None,
+            "result":      None,
+            "error":       None,
+            "params":      {"start": start, "end": end, "interval": interval},
+        })
 
-        if start >= end:
-            return jsonify({
-                "status": "error",
-                "error": "Start date must be before end date.",
-            }), 400
+    _analysis_thread = threading.Thread(
+        target=_run_analysis_worker,
+        args=(start, end, interval),
+        name="analysis-worker",
+        daemon=True,
+    )
+    _analysis_thread.start()
 
-        # Kalshi client — reuse the bot's authenticated client if available,
-        # otherwise build one from env. If no creds at all we cannot proceed.
-        client = _bot.client if _bot is not None else None
-        if client is None:
-            api_key_id = os.getenv("KALSHI_API_KEY_ID")
-            key_path   = os.getenv("KALSHI_PRIVATE_KEY_PATH", "./kalshi.key")
-            if not api_key_id:
-                return jsonify({
-                    "status": "error",
-                    "error": "Bot isn't initialized and no Kalshi credentials "
-                             "are set. Analysis needs Kalshi API access to fetch "
-                             "historical markets.",
-                }), 503
-            try:
-                pkey = load_private_key(key_path)
-                client = KalshiClient(api_key_id, pkey, dry_run=True)
-            except Exception as e:
-                return jsonify({
-                    "status": "error",
-                    "error": f"Failed to build Kalshi client: {e}",
-                }), 500
-
-        try:
-            history = fetch_history(
-                start=start,
-                end=end,
-                interval=interval,
-                with_kalshi=True,
-                cache_dir="data",
-                max_cache_age_hours=6.0,
-                kalshi_client=client,
-            )
-        except Exception as e:
-            traceback.print_exc()
-            return jsonify({
-                "status": "error",
-                "error": f"Failed to fetch history: {e}",
-            }), 500
-
-        try:
-            rows = run_sweep(
-                history,
-                dead_zones=DEFAULT_SWEEP_DEAD_ZONES,
-                base_price=DEFAULT_BASE_PRICE,
-                max_price=DEFAULT_MAX_PRICE,
-            )
-            verdict = interpret_sweep(rows)
-        except Exception as e:
-            traceback.print_exc()
-            return jsonify({
-                "status": "error",
-                "error": f"Sweep/interpretation failed: {e}",
-            }), 500
-
-        result = {
-            "status":       "ok",
-            "start":        start,
-            "end":          end,
-            "interval":     interval,
-            "cache_hit":    bool(history.get("_cache_hit")),
-            "cache_age_s":  history.get("_cache_age_s"),
-            "btc_count":    len(history.get("btc") or []),
-            "market_count": len(history.get("kalshi_markets") or []),
-            "sweep":        rows,
-            "verdict":      verdict,
-            "ran_at":       datetime.datetime.utcnow().isoformat() + "Z",
-        }
-        _last_analysis_result = result
-        return jsonify(result)
-
-    finally:
-        _analysis_lock.release()
+    return jsonify({
+        "status": "started",
+        "state":  "running",
+        "params": {"start": start, "end": end, "interval": interval},
+    }), 202
 
 
 

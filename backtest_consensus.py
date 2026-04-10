@@ -492,7 +492,11 @@ def replay(history: dict, dead_zone: float, base_price: float, max_price: float,
     actually have fired).
     """
     if not history.get("kalshi_markets"):
-        raise SystemExit("[replay] history bundle is missing kalshi_markets — re-fetch with --with-kalshi")
+        raise ValueError(
+            "history bundle is missing kalshi_markets — either the date range "
+            "has no settled KXBTC15M markets, or the bundle was fetched without "
+            "--with-kalshi"
+        )
     btc = history["btc"]
     markets = sorted(history["kalshi_markets"], key=lambda m: m.get("close_time", ""))
 
