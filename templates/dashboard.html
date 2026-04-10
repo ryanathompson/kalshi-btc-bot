@@ -451,6 +451,22 @@
     #reset-halt-btn:hover { background: rgba(248,81,73,.3); }
     #reset-halt-btn:active { transform: translateY(1px); }
 
+    /* -- NAV LINKS (analysis, etc.) -- */
+    .nav-link {
+      color: var(--muted);
+      text-decoration: none;
+      padding: 4px 10px;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      font-size: 12px;
+      font-weight: 500;
+      transition: all .15s;
+    }
+    .nav-link:hover {
+      color: var(--cyan);
+      border-color: var(--cyan);
+    }
+
     /* -- CONFIRM MODAL -- */
     .modal-overlay {
       display: none;
@@ -523,6 +539,7 @@
 <header>
   <h1>🤖 Kalshi BTC Bot</h1>
   <span id="mode-badge" class="badge badge-offline"><span class="dot"></span> Loading</span>
+  <a href="/analysis" class="nav-link" title="Replay Consensus over real history to check for edge">🔬 Analysis</a>
   <div id="halt-controls" class="halt-controls">
     <span id="halt-countdown" title="Time until automatic halt reset at 00:00 ET">--:--:--</span>
     <button id="reset-halt-btn" type="button" title="Force-clear the halt right now">Reset Now</button>

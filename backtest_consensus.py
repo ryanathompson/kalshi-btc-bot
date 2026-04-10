@@ -164,46 +164,277 @@ def fetch_kalshi_settled_markets(client, start_iso: str, end_iso: str) -> list[d
     return out
 
 
-def cmd_fetch(args):
+# ──────────────────────────────────────────────────────────────────────────
+# CORE API (used by both CLI and the Flask dashboard analysis page)
+# ──────────────────────────────────────────────────────────────────────────
+
+def _cache_path(start: str, end: str, interval: str, cache_dir: str = "data") -> Path:
+    """Deterministic cache path for a (start, end, interval) fetch bundle."""
+    key = f"history_{start}_{end}_{interval}.json"
+    return Path(cache_dir) / key
+
+
+def fetch_history(start: str, end: str, interval: str = "1m",
+                  with_kalshi: bool = True, cache_dir: str = "data",
+                  max_cache_age_hours: float = 6.0,
+                  kalshi_client=None) -> dict:
     """
-    Fetch BTC klines AND Kalshi settled markets, persist as a single JSON.
-    The Kalshi side requires API credentials; without them we still capture
-    BTC and write a 'kalshi_markets: null' field that replay() will refuse.
+    Fetch (or load from cache) a history bundle with BTC klines + Kalshi markets.
+
+    Args:
+        start, end: ISO date strings (e.g. "2026-04-02")
+        interval: Binance kline interval — "1s" or "1m"
+        with_kalshi: if True, also fetch Kalshi settled markets
+        cache_dir: where to store cached bundles
+        max_cache_age_hours: serve from cache if file is newer than this
+        kalshi_client: optional pre-built KalshiClient; if None we construct
+                       one from env (KALSHI_API_KEY_ID + key path/base64)
+
+    Returns: the history dict (same shape cmd_fetch writes to disk)
+    Raises:  requests.HTTPError on network failure,
+             RuntimeError if with_kalshi=True but no credentials available.
     """
-    start_dt = datetime.fromisoformat(args.start).replace(tzinfo=timezone.utc)
-    end_dt   = datetime.fromisoformat(args.end).replace(tzinfo=timezone.utc)
-    print(f"[fetch] BTC klines {args.start} → {args.end}  ({args.interval})", flush=True)
+    cache_file = _cache_path(start, end, interval, cache_dir)
+    if cache_file.exists():
+        age_s = time.time() - cache_file.stat().st_mtime
+        if age_s < max_cache_age_hours * 3600:
+            with open(cache_file) as f:
+                bundle = json.load(f)
+            bundle["_cache_hit"] = True
+            bundle["_cache_age_s"] = round(age_s, 1)
+            return bundle
+
+    start_dt = datetime.fromisoformat(start).replace(tzinfo=timezone.utc)
+    end_dt   = datetime.fromisoformat(end).replace(tzinfo=timezone.utc)
+    print(f"[fetch_history] BTC klines {start} → {end} ({interval})", flush=True)
     btc = fetch_btc_klines(int(start_dt.timestamp() * 1000),
                            int(end_dt.timestamp() * 1000),
-                           interval=args.interval)
-    print(f"[fetch] Got {len(btc)} BTC klines", flush=True)
+                           interval=interval)
+    print(f"[fetch_history] Got {len(btc)} BTC klines", flush=True)
 
     kalshi = None
-    if args.with_kalshi:
-        # Lazy import so the harness still runs without bot.py credentials.
-        sys.path.insert(0, os.path.dirname(__file__))
-        from bot import KalshiClient, load_private_key
-        api_key_id = os.getenv("KALSHI_API_KEY_ID")
-        key_path   = os.getenv("KALSHI_PRIVATE_KEY_PATH", "./kalshi.key")
-        if not api_key_id:
-            print("[fetch] KALSHI_API_KEY_ID not set — skipping Kalshi fetch", flush=True)
-        else:
-            pkey   = load_private_key(key_path)
-            client = KalshiClient(api_key_id, pkey, dry_run=True)
-            print(f"[fetch] Pulling Kalshi settled markets {args.start} → {args.end}", flush=True)
-            kalshi = fetch_kalshi_settled_markets(client, args.start, args.end)
-            print(f"[fetch] Got {len(kalshi)} Kalshi markets", flush=True)
+    if with_kalshi:
+        if kalshi_client is None:
+            # Lazy import to keep the harness importable without bot deps
+            sys.path.insert(0, os.path.dirname(__file__))
+            from bot import KalshiClient, load_private_key
+            api_key_id = os.getenv("KALSHI_API_KEY_ID")
+            key_path   = os.getenv("KALSHI_PRIVATE_KEY_PATH", "./kalshi.key")
+            if not api_key_id:
+                raise RuntimeError(
+                    "KALSHI_API_KEY_ID not set — cannot fetch Kalshi markets")
+            pkey = load_private_key(key_path)
+            kalshi_client = KalshiClient(api_key_id, pkey, dry_run=True)
+        print(f"[fetch_history] Pulling Kalshi settled markets", flush=True)
+        kalshi = fetch_kalshi_settled_markets(kalshi_client, start, end)
+        print(f"[fetch_history] Got {len(kalshi)} Kalshi markets", flush=True)
 
+    bundle = {
+        "fetched_at": datetime.utcnow().isoformat() + "Z",
+        "start": start,
+        "end": end,
+        "interval": interval,
+        "btc": btc,
+        "kalshi_markets": kalshi,
+    }
+
+    cache_file.parent.mkdir(parents=True, exist_ok=True)
+    with open(cache_file, "w") as f:
+        json.dump(bundle, f)
+    bundle["_cache_hit"] = False
+    return bundle
+
+
+# Standard sweep grid: spans an order of magnitude of dead-zone values
+DEFAULT_SWEEP_DEAD_ZONES = [0.0005, 0.001, 0.0015, 0.002, 0.0025, 0.003, 0.004, 0.005]
+
+
+def run_sweep(history: dict,
+              dead_zones: list[float] = None,
+              base_price: float = DEFAULT_BASE_PRICE,
+              max_price: float = DEFAULT_MAX_PRICE) -> list[dict]:
+    """
+    Replay Consensus over `history` once per dead_zone value.
+
+    Returns: list of rows, each row = summarize() output + {"dead_zone": z}.
+             Sorted by dead_zone ascending (smallest → largest).
+    """
+    if dead_zones is None:
+        dead_zones = DEFAULT_SWEEP_DEAD_ZONES
+    rows = []
+    for dz in sorted(dead_zones):
+        trades = replay(history, dz, base_price, max_price)
+        row = summarize(trades)
+        row["dead_zone"] = dz
+        rows.append(row)
+    return rows
+
+
+def interpret_sweep(rows: list[dict], min_trades: int = 10) -> dict:
+    """
+    Convert a sweep result into a plain-English verdict for non-technical users.
+
+    Looks for a "plateau": at least 3 adjacent rows where pnl_per_dollar > 0.03
+    (~3% edge, enough to survive fees) AND trade count >= min_trades.
+
+    Returns:
+        {
+          "verdict": "edge" | "no_edge" | "thin_sample" | "overfit_spike",
+          "headline": str,    # one-line summary
+          "rationale": str,   # plain-English explanation
+          "recommendation": str,
+          "best_dead_zone": float | None,
+          "plateau_range": [lo, hi] | None,
+        }
+    """
+    if not rows:
+        return {
+            "verdict": "no_edge",
+            "headline": "No data to analyze",
+            "rationale": "The sweep returned no rows. Check your date range.",
+            "recommendation": "Try a wider date range or verify Kalshi credentials.",
+            "best_dead_zone": None,
+            "plateau_range": None,
+        }
+
+    # Sort by dead_zone ascending
+    rows = sorted(rows, key=lambda r: r.get("dead_zone", 0))
+
+    # Count rows with enough trades to be meaningful
+    meaningful = [r for r in rows if r.get("trades", 0) >= min_trades]
+    if not meaningful:
+        return {
+            "verdict": "thin_sample",
+            "headline": "Not enough candidate trades to judge",
+            "rationale": (
+                f"Across every threshold tested, the sweep generated fewer than "
+                f"{min_trades} candidate trades. This window is too short or too "
+                f"quiet to measure edge reliably."
+            ),
+            "recommendation": (
+                "Re-run with a longer date range (at least 2–4 weeks). "
+                "If the trade count stays low, Consensus simply isn't firing "
+                "often enough to be a useful strategy."
+            ),
+            "best_dead_zone": None,
+            "plateau_range": None,
+        }
+
+    # Look for a plateau: 3 consecutive rows with pnl_per_dollar > 0.03 AND
+    # enough trades in each.
+    EDGE_FLOOR = 0.03  # 3% return on stake — rough floor above fees/slippage
+    plateau_start = None
+    plateau_len = 0
+    best_plateau = None  # (start_idx, length, avg_pnl)
+
+    profitable = [i for i, r in enumerate(rows)
+                  if r.get("pnl_per_dollar", 0) > EDGE_FLOOR
+                  and r.get("trades", 0) >= min_trades]
+
+    # Find longest run of consecutive indices in `profitable`
+    if profitable:
+        run_start = profitable[0]
+        run_len = 1
+        for i in range(1, len(profitable)):
+            if profitable[i] == profitable[i - 1] + 1:
+                run_len += 1
+            else:
+                if run_len >= 3:
+                    avg = sum(rows[k]["pnl_per_dollar"]
+                              for k in range(run_start, run_start + run_len)) / run_len
+                    if best_plateau is None or avg > best_plateau[2]:
+                        best_plateau = (run_start, run_len, avg)
+                run_start = profitable[i]
+                run_len = 1
+        if run_len >= 3:
+            avg = sum(rows[k]["pnl_per_dollar"]
+                      for k in range(run_start, run_start + run_len)) / run_len
+            if best_plateau is None or avg > best_plateau[2]:
+                best_plateau = (run_start, run_len, avg)
+
+    # Is there a single-point spike (profitable but isolated)?
+    single_spikes = [i for i in profitable
+                     if (i - 1) not in profitable and (i + 1) not in profitable]
+
+    if best_plateau:
+        start_i, length, avg_pnl = best_plateau
+        lo = rows[start_i]["dead_zone"]
+        hi = rows[start_i + length - 1]["dead_zone"]
+        # "Best" threshold = the middle of the plateau
+        mid_i = start_i + length // 2
+        best_dz = rows[mid_i]["dead_zone"]
+        return {
+            "verdict": "edge",
+            "headline": (
+                f"Stable edge detected — ~{avg_pnl*100:.1f}% average return "
+                f"across {length} adjacent thresholds"
+            ),
+            "rationale": (
+                f"The sweep found {length} consecutive dead-zone values "
+                f"({lo*100:.2f}% to {hi*100:.2f}%) where Consensus is profitable "
+                f"with enough trades in each. Plateaus are more trustworthy than "
+                f"isolated peaks — a plateau means the edge isn't just fitting noise."
+            ),
+            "recommendation": (
+                f"Re-run the analysis on a DIFFERENT date range to confirm this "
+                f"holds out-of-sample. If it does, set MOMENTUM_DEAD_ZONE={best_dz} "
+                f"and CONSENSUS_ENABLED=true in Render env."
+            ),
+            "best_dead_zone": best_dz,
+            "plateau_range": [lo, hi],
+        }
+
+    if single_spikes:
+        i = max(single_spikes, key=lambda k: rows[k]["pnl_per_dollar"])
+        return {
+            "verdict": "overfit_spike",
+            "headline": "Only isolated spikes — no stable edge",
+            "rationale": (
+                f"One threshold ({rows[i]['dead_zone']*100:.2f}%) looks profitable, "
+                f"but its neighbors are not. This is the signature of overfitting: "
+                f"the parameter is catching noise, not real edge. If you enabled "
+                f"Consensus with this value, a small regime shift would flip it "
+                f"to losing."
+            ),
+            "recommendation": (
+                "Do NOT re-enable Consensus based on this. Either the signal is "
+                "dead or you need a much longer window to find a real plateau."
+            ),
+            "best_dead_zone": None,
+            "plateau_range": None,
+        }
+
+    return {
+        "verdict": "no_edge",
+        "headline": "No edge found at any threshold",
+        "rationale": (
+            "Every dead-zone value tested produced either losses or returns "
+            "too small to survive fees and slippage. This matches the live "
+            "result (−23.6% ROI in the 2026-04-09 post-mortem)."
+        ),
+        "recommendation": (
+            "Keep Consensus disabled. The strategy in its current form has no "
+            "measurable edge. Consider building a different signal from scratch "
+            "rather than re-tuning this one."
+        ),
+        "best_dead_zone": None,
+        "plateau_range": None,
+    }
+
+
+def cmd_fetch(args):
+    """CLI wrapper: fetch into the user-specified file path."""
+    bundle = fetch_history(
+        start=args.start,
+        end=args.end,
+        interval=args.interval,
+        with_kalshi=args.with_kalshi,
+        cache_dir=str(Path(args.out).parent),
+        max_cache_age_hours=0,  # CLI always refetches
+    )
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     with open(args.out, "w") as f:
-        json.dump({
-            "fetched_at": datetime.utcnow().isoformat() + "Z",
-            "start": args.start,
-            "end": args.end,
-            "interval": args.interval,
-            "btc": btc,
-            "kalshi_markets": kalshi,
-        }, f)
+        json.dump(bundle, f)
     print(f"[fetch] Wrote {args.out}", flush=True)
 
 

@@ -14,14 +14,20 @@ import time
 import threading
 import datetime
 import concurrent.futures
+import traceback
 
-from flask import Flask, render_template, jsonify
+from flask import Flask, render_template, jsonify, request
 from dotenv import load_dotenv
 
 from bot import (
     KalshiBot, KalshiClient, load_private_key, load_trades, POLL_INTERVAL,
     resolve_trades, start_keep_alive, rebuild_trades_from_api,
     ET, now_et, today_et, parse_trade_ts,
+)
+
+from backtest_consensus import (
+    fetch_history, run_sweep, interpret_sweep,
+    DEFAULT_SWEEP_DEAD_ZONES, DEFAULT_BASE_PRICE, DEFAULT_MAX_PRICE,
 )
 
 load_dotenv()
@@ -263,6 +269,153 @@ def api_reset_halt():
         return jsonify({"ok": True, "was": prev_reason})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+# ────────────────────────────────────────────────────────────
+# ANALYSIS PAGE — wraps backtest_consensus.py for non-technical use
+# ─────────────────────────────────────────────────────────────
+#
+# The page answers one question: "Is Consensus safe to re-enable?"
+# It runs the same paranoid replay the CLI does, but in-process from
+# the dashboard, with file-based caching so repeated clicks are fast.
+
+# Lock so two concurrent clicks don't both blast Binance/Kalshi at once.
+_analysis_lock = threading.Lock()
+
+# In-memory cache of the LAST run, lets us re-render on refresh.
+_last_analysis_result = None
+
+
+@app.route("/analysis")
+def analysis_page():
+    return render_template("analysis.html")
+
+
+@app.route("/api/analysis/last")
+def api_analysis_last():
+    """Return the most recent analysis result, if any."""
+    if _last_analysis_result is None:
+        return jsonify({"status": "empty"})
+    return jsonify({"status": "ok", "result": _last_analysis_result})
+
+
+@app.route("/api/analysis/run", methods=["POST"])
+def api_analysis_run():
+    """Run a fetch+sweep+interpret pipeline for the analysis page."""
+    global _last_analysis_result
+
+    if not _analysis_lock.acquire(blocking=False):
+        return jsonify({
+            "status": "error",
+            "error": "Another analysis run is already in progress. "
+                     "Wait a few seconds and try again.",
+        }), 429
+
+    try:
+        body = request.get_json(silent=True) or {}
+        today = datetime.date.today()
+        default_start = (today - datetime.timedelta(days=14)).isoformat()
+        default_end   = today.isoformat()
+
+        start    = body.get("start")    or default_start
+        end      = body.get("end")      or default_end
+        interval = body.get("interval") or "1m"
+
+        if interval not in ("1s", "1m"):
+            return jsonify({
+                "status": "error",
+                "error": f"Invalid interval {interval!r}. Must be '1s' or '1m'.",
+            }), 400
+
+        try:
+            datetime.date.fromisoformat(start)
+            datetime.date.fromisoformat(end)
+        except ValueError as e:
+            return jsonify({
+                "status": "error",
+                "error": f"Invalid date format (expected YYYY-MM-DD): {e}",
+            }), 400
+
+        if start >= end:
+            return jsonify({
+                "status": "error",
+                "error": "Start date must be before end date.",
+            }), 400
+
+        # Kalshi client — reuse the bot's authenticated client if available,
+        # otherwise build one from env. If no creds at all we cannot proceed.
+        client = _bot.client if _bot is not None else None
+        if client is None:
+            api_key_id = os.getenv("KALSHI_API_KEY_ID")
+            key_path   = os.getenv("KALSHI_PRIVATE_KEY_PATH", "./kalshi.key")
+            if not api_key_id:
+                return jsonify({
+                    "status": "error",
+                    "error": "Bot isn't initialized and no Kalshi credentials "
+                             "are set. Analysis needs Kalshi API access to fetch "
+                             "historical markets.",
+                }), 503
+            try:
+                pkey = load_private_key(key_path)
+                client = KalshiClient(api_key_id, pkey, dry_run=True)
+            except Exception as e:
+                return jsonify({
+                    "status": "error",
+                    "error": f"Failed to build Kalshi client: {e}",
+                }), 500
+
+        try:
+            history = fetch_history(
+                start=start,
+                end=end,
+                interval=interval,
+                with_kalshi=True,
+                cache_dir="data",
+                max_cache_age_hours=6.0,
+                kalshi_client=client,
+            )
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({
+                "status": "error",
+                "error": f"Failed to fetch history: {e}",
+            }), 500
+
+        try:
+            rows = run_sweep(
+                history,
+                dead_zones=DEFAULT_SWEEP_DEAD_ZONES,
+                base_price=DEFAULT_BASE_PRICE,
+                max_price=DEFAULT_MAX_PRICE,
+            )
+            verdict = interpret_sweep(rows)
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({
+                "status": "error",
+                "error": f"Sweep/interpretation failed: {e}",
+            }), 500
+
+        result = {
+            "status":       "ok",
+            "start":        start,
+            "end":          end,
+            "interval":     interval,
+            "cache_hit":    bool(history.get("_cache_hit")),
+            "cache_age_s":  history.get("_cache_age_s"),
+            "btc_count":    len(history.get("btc") or []),
+            "market_count": len(history.get("kalshi_markets") or []),
+            "sweep":        rows,
+            "verdict":      verdict,
+            "ran_at":       datetime.datetime.utcnow().isoformat() + "Z",
+        }
+        _last_analysis_result = result
+        return jsonify(result)
+
+    finally:
+        _analysis_lock.release()
+
+
 
 
 # âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ

@@ -1,0 +1,585 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Consensus Analysis — Kalshi BTC Bot</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🔬</text></svg>">
+  <style>
+    :root {
+      --bg:      #0d1117;
+      --panel:   #161b22;
+      --panel2:  #1c2129;
+      --border:  #30363d;
+      --text:    #e6edf3;
+      --muted:   #8b949e;
+      --green:   #3fb950;
+      --red:     #f85149;
+      --yellow:  #d29922;
+      --blue:    #58a6ff;
+      --cyan:    #79c0ff;
+      --purple:  #bc8cff;
+      --orange:  #ffa657;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 14px;
+      line-height: 1.5;
+    }
+
+    header {
+      background: var(--panel);
+      border-bottom: 1px solid var(--border);
+      padding: 12px 24px;
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      position: sticky;
+      top: 0;
+      z-index: 100;
+    }
+    header h1 {
+      font-size: 16px;
+      font-weight: 600;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    header a {
+      color: var(--muted);
+      text-decoration: none;
+      padding: 6px 12px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      font-size: 13px;
+      transition: all .15s;
+    }
+    header a:hover {
+      color: var(--text);
+      border-color: var(--blue);
+    }
+    header .spacer { flex: 1; }
+
+    main {
+      max-width: 1100px;
+      margin: 0 auto;
+      padding: 24px;
+    }
+
+    .intro {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 20px 24px;
+      margin-bottom: 20px;
+    }
+    .intro h2 {
+      font-size: 18px;
+      margin-bottom: 8px;
+      color: var(--cyan);
+    }
+    .intro p {
+      color: var(--muted);
+      margin-bottom: 8px;
+    }
+    .intro p:last-child { margin-bottom: 0; }
+    .intro strong { color: var(--text); }
+
+    .controls {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 20px 24px;
+      margin-bottom: 20px;
+      display: flex;
+      flex-wrap: wrap;
+      align-items: end;
+      gap: 16px;
+    }
+    .field {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .field label {
+      font-size: 12px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: .05em;
+    }
+    .field input, .field select {
+      background: var(--bg);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 8px 12px;
+      font-size: 14px;
+      font-family: inherit;
+      min-width: 140px;
+    }
+    .field input:focus, .field select:focus {
+      outline: none;
+      border-color: var(--blue);
+    }
+
+    .run-btn {
+      background: var(--blue);
+      color: #0d1117;
+      border: none;
+      border-radius: 6px;
+      padding: 10px 20px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      font-family: inherit;
+      transition: background .15s;
+    }
+    .run-btn:hover:not(:disabled) { background: #4493e0; }
+    .run-btn:disabled {
+      opacity: .6;
+      cursor: not-allowed;
+    }
+
+    .spinner {
+      display: inline-block;
+      width: 14px;
+      height: 14px;
+      border: 2px solid rgba(255,255,255,.3);
+      border-top-color: #fff;
+      border-radius: 50%;
+      animation: spin .8s linear infinite;
+      vertical-align: middle;
+      margin-right: 8px;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    #status-line {
+      color: var(--muted);
+      font-size: 13px;
+      margin-left: auto;
+    }
+    #status-line.error { color: var(--red); }
+
+    .verdict-card {
+      border-radius: 10px;
+      padding: 24px 28px;
+      margin-bottom: 20px;
+      border: 1px solid var(--border);
+      display: none;
+    }
+    .verdict-card.show { display: block; }
+    .verdict-card.edge {
+      background: rgba(63, 185, 80, 0.08);
+      border-color: var(--green);
+    }
+    .verdict-card.no_edge {
+      background: rgba(248, 81, 73, 0.08);
+      border-color: var(--red);
+    }
+    .verdict-card.overfit_spike {
+      background: rgba(210, 153, 34, 0.08);
+      border-color: var(--yellow);
+    }
+    .verdict-card.thin_sample {
+      background: rgba(139, 148, 158, 0.08);
+      border-color: var(--muted);
+    }
+    .verdict-label {
+      font-size: 12px;
+      letter-spacing: .1em;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin-bottom: 6px;
+    }
+    .verdict-headline {
+      font-size: 22px;
+      font-weight: 600;
+      margin-bottom: 14px;
+    }
+    .verdict-card.edge .verdict-headline { color: var(--green); }
+    .verdict-card.no_edge .verdict-headline { color: var(--red); }
+    .verdict-card.overfit_spike .verdict-headline { color: var(--yellow); }
+    .verdict-card.thin_sample .verdict-headline { color: var(--muted); }
+    .verdict-body {
+      color: var(--text);
+      margin-bottom: 14px;
+    }
+    .verdict-rec {
+      background: var(--panel2);
+      border-left: 3px solid currentColor;
+      padding: 12px 16px;
+      border-radius: 4px;
+      color: var(--text);
+    }
+    .verdict-rec strong {
+      display: block;
+      font-size: 11px;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin-bottom: 4px;
+    }
+
+    .summary-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+      gap: 12px;
+      margin-bottom: 20px;
+      display: none;
+    }
+    .summary-grid.show { display: grid; }
+    .summary-box {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 14px 18px;
+    }
+    .summary-box .label {
+      font-size: 11px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: .05em;
+      margin-bottom: 4px;
+    }
+    .summary-box .val {
+      font-size: 18px;
+      font-weight: 600;
+      color: var(--text);
+    }
+
+    .sweep-card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 20px 24px;
+      margin-bottom: 20px;
+      display: none;
+    }
+    .sweep-card.show { display: block; }
+    .sweep-card h3 {
+      font-size: 15px;
+      color: var(--cyan);
+      margin-bottom: 12px;
+    }
+    .sweep-card p.desc {
+      color: var(--muted);
+      font-size: 13px;
+      margin-bottom: 16px;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+    }
+    thead th {
+      text-align: right;
+      padding: 8px 12px;
+      color: var(--muted);
+      font-weight: 500;
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: .05em;
+      border-bottom: 1px solid var(--border);
+    }
+    thead th:first-child { text-align: left; }
+    tbody td {
+      padding: 10px 12px;
+      text-align: right;
+      border-bottom: 1px solid var(--border);
+      font-variant-numeric: tabular-nums;
+    }
+    tbody td:first-child { text-align: left; font-weight: 500; }
+    tbody tr:last-child td { border-bottom: none; }
+    tbody tr.plateau { background: rgba(63, 185, 80, 0.06); }
+    .pos { color: var(--green); }
+    .neg { color: var(--red); }
+
+    .empty-state {
+      background: var(--panel);
+      border: 1px dashed var(--border);
+      border-radius: 8px;
+      padding: 40px 24px;
+      text-align: center;
+      color: var(--muted);
+    }
+    .empty-state .icon {
+      font-size: 32px;
+      margin-bottom: 8px;
+    }
+
+    .error-banner {
+      background: rgba(248, 81, 73, 0.1);
+      border: 1px solid var(--red);
+      border-radius: 8px;
+      padding: 14px 18px;
+      color: var(--red);
+      margin-bottom: 20px;
+      display: none;
+    }
+    .error-banner.show { display: block; }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>🔬 Consensus Analysis</h1>
+  <span class="spacer"></span>
+  <a href="/">← Back to dashboard</a>
+</header>
+
+<main>
+
+  <section class="intro">
+    <h2>Is Consensus safe to re-enable?</h2>
+    <p>
+      This page replays the Consensus strategy over real historical data and
+      tells you — in plain English — whether there's a stable edge. It uses the
+      same paranoid checks the post-mortem harness uses: point-in-time BTC
+      alignment, no look-ahead leakage, no using the current market's result.
+    </p>
+    <p>
+      Pick a date range, click <strong>Run Analysis</strong>, and read the
+      verdict at the top. A green "edge" result across a range of thresholds is
+      the only signal worth trusting. Isolated spikes are overfitting.
+    </p>
+  </section>
+
+  <section class="controls">
+    <div class="field">
+      <label for="start-date">Start date</label>
+      <input type="date" id="start-date" />
+    </div>
+    <div class="field">
+      <label for="end-date">End date</label>
+      <input type="date" id="end-date" />
+    </div>
+    <div class="field">
+      <label for="interval">BTC precision</label>
+      <select id="interval">
+        <option value="1m" selected>1-minute (fast)</option>
+        <option value="1s">1-second (slow, precise)</option>
+      </select>
+    </div>
+    <button id="run-btn" class="run-btn">Run Analysis</button>
+    <span id="status-line"></span>
+  </section>
+
+  <div id="error-banner" class="error-banner"></div>
+
+  <section id="verdict-card" class="verdict-card">
+    <div class="verdict-label">Verdict</div>
+    <div id="verdict-headline" class="verdict-headline">—</div>
+    <div id="verdict-body" class="verdict-body">—</div>
+    <div class="verdict-rec">
+      <strong>Recommendation</strong>
+      <span id="verdict-rec">—</span>
+    </div>
+  </section>
+
+  <div id="summary-grid" class="summary-grid">
+    <div class="summary-box">
+      <div class="label">Date range</div>
+      <div class="val" id="sum-range">—</div>
+    </div>
+    <div class="summary-box">
+      <div class="label">BTC samples</div>
+      <div class="val" id="sum-btc">—</div>
+    </div>
+    <div class="summary-box">
+      <div class="label">Kalshi markets</div>
+      <div class="val" id="sum-markets">—</div>
+    </div>
+    <div class="summary-box">
+      <div class="label">Best threshold</div>
+      <div class="val" id="sum-best">—</div>
+    </div>
+  </div>
+
+  <section id="sweep-card" class="sweep-card">
+    <h3>Dead-zone sweep</h3>
+    <p class="desc">
+      Each row is a full replay at a different momentum dead-zone. Look for a
+      <em>plateau</em> — several adjacent rows where P&L per $1 is positive.
+      Isolated winners are almost always overfitting. Rows highlighted in green
+      are inside the detected plateau.
+    </p>
+    <table>
+      <thead>
+        <tr>
+          <th>Dead zone</th>
+          <th>Trades</th>
+          <th>Win rate</th>
+          <th>P&L per $1</th>
+          <th>Avg win</th>
+          <th>Avg loss</th>
+          <th>Max drawdown</th>
+        </tr>
+      </thead>
+      <tbody id="sweep-body"></tbody>
+    </table>
+  </section>
+
+  <div id="empty-state" class="empty-state">
+    <div class="icon">📊</div>
+    <div>No analysis run yet. Set a date range and click <strong>Run Analysis</strong>.</div>
+  </div>
+
+</main>
+
+<script>
+  // ─── Defaults ─────────────────────────────────────────────────────────
+  const endInput   = document.getElementById('end-date');
+  const startInput = document.getElementById('start-date');
+  const today = new Date();
+  const startDefault = new Date(today); startDefault.setDate(today.getDate() - 14);
+  endInput.value   = today.toISOString().slice(0, 10);
+  startInput.value = startDefault.toISOString().slice(0, 10);
+
+  const runBtn       = document.getElementById('run-btn');
+  const statusLine   = document.getElementById('status-line');
+  const errorBanner  = document.getElementById('error-banner');
+  const verdictCard  = document.getElementById('verdict-card');
+  const verdictHead  = document.getElementById('verdict-headline');
+  const verdictBody  = document.getElementById('verdict-body');
+  const verdictRec   = document.getElementById('verdict-rec');
+  const summaryGrid  = document.getElementById('summary-grid');
+  const sweepCard    = document.getElementById('sweep-card');
+  const sweepBody    = document.getElementById('sweep-body');
+  const emptyState   = document.getElementById('empty-state');
+
+  function fmtPct(v) {
+    if (v === null || v === undefined) return '—';
+    return (v * 100).toFixed(2) + '%';
+  }
+  function fmtSigned(v, digits = 4) {
+    if (v === null || v === undefined) return '—';
+    const s = v > 0 ? '+' : '';
+    return s + v.toFixed(digits);
+  }
+  function pnlClass(v) {
+    if (v > 0) return 'pos';
+    if (v < 0) return 'neg';
+    return '';
+  }
+
+  function renderResult(r) {
+    emptyState.style.display = 'none';
+    errorBanner.classList.remove('show');
+
+    // Verdict card
+    const v = r.verdict || {};
+    verdictCard.className = 'verdict-card show ' + (v.verdict || '');
+    verdictHead.textContent = v.headline || '—';
+    verdictBody.textContent = v.rationale || '—';
+    verdictRec.textContent  = v.recommendation || '—';
+
+    // Summary
+    summaryGrid.classList.add('show');
+    document.getElementById('sum-range').textContent   = `${r.start} → ${r.end}`;
+    document.getElementById('sum-btc').textContent     = (r.btc_count || 0).toLocaleString();
+    document.getElementById('sum-markets').textContent = (r.market_count || 0).toLocaleString();
+    document.getElementById('sum-best').textContent    =
+      v.best_dead_zone != null ? fmtPct(v.best_dead_zone) : '—';
+
+    // Sweep table
+    sweepCard.classList.add('show');
+    sweepBody.innerHTML = '';
+    const plateau = v.plateau_range;
+    (r.sweep || []).forEach(row => {
+      const tr = document.createElement('tr');
+      if (plateau && row.dead_zone >= plateau[0] && row.dead_zone <= plateau[1]) {
+        tr.classList.add('plateau');
+      }
+      const trades = row.trades || 0;
+      const wr    = row.win_rate;
+      const ppd   = row.pnl_per_dollar;
+      const aw    = row.avg_win;
+      const al    = row.avg_loss;
+      const dd    = row.max_drawdown;
+      tr.innerHTML = `
+        <td>${fmtPct(row.dead_zone)}</td>
+        <td>${trades}</td>
+        <td>${wr != null ? fmtPct(wr) : '—'}</td>
+        <td class="${pnlClass(ppd)}">${ppd != null ? fmtSigned(ppd) : '—'}</td>
+        <td class="pos">${aw != null && aw !== 0 ? fmtSigned(aw) : '—'}</td>
+        <td class="neg">${al != null && al !== 0 ? fmtSigned(al) : '—'}</td>
+        <td class="neg">${dd != null ? fmtSigned(dd) : '—'}</td>
+      `;
+      sweepBody.appendChild(tr);
+    });
+
+    // Status line
+    const parts = [];
+    if (r.cache_hit) parts.push('served from cache');
+    if (r.ran_at) {
+      const t = new Date(r.ran_at);
+      parts.push('ran at ' + t.toLocaleTimeString());
+    }
+    statusLine.className = '';
+    statusLine.textContent = parts.join(' • ');
+  }
+
+  function showError(msg) {
+    errorBanner.textContent = msg;
+    errorBanner.classList.add('show');
+    statusLine.className = 'error';
+    statusLine.textContent = 'Failed';
+  }
+
+  async function runAnalysis() {
+    runBtn.disabled = true;
+    const origLabel = runBtn.textContent;
+    runBtn.innerHTML = '<span class="spinner"></span>Running…';
+    statusLine.className = '';
+    statusLine.textContent = 'Fetching BTC klines and Kalshi markets — may take 30–90s on a fresh run…';
+    errorBanner.classList.remove('show');
+
+    try {
+      const body = {
+        start:    startInput.value,
+        end:      endInput.value,
+        interval: document.getElementById('interval').value,
+      };
+      const resp = await fetch('/api/analysis/run', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify(body),
+      });
+      const json = await resp.json();
+      if (json.status !== 'ok') {
+        showError(json.error || 'Unknown error');
+        return;
+      }
+      renderResult(json);
+    } catch (e) {
+      showError(e.message || String(e));
+    } finally {
+      runBtn.disabled = false;
+      runBtn.textContent = origLabel;
+    }
+  }
+
+  runBtn.addEventListener('click', runAnalysis);
+
+  // Load the last run on page load (if any) so refreshing keeps the view.
+  (async () => {
+    try {
+      const resp = await fetch('/api/analysis/last');
+      const json = await resp.json();
+      if (json.status === 'ok' && json.result) {
+        renderResult(json.result);
+      }
+    } catch (e) {
+      // silent — empty state stays
+    }
+  })();
+</script>
+
+</body>
+</html>
