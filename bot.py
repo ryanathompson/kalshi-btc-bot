@@ -1371,7 +1371,20 @@ class KalshiBot:
         self.risk      = RiskManager(daily_loss_limit,
                                      gross_daily_loss_limit=gross_daily_loss_limit)
         self.dry       = dry_run
-        self.traded_this_market = set()  # prevent double-trading same market
+        # Seed from existing open trades so we never double up on a market
+        # after a Render restart (rebuild_trades_from_api creates RECOVERED
+        # records, but traded_this_market was empty → strategies would fire
+        # on markets we already hold positions in).
+        self.traded_this_market = set()
+        try:
+            for t in load_trades():
+                if not t.get("result") and t.get("ticker"):
+                    self.traded_this_market.add(t["ticker"])
+            if self.traded_this_market:
+                print(f"  [bot] Pre-seeded {len(self.traded_this_market)} market(s) "
+                      f"from open positions: {self.traded_this_market}", flush=True)
+        except Exception:
+            pass
         self._last_markets = []          # exposed for dashboard
 
     def _log_signal(self, signal, order_result):
