@@ -635,8 +635,10 @@ def _bot_thread():
     dry_run    = os.getenv("DRY_RUN", "true").lower() == "true"
     lag_stake  = float(os.getenv("LAG_STAKE",        "25"))
     con_stake  = float(os.getenv("CONSENSUS_STAKE",  "25"))
-    snp_lot    = float(os.getenv("SNIPER_LOTTERY_STAKE",    "10"))
-    snp_conv   = float(os.getenv("SNIPER_CONVICTION_STAKE", "25"))
+    # Sniper stakes fall back to CONSENSUS_STAKE when not explicitly set,
+    # so existing configs (e.g. CONSENSUS_STAKE=1) automatically apply.
+    snp_lot    = float(os.getenv("SNIPER_LOTTERY_STAKE")    or con_stake)
+    snp_conv   = float(os.getenv("SNIPER_CONVICTION_STAKE") or con_stake)
     daily_lim  = float(os.getenv("DAILY_LOSS_LIMIT", "100"))
 
     _state.dry_run     = dry_run

@@ -203,8 +203,12 @@ PREV_CHECK_INTERVAL = 60     # only poll settled markets every 60s (not every cy
 # See analyze_edge.py output for the full data backing these thresholds.
 SNIPER_5M_MIN_MOMENTUM = float(os.getenv("SNIPER_5M_MIN_MOMENTUM", "0.0003"))  # 0.03%
 SNIPER_COOLDOWN        = int(os.getenv("SNIPER_COOLDOWN",   "180"))   # seconds between sniper trades
-SNIPER_LOTTERY_STAKE   = float(os.getenv("SNIPER_LOTTERY_STAKE",  "10"))  # dollars per lottery ticket
-SNIPER_CONVICTION_STAKE = float(os.getenv("SNIPER_CONVICTION_STAKE", "25"))  # dollars per conviction trade
+# Sniper stake defaults — only used as safety fallback if app.py/main() don't
+# pass explicit values. In production, stakes inherit from CONSENSUS_STAKE
+# unless SNIPER_LOTTERY_STAKE / SNIPER_CONVICTION_STAKE are explicitly set.
+_con_stake_fallback     = float(os.getenv("CONSENSUS_STAKE", "1"))
+SNIPER_LOTTERY_STAKE    = float(os.getenv("SNIPER_LOTTERY_STAKE")    or _con_stake_fallback)
+SNIPER_CONVICTION_STAKE = float(os.getenv("SNIPER_CONVICTION_STAKE") or _con_stake_fallback)
 SNIPER_MIN_MINS_LEFT   = float(os.getenv("SNIPER_MIN_MINS_LEFT", "5"))  # skip markets with < N min left
 
 
@@ -1673,8 +1677,9 @@ def main():
 
     lag_stake   = get_stake(args.lag_stake,   "LAG_STAKE",       "LAG strategy")
     con_stake   = get_stake(args.con_stake,   "CONSENSUS_STAKE", "CONSENSUS strategy")
-    snp_lot     = args.snp_lottery_stake    or float(os.getenv("SNIPER_LOTTERY_STAKE",    str(SNIPER_LOTTERY_STAKE)))
-    snp_conv    = args.snp_conviction_stake or float(os.getenv("SNIPER_CONVICTION_STAKE", str(SNIPER_CONVICTION_STAKE)))
+    # Sniper stakes fall back to CONSENSUS_STAKE when not explicitly set
+    snp_lot     = args.snp_lottery_stake    or float(os.getenv("SNIPER_LOTTERY_STAKE")    or con_stake)
+    snp_conv    = args.snp_conviction_stake or float(os.getenv("SNIPER_CONVICTION_STAKE") or con_stake)
     daily_limit = args.daily_limit or float(os.getenv("DAILY_LOSS_LIMIT", 0) or
                   input("  Daily loss limit in dollars (bot halts if exceeded): $").strip())
     # Gross-loss limit defaults to 1.5× the net limit if not explicitly set.
