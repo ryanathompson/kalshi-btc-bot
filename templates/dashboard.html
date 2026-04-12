@@ -906,18 +906,13 @@
     return `<span class="pill pill-${cls}">${text}</span>`;
   }
 
-  // ── Profit/Loss tracker (time-windowed) ───────────────────
-  const _pnlTracker = { range: '1D', points: [] };
+  // ── Profit/Loss tracker (calendar-aligned ET, server-computed) ────
+  // `windows` holds the most recent /api/pnl_windows response, which is
+  // the source of truth for window boundaries AND headline values. We
+  // still use `points` (the pnl_points feed from /api/status) to draw
+  // the sparkline, filtered to the same server-provided window.
+  const _pnlTracker = { range: '1D', points: [], windows: null };
 
-  function _rangeMs(r) {
-    switch (r) {
-      case '1D':  return 24 * 60 * 60 * 1000;
-      case '1W':  return 7  * 24 * 60 * 60 * 1000;
-      case '1M':  return 30 * 24 * 60 * 60 * 1000;
-      case 'ALL': return Infinity;
-    }
-    return 24 * 60 * 60 * 1000;
-  }
   function _rangeLabel(r) {
     return ({'1D':'Past Day','1W':'Past Week','1M':'Past Month','ALL':'All Time'})[r] || '';
   }
@@ -925,8 +920,7 @@
   function renderPnlTracker() {
     const range    = _pnlTracker.range;
     const pts      = _pnlTracker.points || [];
-    const now      = Date.now();
-    const window   = _rangeMs(range);
+    const windows  = _pnlTracker.windows;
     const valueEl  = document.getElementById('pnl-trend-value');
     const arrowEl  = document.getElementById('pnl-trend-arrow');
     const rangeEl  = document.getElementById('pnl-trend-range');
@@ -934,31 +928,23 @@
 
     rangeEl.textContent = _rangeLabel(range);
 
-    // Server already normalizes to epoch-ms UTC in `ts` (handles both
-    // naive-UTC bot trades AND ISO-with-Z recovered trades from the Kalshi API).
-    // Fall back to parsing `t` for any stale payloads still in flight.
-    const parsed = pts.map(p => ({
-      ts:  typeof p.ts === 'number' ? p.ts
-         : p.t ? new Date(/[zZ]|[+\-]\d\d:?\d\d$/.test(p.t) ? p.t : p.t + 'Z').getTime()
-         : NaN,
-      cum: p.pnl,
-    })).filter(p => isFinite(p.ts));
-
-    // Cumulative P&L at the moment the window opens (0 for ALL)
-    const startTs  = isFinite(window) ? (now - window) : -Infinity;
-    let   startCum = 0;
-    const inRange  = [];
-    for (const p of parsed) {
-      if (p.ts < startTs) startCum = p.cum;
-      else                inRange.push(p);
+    // Window boundaries come from the server (calendar ET), NOT the
+    // client clock. While the first fetch is in flight, show a dash.
+    if (!windows || !windows[range]) {
+      valueEl.textContent = '—';
+      valueEl.className   = 'pnl-tracker-value';
+      arrowEl.textContent = '•';
+      arrowEl.style.color = 'var(--muted)';
+      emptyEl.classList.add('active');
+      _drawSpark([]);
+      return;
     }
+    const w       = windows[range];
+    const headline = w.pnl || 0;
+    const startMs = w.start_ms;
+    const endMs   = w.end_ms;
 
-    // Headline = delta from window-start to most recent settled trade in range
-    const headline = inRange.length
-      ? (inRange[inRange.length - 1].cum - startCum)
-      : 0;
-
-    // Render headline
+    // Render headline from server-computed window total
     const sign = headline >= 0 ? '+' : '-';
     const abs  = Math.abs(headline).toLocaleString('en-US', {
       minimumFractionDigits: 2, maximumFractionDigits: 2,
@@ -971,7 +957,23 @@
                         : headline < 0 ? 'var(--red)'
                         : 'var(--muted)';
 
-    // Build the sparkline series (relative to window start)
+    // Build the sparkline from the pnl_points feed, filtered to the
+    // same server-provided window. Start the series at startMs with
+    // v=0 and add points computing each as (cum - startCum).
+    const parsed = pts.map(p => ({
+      ts:  typeof p.ts === 'number' ? p.ts
+         : p.t ? new Date(/[zZ]|[+\-]\d\d:?\d\d$/.test(p.t) ? p.t : p.t + 'Z').getTime()
+         : NaN,
+      cum: p.pnl,
+    })).filter(p => isFinite(p.ts));
+
+    let   startCum = 0;
+    const inRange  = [];
+    for (const p of parsed) {
+      if (p.ts < startMs) startCum = p.cum;
+      else if (p.ts <= endMs) inRange.push(p);
+    }
+
     if (!inRange.length) {
       emptyEl.classList.add('active');
       _drawSpark([]);
@@ -979,22 +981,22 @@
     }
     emptyEl.classList.remove('active');
 
-    const series = [];
-    // Anchor a zero point at the start of the window so the line shows
-    // true "change over period"; for ALL, anchor at the first trade.
-    if (isFinite(window)) {
-      series.push({ ts: startTs, v: 0 });
-    } else {
-      series.push({ ts: inRange[0].ts, v: 0 });
-    }
+    const series = [{ ts: startMs, v: 0 }];
     for (const p of inRange) {
       series.push({ ts: p.ts, v: p.cum - startCum });
     }
     // Carry the latest value forward to "now" so the line extends to the edge
-    const last = series[series.length - 1];
-    if (last.ts < now) series.push({ ts: now, v: last.v });
+    const last  = series[series.length - 1];
+    const nowMs = Date.now();
+    if (last.ts < nowMs) series.push({ ts: nowMs, v: last.v });
 
     _drawSpark(series);
+
+    // Surface invariant failures — they should never fire; if they do
+    // it's a real arithmetic bug worth investigating.
+    if (windows._invariants && !windows._invariants.ok) {
+      console.warn('P&L window invariants failed:', windows._invariants.failures);
+    }
   }
 
   function _drawSpark(series) {
@@ -1381,8 +1383,17 @@
         hb.style.display = 'none';
       }
 
-      // P&L tracker (time-windowed card w/ sparkline)
+      // P&L tracker (calendar-windowed card w/ sparkline)
+      // - points come from /api/status (sparkline data)
+      // - window boundaries + headline totals come from /api/pnl_windows
+      //   which is fetched in parallel just below so both update together
       _pnlTracker.points = d.pnl_points || [];
+      try {
+        const rw = await fetch('/api/pnl_windows');
+        if (rw.ok) _pnlTracker.windows = await rw.json();
+      } catch (e) {
+        console.warn('pnl_windows fetch failed', e);
+      }
       renderPnlTracker();
 
       // P&L bar

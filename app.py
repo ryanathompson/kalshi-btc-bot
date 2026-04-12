@@ -25,6 +25,8 @@ from bot import (
     ET, now_et, today_et, parse_trade_ts,
 )
 
+from pnl_windows import compute_windows
+
 from backtest_consensus import (
     fetch_history, run_sweep, interpret_sweep,
     DEFAULT_SWEEP_DEAD_ZONES, DEFAULT_BASE_PRICE, DEFAULT_MAX_PRICE,
@@ -332,6 +334,50 @@ def api_reset_halt():
         return jsonify({"ok": True, "was": prev_reason})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/pnl_windows")
+def api_pnl_windows():
+    """Windowed P&L for 1D/1W/1M/ALL, calendar-aligned to ET.
+
+    Replaces the client-side rolling-window math in dashboard.html with
+    one server-side computation so (a) the 1D display matches the halt
+    timer's ET-midnight reset, and (b) DST transitions are handled
+    correctly regardless of the viewer's browser timezone.
+
+    The response also includes an ``_invariants`` block flagging any
+    monotonicity violations across nested windows. Those failures are a
+    real-bug detector (double-count / bad timestamp / boundary drift),
+    NOT a math artifact, and are also logged at WARNING level to Render
+    so they surface even if the dashboard is closed.
+    """
+    trades = load_trades()
+    # Pass bot.py's own parse_trade_ts so the dashboard buckets trades
+    # into the same calendar day as the RiskManager halt timer does.
+    result = compute_windows(
+        trades,
+        now=now_et(),
+        ts_parser=parse_trade_ts,
+    )
+
+    # Annotate with current halt state if the bot is running so the
+    # dashboard can badge the window that's currently frozen.
+    try:
+        if _bot is not None:
+            halted = bool(_bot.risk._halted)
+            for k in ("1D", "1W", "1M", "ALL"):
+                result[k]["halt_active"] = halted
+            if halted:
+                result["_halt_reason"] = _bot.risk._halt_reason
+    except Exception:
+        pass
+
+    inv = result.get("_invariants", {})
+    if not inv.get("ok", True):
+        app.logger.warning(
+            "pnl_windows invariant failures: %s", inv.get("failures"),
+        )
+    return jsonify(result)
 
 
 # ────────────────────────────────────────────────────────────
