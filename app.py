@@ -635,11 +635,15 @@ def _bot_thread():
     dry_run    = os.getenv("DRY_RUN", "true").lower() == "true"
     lag_stake  = float(os.getenv("LAG_STAKE",        "25"))
     con_stake  = float(os.getenv("CONSENSUS_STAKE",  "25"))
+    snp_lot    = float(os.getenv("SNIPER_LOTTERY_STAKE",    "10"))
+    snp_conv   = float(os.getenv("SNIPER_CONVICTION_STAKE", "25"))
     daily_lim  = float(os.getenv("DAILY_LOSS_LIMIT", "100"))
 
     _state.dry_run     = dry_run
     _state.lag_stake   = lag_stake
     _state.con_stake   = con_stake
+    _state.snp_lot     = snp_lot
+    _state.snp_conv    = snp_conv
     _state.daily_limit = daily_lim
 
     print("[bot] Thread started â initializing...", flush=True)
@@ -653,7 +657,9 @@ def _bot_thread():
         except Exception as e:
             print(f"[bot] Trade rebuild warning: {e}", flush=True)
 
-        _bot   = KalshiBot(client, lag_stake, con_stake, daily_lim, dry_run)
+        _bot   = KalshiBot(client, lag_stake, con_stake, daily_lim, dry_run,
+                           sniper_lottery_stake=snp_lot,
+                           sniper_conviction_stake=snp_conv)
         print("[bot] Bot initialized â warming up BTC price feed...", flush=True)
 
         # Warm up BTC feed with a hard per-fetch deadline.

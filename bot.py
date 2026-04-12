@@ -1358,12 +1358,16 @@ class RiskManager:
 
 class KalshiBot:
     def __init__(self, client, lag_stake, consensus_stake,
-                 daily_loss_limit, dry_run, gross_daily_loss_limit=None):
+                 daily_loss_limit, dry_run, gross_daily_loss_limit=None,
+                 sniper_lottery_stake=None, sniper_conviction_stake=None):
         self.client    = client
         self.btc       = BTCPriceFeed(window=500)
         self.lag       = LagStrategy(lag_stake)
         self.consensus = ConsensusStrategy(consensus_stake)
-        self.sniper    = SniperStrategy()
+        self.sniper    = SniperStrategy(
+            lottery_stake=sniper_lottery_stake,
+            conviction_stake=sniper_conviction_stake,
+        )
         self.risk      = RiskManager(daily_loss_limit,
                                      gross_daily_loss_limit=gross_daily_loss_limit)
         self.dry       = dry_run
@@ -1538,9 +1542,9 @@ class KalshiBot:
         con_state = "ENABLED" if CONSENSUS_ENABLED else "DISABLED"
         snp_state = "ENABLED" if SNIPER_ENABLED else "DISABLED"
         print(f"   LAG stake:       ${self.lag.stake}/trade  [{lag_state}]")
-        print(f"   CONSENSUS stake: ${self.consensus.stake}/trade  [{con_state}]")
-        print(f"   SNIPER lottery:  ${self.sniper.lottery_stake}/trade  conviction: "
-              f"${self.sniper.conviction_stake}/trade  [{snp_state}]")
+        print(f"   CONSENSUS stake:  ${self.consensus.stake}/trade  [{con_state}]")
+        print(f"   SNIPER lottery:  ${self.sniper.lottery_stake}/trade  "
+              f"conviction: ${self.sniper.conviction_stake}/trade  [{snp_state}]")
         print(f"   Sniper 5m momentum floor: {SNIPER_5M_MIN_MOMENTUM*100:.3f}%  "
               f"cooldown: {SNIPER_COOLDOWN}s  min time: {SNIPER_MIN_MINS_LEFT:.0f}m")
         print(f"   Momentum dead zone: {MOMENTUM_DEAD_ZONE*100:.3f}%")
@@ -1602,6 +1606,10 @@ def main():
                         help="Dollar stake per LAG trade (overrides .env)")
     parser.add_argument("--con-stake",   type=float, default=None,
                         help="Dollar stake per CONSENSUS trade (overrides .env)")
+    parser.add_argument("--snp-lottery-stake",    type=float, default=None,
+                        help="Dollar stake per SNIPER lottery trade (overrides .env)")
+    parser.add_argument("--snp-conviction-stake", type=float, default=None,
+                        help="Dollar stake per SNIPER conviction trade (overrides .env)")
     parser.add_argument("--daily-limit", type=float, default=None,
                         help="Max daily loss in dollars before halting")
     parser.add_argument("--stats",       action="store_true",
@@ -1652,6 +1660,8 @@ def main():
 
     lag_stake   = get_stake(args.lag_stake,   "LAG_STAKE",       "LAG strategy")
     con_stake   = get_stake(args.con_stake,   "CONSENSUS_STAKE", "CONSENSUS strategy")
+    snp_lot     = args.snp_lottery_stake    or float(os.getenv("SNIPER_LOTTERY_STAKE",    str(SNIPER_LOTTERY_STAKE)))
+    snp_conv    = args.snp_conviction_stake or float(os.getenv("SNIPER_CONVICTION_STAKE", str(SNIPER_CONVICTION_STAKE)))
     daily_limit = args.daily_limit or float(os.getenv("DAILY_LOSS_LIMIT", 0) or
                   input("  Daily loss limit in dollars (bot halts if exceeded): $").strip())
     # Gross-loss limit defaults to 1.5× the net limit if not explicitly set.
@@ -1663,6 +1673,7 @@ def main():
         print(f"\n{Fore.RED}â²  LIVE TRADING MODE{Style.RESET_ALL}")
         print(f"   LAG stake:       ${lag_stake}/trade")
         print(f"   CONSENSUS stake: ${con_stake}/trade")
+        print(f"   SNIPER lottery:  ${snp_lot}/trade  conviction: ${snp_conv}/trade")
         print(f"   Daily loss limit: ${daily_limit}")
         confirm = input("\n  Type 'YES' to confirm live trading: ").strip()
         if confirm != "YES":
@@ -1681,12 +1692,14 @@ def main():
         return
 
     bot = KalshiBot(
-        client                 = client,
-        lag_stake              = lag_stake,
-        consensus_stake        = con_stake,
-        daily_loss_limit       = daily_limit,
-        gross_daily_loss_limit = gross_daily_limit,
-        dry_run                = dry_run,
+        client                   = client,
+        lag_stake                = lag_stake,
+        consensus_stake          = con_stake,
+        daily_loss_limit         = daily_limit,
+        gross_daily_loss_limit   = gross_daily_limit,
+        dry_run                  = dry_run,
+        sniper_lottery_stake     = snp_lot,
+        sniper_conviction_stake  = snp_conv,
     )
     start_keep_alive()
     bot.run()
