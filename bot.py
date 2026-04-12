@@ -1,7 +1,7 @@
 """
-Kalshi BTC 15-Minute Dual Strategy Bot
-=======================================
-Runs two strategies in parallel on Kalshi's KXBTC15M markets:
+Kalshi BTC 15-Minute Multi-Strategy Bot
+========================================
+Runs multiple strategies in parallel on Kalshi's KXBTC15M markets:
 
   STRATEGY 1 â LAG BOT
     Detects when Kalshi contract prices haven't caught up to live BTC
@@ -13,7 +13,7 @@ Runs two strategies in parallel on Kalshi's KXBTC15M markets:
       - MOMENTUM: BTC price direction over last 60 seconds
       - PREVIOUS: Result of the last settled 15-min market
     Only trades when both signals agree AND price is <= threshold.
-    Historically ~73% win rate in backtests.
+    Historically ~73% win rate in backtests (not validated OOS).
 
     v1.1 improvements:
       1. Momentum dead zone â ignores noise below 0.03% BTC move
@@ -30,6 +30,15 @@ Runs two strategies in parallel on Kalshi's KXBTC15M markets:
       2. Strong-momentum tier: when |momentum| >= STRONG_MOMENTUM_THRESHOLD
          (0.065%) the strategy applies a stake multiplier and a small
          price-cap bonus, leaning into the band where wins concentrate
+
+  STRATEGY 3 — SNIPER v1.0 (2026-04-12)
+    Data-driven directional strategy derived from edge analysis of 136
+    ground-truth fills. Exploits two price zones where the market
+    systematically misprices:
+      - LOTTERY (1-10c):   Deep OTM, +4.8pp edge, +237% ROI
+      - CONVICTION (50-55c): ATM+, +9.1pp edge, +18.5% ROI
+    Primary filter: 5-minute BTC momentum alignment (+2.5pp edge, n=48).
+    Avoids 11-49c "kill zone" where all sub-bands show -13pp to -15pp edge.
 
 SETUP:
     pip install requests cryptography colorama tabulate python-dotenv
@@ -165,7 +174,8 @@ MIN_BOOK_SUM        = 0.97   # yes+no must sum >= 0.97 (liquid market check)
 # was |momentum| 0.030-0.043% with entry prices below 40c, both of which
 # v1.2 filters out. Kill-switch via env: CONSENSUS_ENABLED=false (no redeploy).
 LAG_ENABLED       = os.getenv("LAG_ENABLED",       "true").lower() == "true"
-CONSENSUS_ENABLED = os.getenv("CONSENSUS_ENABLED", "true").lower()  == "true"
+CONSENSUS_ENABLED = os.getenv("CONSENSUS_ENABLED", "false").lower() == "true"
+SNIPER_ENABLED    = os.getenv("SNIPER_ENABLED",    "true").lower()  == "true"
 
 # Consensus v1.2 tuning
 CONSENSUS_BASE_PRICE = 0.45  # base price cap before momentum scaling
@@ -188,6 +198,14 @@ CONSENSUS_STRONG_PRICE_BONUS = float(os.getenv("CONSENSUS_STRONG_PRICE_BONUS", "
 PREV_RESULT_MAX_AGE = 1800   # previous-result signal expires after 30 min (seconds)
 CONSENSUS_COOLDOWN  = 300    # min seconds between consensus trades
 PREV_CHECK_INTERVAL = 60     # only poll settled markets every 60s (not every cycle)
+
+# Sniper v1.0 tuning — derived from edge analysis of 136 ground-truth fills
+# See analyze_edge.py output for the full data backing these thresholds.
+SNIPER_5M_MIN_MOMENTUM = float(os.getenv("SNIPER_5M_MIN_MOMENTUM", "0.0003"))  # 0.03%
+SNIPER_COOLDOWN        = int(os.getenv("SNIPER_COOLDOWN",   "180"))   # seconds between sniper trades
+SNIPER_LOTTERY_STAKE   = float(os.getenv("SNIPER_LOTTERY_STAKE",  "10"))  # dollars per lottery ticket
+SNIPER_CONVICTION_STAKE = float(os.getenv("SNIPER_CONVICTION_STAKE", "25"))  # dollars per conviction trade
+SNIPER_MIN_MINS_LEFT   = float(os.getenv("SNIPER_MIN_MINS_LEFT", "5"))  # skip markets with < N min left
 
 
 # ═══════════════════════════════════════════════════════════
@@ -851,7 +869,7 @@ def print_stats():
         print(Fore.YELLOW + "No settled trades yet.")
         return
 
-    for strategy in ["LAG", "CONSENSUS", "ALL"]:
+    for strategy in ["LAG", "CONSENSUS", "SNIPER", "ALL"]:
         subset = settled if strategy == "ALL" else [
             t for t in settled if t.get("strategy") == strategy
         ]
@@ -1096,6 +1114,121 @@ class ConsensusStrategy:
 
 
 # âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+# STRATEGY 3: SNIPER (data-driven directional)
+# âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+
+class SniperStrategy:
+    """
+    Sniper v1.0 -- data-driven directional strategy
+    ================================================
+    Derived from edge analysis of 136 ground-truth fills (analyze_edge.py).
+
+    THESIS:
+      Two price zones beat fair pricing; everything between is a graveyard.
+      5-minute BTC momentum alignment is the strongest exploitable signal.
+
+    ENTRY MODES:
+      LOTTERY    (1-10c):  Deep OTM. WR=10.5% vs BE=5.7% -> +4.8pp edge, +237% ROI.
+                           Risk $5-10 to win $90-95. Asymmetry does the heavy lifting.
+      CONVICTION (50-55c): ATM+.    WR=61.5% vs BE=52.5% -> +9.1pp edge, +18.5% ROI.
+                           Higher hit rate, moderate payoff per trade.
+      KILL ZONE  (11-49c): NEVER.   All sub-bands show -13pp to -15pp edge.
+
+    FILTERS:
+      1. 5-min BTC momentum must exceed SNIPER_5M_MIN_MOMENTUM (0.03%).
+         Aligned trades:  n=48, WR=35.4%, edge=+2.5pp, +22% ROI.
+         Counter trades:  n=88, WR=15.9%, edge=-15.9pp, -27% ROI.
+      2. 60-second momentum must not contradict 5-min direction.
+         Counter to 60s momentum was 0% WR across 12 trades.
+      3. Market must have >= SNIPER_MIN_MINS_LEFT minutes remaining.
+         Too little time = no room for momentum continuation.
+    """
+
+    def __init__(self, lottery_stake=None, conviction_stake=None):
+        self.lottery_stake    = lottery_stake or SNIPER_LOTTERY_STAKE
+        self.conviction_stake = conviction_stake or SNIPER_CONVICTION_STAKE
+        self.name             = "SNIPER"
+        self.last_trade_time  = 0
+
+    def evaluate(self, market, btc_feed, mins_left=None):
+        """
+        Evaluate sniper signal for a single market.
+
+        Returns signal dict or None.
+        """
+        ticker  = market["ticker"]
+        yes_px  = float(market.get("yes_ask_dollars", market.get("yes_bid_dollars", 0)))
+        no_px   = float(market.get("no_ask_dollars",  market.get("no_bid_dollars",  0)))
+        book_sum = yes_px + no_px
+
+        if book_sum < MIN_BOOK_SUM:
+            return None
+
+        # -- Time filter: need enough runway for momentum continuation --
+        if mins_left is not None and mins_left < SNIPER_MIN_MINS_LEFT:
+            return None
+
+        # -- Cooldown -------------------------------------------------------
+        now = time.time()
+        if now - self.last_trade_time < SNIPER_COOLDOWN:
+            return None
+
+        # -- 5-minute BTC momentum (primary signal) -------------------------
+        mom_5m = btc_feed.pct_change(300)
+        if mom_5m is None:
+            return None
+
+        # Must have meaningful 5-min directional move
+        if abs(mom_5m) < SNIPER_5M_MIN_MOMENTUM:
+            return None
+
+        # -- 60-second momentum cross-check ---------------------------------
+        # Counter to 60s momentum = 0% WR (n=12). If short-term momentum
+        # has reversed against the 5-min trend, stand aside.
+        mom_60s = btc_feed.pct_change(60)
+        if mom_60s is not None and abs(mom_60s) > 0.0003:
+            if (mom_5m > 0 and mom_60s < -0.0003) or \
+               (mom_5m < 0 and mom_60s > 0.0003):
+                return None
+
+        # -- Direction from 5-min momentum ----------------------------------
+        side          = "yes" if mom_5m > 0 else "no"
+        price_dollars = yes_px if side == "yes" else no_px
+        price_cents   = int(price_dollars * 100)
+
+        # -- Entry price zone filter ----------------------------------------
+        # LOTTERY: 1-10c | CONVICTION: 50-55c | KILL ZONE: 11-49c, 56c+
+        if 1 <= price_cents <= 10:
+            mode  = "LOTTERY"
+            stake = self.lottery_stake
+        elif 50 <= price_cents <= 55:
+            mode  = "CONVICTION"
+            stake = self.conviction_stake
+        else:
+            return None  # kill zone -- no edge here
+
+        count = max(1, int(stake / price_dollars))
+
+        # -- Record trade time for cooldown ---------------------------------
+        self.last_trade_time = now
+
+        mom_60s_str = f"{mom_60s*100:+.3f}%" if mom_60s else "n/a"
+        return {
+            "strategy": self.name,
+            "ticker":   ticker,
+            "side":     side,
+            "price":    price_cents,
+            "count":    count,
+            "dollars":  round(count * price_dollars, 2),
+            "reason":   (f"{mode} | 5m {mom_5m*100:+.3f}% -> {side.upper()} @ {price_cents}c "
+                         f"| 60s: {mom_60s_str} | {mins_left:.0f}m left"
+                         if mins_left else
+                         f"{mode} | 5m {mom_5m*100:+.3f}% -> {side.upper()} @ {price_cents}c "
+                         f"| 60s: {mom_60s_str}"),
+        }
+
+
+# âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 # RISK MANAGEMENT
 # âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 
@@ -1230,6 +1363,7 @@ class KalshiBot:
         self.btc       = BTCPriceFeed(window=500)
         self.lag       = LagStrategy(lag_stake)
         self.consensus = ConsensusStrategy(consensus_stake)
+        self.sniper    = SniperStrategy()
         self.risk      = RiskManager(daily_loss_limit,
                                      gross_daily_loss_limit=gross_daily_loss_limit)
         self.dry       = dry_run
@@ -1338,11 +1472,13 @@ class KalshiBot:
                 active_strategies.append(self.lag)
             if CONSENSUS_ENABLED:
                 active_strategies.append(self.consensus)
+            if SNIPER_ENABLED:
+                active_strategies.append(self.sniper)
 
             for strategy in active_strategies:
                 try:
-                    # [v1.1] Pass mins_left to consensus for time-aware entry
-                    if isinstance(strategy, ConsensusStrategy):
+                    # Pass mins_left to strategies that use it
+                    if isinstance(strategy, (ConsensusStrategy, SniperStrategy)):
                         signal = strategy.evaluate(market, self.btc, mins_left=mins_left)
                     else:
                         signal = strategy.evaluate(market, self.btc)
@@ -1400,8 +1536,13 @@ class KalshiBot:
         print(f"   Mode: {Fore.YELLOW}{mode}{Style.RESET_ALL}")
         lag_state = "ENABLED" if LAG_ENABLED else "DISABLED"
         con_state = "ENABLED" if CONSENSUS_ENABLED else "DISABLED"
+        snp_state = "ENABLED" if SNIPER_ENABLED else "DISABLED"
         print(f"   LAG stake:       ${self.lag.stake}/trade  [{lag_state}]")
         print(f"   CONSENSUS stake: ${self.consensus.stake}/trade  [{con_state}]")
+        print(f"   SNIPER lottery:  ${self.sniper.lottery_stake}/trade  conviction: "
+              f"${self.sniper.conviction_stake}/trade  [{snp_state}]")
+        print(f"   Sniper 5m momentum floor: {SNIPER_5M_MIN_MOMENTUM*100:.3f}%  "
+              f"cooldown: {SNIPER_COOLDOWN}s  min time: {SNIPER_MIN_MINS_LEFT:.0f}m")
         print(f"   Momentum dead zone: {MOMENTUM_DEAD_ZONE*100:.3f}%")
         print(f"   Strong-momentum threshold: {STRONG_MOMENTUM_THRESHOLD*100:.3f}% "
               f"(stake x{CONSENSUS_STRONG_STAKE_MULT}, cap +{CONSENSUS_STRONG_PRICE_BONUS:.2f})")
