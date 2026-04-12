@@ -282,6 +282,7 @@ def api_status():
         "history":      [fmt_hist(t) for t in history],
         "lag_stats":    _strat_stats(trades, "LAG"),
         "con_stats":    _strat_stats(trades, "CONSENSUS"),
+        "snp_stats":    _strat_stats(trades, "SNIPER"),
         "all_stats":    _strat_stats(trades),
         "pnl_points":   _pnl_points(trades),
         # Win-rate breakdown by entry price band — used by the dashboard
@@ -289,6 +290,7 @@ def api_status():
         # view since the price-band signal is most actionable for Consensus.
         "entry_price_stats":     _entry_price_stats(trades),
         "entry_price_stats_con": _entry_price_stats(trades, "CONSENSUS"),
+        "entry_price_stats_snp": _entry_price_stats(trades, "SNIPER"),
     })
 
 
