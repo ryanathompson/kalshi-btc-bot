@@ -783,8 +783,8 @@
 
   <!-- v2.0 EDGE ENGINE STATUS -->
   <div class="card" style="grid-column: 1/-1; padding: 16px 20px;">
-    <h3 style="font-size:13px; color:var(--muted); letter-spacing:.05em; text-transform:uppercase; margin-bottom:12px;">v2.0 Edge Engine</h3>
-    <div style="display:grid; grid-template-columns: repeat(4, 1fr); gap: 16px;">
+    <h3 style="font-size:13px; color:var(--muted); letter-spacing:.05em; text-transform:uppercase; margin-bottom:12px;">v2.1 Edge Engine</h3>
+    <div style="display:grid; grid-template-columns: repeat(5, 1fr); gap: 16px;">
       <div>
         <div style="font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:.04em;">Kelly Sizing</div>
         <div style="font-size:18px; font-weight:600;" id="v2-kelly">—</div>
@@ -804,6 +804,11 @@
         <div style="font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:.04em;">Early Exits</div>
         <div style="font-size:18px; font-weight:600;" id="v2-exits">0</div>
         <div style="font-size:11px; color:var(--muted);">conviction trades exited early</div>
+      </div>
+      <div>
+        <div style="font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:.04em;">Cheap Caps</div>
+        <div style="font-size:18px; font-weight:600;" id="v2-cheapcaps">0</div>
+        <div style="font-size:11px; color:var(--muted);" id="v2-cheapcap-detail"></div>
       </div>
     </div>
   </div>
@@ -1491,6 +1496,8 @@
 
       document.getElementById('v2-disagreements').textContent = v2c.disagreements_skipped ?? 0;
       document.getElementById('v2-exits').textContent = v2c.early_exits_triggered ?? 0;
+      document.getElementById('v2-cheapcaps').textContent = v2c.cheap_caps_applied ?? 0;
+      document.getElementById('v2-cheapcap-detail').textContent = `<${v2.cheap_cap_price || 25}c capped $${v2.cheap_cap_max_stake || 5}`;
 
       // Win Rate by Entry Price widget
       _entryPriceCache = {

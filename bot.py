@@ -265,6 +265,13 @@ EARLY_EXIT_REVERSAL_PCT  = float(os.getenv("EARLY_EXIT_REVERSAL_PCT", "0.003")) 
 EARLY_EXIT_MIN_HOLD_S    = int(os.getenv("EARLY_EXIT_MIN_HOLD_S", "120"))        # 2 min minimum hold
 EARLY_EXIT_MAX_LOSS_PCT  = float(os.getenv("EARLY_EXIT_MAX_LOSS_PCT", "0.10"))   # exit if can recover 90%+
 
+# Cheap-contract stake cap: lottery-ticket entries (<25c) keep their
+# asymmetric upside but stakes are capped to limit bleed during dry
+# streaks.  Kelly tends to oversize these because the payout multiple
+# is huge, even when the actual win rate doesn't support it.
+CHEAP_CONTRACT_PRICE     = int(os.getenv("CHEAP_CONTRACT_PRICE", "25"))         # cents threshold
+CHEAP_CONTRACT_MAX_STAKE = float(os.getenv("CHEAP_CONTRACT_MAX_STAKE", "5.0"))  # max $ on cheap entries
+
 
 # ═══════════════════════════════════════════════════════════
 # KEEP-ALIVE (prevents Render free-tier spin-down)
@@ -1363,6 +1370,11 @@ class ConsensusStrategy:
             effective_stake = base_stake
         # [v2.0] Auto-score throttle multiplier
         effective_stake *= score_mult
+        # [v2.1] Cheap-contract stake cap: limit bleed on lottery-priced entries
+        cheap_capped = False
+        if price_cents < CHEAP_CONTRACT_PRICE and effective_stake > CHEAP_CONTRACT_MAX_STAKE:
+            effective_stake = CHEAP_CONTRACT_MAX_STAKE
+            cheap_capped = True
         count = max(1, int(effective_stake / price_dollars))
 
         # [v1.1] Record trade time for cooldown
@@ -1377,7 +1389,8 @@ class ConsensusStrategy:
             "dollars":  round(count * price_dollars, 2),
             "reason":   (f"Momentum {btc_change*100:+.3f}% + Previous={previous_side} "
                          f"| cap={dynamic_max:.2f} mins_left={mins_left or '?'}"
-                         f"{' [STRONG x' + str(CONSENSUS_STRONG_STAKE_MULT) + ']' if strong_momentum else ''}"),
+                         f"{' [STRONG x' + str(CONSENSUS_STRONG_STAKE_MULT) + ']' if strong_momentum else ''}"
+                         f"{' [CHEAP_CAP $' + str(CHEAP_CONTRACT_MAX_STAKE) + ']' if cheap_capped else ''}"),
         }
         if kelly_stake is not None:
             signal["kelly_stake"] = kelly_stake
@@ -1502,6 +1515,11 @@ class SniperStrategy:
             effective_stake = stake
         # [v2.0] Auto-score throttle multiplier
         effective_stake *= score_mult
+        # [v2.1] Cheap-contract stake cap: limit bleed on lottery-priced entries
+        cheap_capped = False
+        if price_cents < CHEAP_CONTRACT_PRICE and effective_stake > CHEAP_CONTRACT_MAX_STAKE:
+            effective_stake = CHEAP_CONTRACT_MAX_STAKE
+            cheap_capped = True
         count = max(1, int(effective_stake / price_dollars))
 
         # -- Record trade time for cooldown ---------------------------------
@@ -1517,9 +1535,11 @@ class SniperStrategy:
             "dollars":  round(count * price_dollars, 2),
             "reason":   (f"{mode} | 5m {mom_5m*100:+.3f}% -> {side.upper()} @ {price_cents}c "
                          f"| 60s: {mom_60s_str} | {mins_left:.0f}m left"
+                         f"{' [CHEAP_CAP $' + str(CHEAP_CONTRACT_MAX_STAKE) + ']' if cheap_capped else ''}"
                          if mins_left else
                          f"{mode} | 5m {mom_5m*100:+.3f}% -> {side.upper()} @ {price_cents}c "
-                         f"| 60s: {mom_60s_str}"),
+                         f"| 60s: {mom_60s_str}"
+                         f"{' [CHEAP_CAP $' + str(CHEAP_CONTRACT_MAX_STAKE) + ']' if cheap_capped else ''}"),
         }
         if kelly_stake is not None:
             signal["kelly_stake"] = kelly_stake
@@ -1678,6 +1698,7 @@ class KalshiBot:
         self.v2_stats  = {
             "disagreements_skipped": 0,
             "early_exits_triggered": 0,
+            "cheap_caps_applied": 0,
             "kelly_active": KELLY_ENABLED,
             "last_kelly_sizes": {},  # strategy name → last kelly stake
         }
@@ -1886,6 +1907,10 @@ class KalshiBot:
 
             # Use first (highest-priority) signal
             signal = signals[0]
+
+            # [v2.1] Track cheap-cap usage
+            if "CHEAP_CAP" in signal.get("reason", ""):
+                self.v2_stats["cheap_caps_applied"] += 1
 
             self._print_signal(signal, self.dry)
 

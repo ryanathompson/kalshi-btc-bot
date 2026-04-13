@@ -24,7 +24,9 @@ from bot import (
     resolve_trades, start_keep_alive, rebuild_trades_from_api,
     ET, now_et, today_et, parse_trade_ts,
     KELLY_ENABLED, KELLY_FRACTION, AUTOSCORE_ENABLED,
-    DISAGREEMENT_GATING, EARLY_EXIT_ENABLED, StrategyScorer,
+    DISAGREEMENT_GATING, EARLY_EXIT_ENABLED,
+    CHEAP_CONTRACT_PRICE, CHEAP_CONTRACT_MAX_STAKE,
+    StrategyScorer,
 )
 
 from pnl_windows import compute_windows
@@ -320,6 +322,8 @@ def api_status():
             "autoscore_enabled": AUTOSCORE_ENABLED,
             "disagreement_gating": DISAGREEMENT_GATING,
             "early_exit_enabled": EARLY_EXIT_ENABLED,
+            "cheap_cap_price": CHEAP_CONTRACT_PRICE,
+            "cheap_cap_max_stake": CHEAP_CONTRACT_MAX_STAKE,
         },
         "strategy_scores": strategy_scores,
         "v2_counters": v2_counters,
