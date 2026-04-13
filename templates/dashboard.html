@@ -670,7 +670,7 @@
     </div>
     <div>Markets <span class="val" id="market-count">—</span></div>
     <div>Prev <span class="val" id="prev-result">—</span></div>
-    <div>Stakes $<span class="val" id="lag-stake">—</span> / $<span class="val" id="con-stake">—</span></div>
+    <div>Stake $<span class="val" id="max-stake">—</span></div>
   </div>
 </header>
 
@@ -1362,8 +1362,7 @@
       prevEl.textContent = prev ? prev.toUpperCase() : '—';
       prevEl.style.color = prev === 'yes' ? 'var(--green)' : prev === 'no' ? 'var(--red)' : 'var(--muted)';
 
-      document.getElementById('lag-stake').textContent  = d.lag_stake ?? '—';
-      document.getElementById('con-stake').textContent  = d.con_stake ?? '—';
+      document.getElementById('max-stake').textContent  = d.max_stake ?? '—';
       document.getElementById('daily-limit').textContent = d.daily_limit ?? '—';
 
       // Started / last cycle (always rendered in ET)

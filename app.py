@@ -50,8 +50,7 @@ class BotState:
         self.prev_result  = None   # consensus previous signal
         self.halted       = False
         self.halt_reason  = ""
-        self.lag_stake    = 0.0
-        self.con_stake    = 0.0
+        self.max_stake    = 0.0
         self.daily_limit  = 0.0
         self.started_at   = None
         self.last_cycle   = None
@@ -272,8 +271,7 @@ def api_status():
         "prev_result":  _state.prev_result,
         "halted":       _state.halted,
         "halt_reason":  _state.halt_reason,
-        "lag_stake":    _state.lag_stake,
-        "con_stake":    _state.con_stake,
+        "max_stake":    _state.max_stake,
         "daily_limit":  _state.daily_limit,
         "started_at":   _state.started_at,
         "last_cycle":   _state.last_cycle,
@@ -633,17 +631,17 @@ def _bot_thread():
     api_key_id = os.getenv("KALSHI_API_KEY_ID")
     key_path   = os.getenv("KALSHI_PRIVATE_KEY_PATH", "./kalshi.key")
     dry_run    = os.getenv("DRY_RUN", "true").lower() == "true"
-    lag_stake  = float(os.getenv("LAG_STAKE",        "25"))
-    con_stake  = float(os.getenv("CONSENSUS_STAKE",  "25"))
-    # Sniper stakes fall back to CONSENSUS_STAKE when not explicitly set,
-    # so existing configs (e.g. CONSENSUS_STAKE=1) automatically apply.
-    snp_lot    = float(os.getenv("SNIPER_LOTTERY_STAKE")    or con_stake)
-    snp_conv   = float(os.getenv("SNIPER_CONVICTION_STAKE") or con_stake)
+    # v2.0: unified stake — falls back through MAX_STAKE > LAG_STAKE > CONSENSUS_STAKE > $25
+    max_stake  = float(os.getenv("MAX_STAKE_PER_TRADE",
+                       os.getenv("LAG_STAKE",
+                       os.getenv("CONSENSUS_STAKE", "25"))))
+    snp_lot    = float(os.getenv("SNIPER_LOTTERY_STAKE")    or max_stake)
+    snp_conv   = float(os.getenv("SNIPER_CONVICTION_STAKE") or max_stake)
     daily_lim  = float(os.getenv("DAILY_LOSS_LIMIT", "100"))
+    gross_lim  = float(os.getenv("DAILY_GROSS_LOSS_LIMIT", "0")) or (1.5 * daily_lim)
 
     _state.dry_run     = dry_run
-    _state.lag_stake   = lag_stake
-    _state.con_stake   = con_stake
+    _state.max_stake   = max_stake
     _state.snp_lot     = snp_lot
     _state.snp_conv    = snp_conv
     _state.daily_limit = daily_lim
@@ -659,7 +657,8 @@ def _bot_thread():
         except Exception as e:
             print(f"[bot] Trade rebuild warning: {e}", flush=True)
 
-        _bot   = KalshiBot(client, lag_stake, con_stake, daily_lim, dry_run,
+        _bot   = KalshiBot(client, max_stake, daily_lim, dry_run,
+                           gross_daily_loss_limit=gross_lim,
                            sniper_lottery_stake=snp_lot,
                            sniper_conviction_stake=snp_conv)
         print("[bot] Bot initialized â warming up BTC price feed...", flush=True)
