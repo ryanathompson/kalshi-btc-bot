@@ -269,7 +269,7 @@ EARLY_EXIT_MAX_LOSS_PCT  = float(os.getenv("EARLY_EXIT_MAX_LOSS_PCT", "0.10"))  
 # asymmetric upside but stakes are capped to limit bleed during dry
 # streaks.  Kelly tends to oversize these because the payout multiple
 # is huge, even when the actual win rate doesn't support it.
-CHEAP_CONTRACT_PRICE     = int(os.getenv("CHEAP_CONTRACT_PRICE", "25"))         # cents threshold
+CHEAP_CONTRACT_PRICE     = int(''.join(c for c in os.getenv("CHEAP_CONTRACT_PRICE", "25") if c.isdigit()) or "25")  # cents threshold
 CHEAP_CONTRACT_MAX_STAKE = float(os.getenv("CHEAP_CONTRACT_MAX_STAKE", "5.0"))  # max $ on cheap entries
 
 
