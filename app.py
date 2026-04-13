@@ -285,6 +285,7 @@ def api_status():
         v2_counters = {
             "disagreements_skipped": v2c.get("disagreements_skipped", 0),
             "early_exits_triggered": v2c.get("early_exits_triggered", 0),
+            "cheap_caps_applied":    v2c.get("cheap_caps_applied", 0),
         }
 
     return jsonify({
