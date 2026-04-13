@@ -23,6 +23,8 @@ from bot import (
     KalshiBot, KalshiClient, load_private_key, load_trades, POLL_INTERVAL,
     resolve_trades, start_keep_alive, rebuild_trades_from_api,
     ET, now_et, today_et, parse_trade_ts,
+    KELLY_ENABLED, KELLY_FRACTION, AUTOSCORE_ENABLED,
+    DISAGREEMENT_GATING, EARLY_EXIT_ENABLED, StrategyScorer,
 )
 
 from pnl_windows import compute_windows
@@ -55,6 +57,7 @@ class BotState:
         self.started_at   = None
         self.last_cycle   = None
         self.error        = None
+        self.balance      = None   # cached account balance for Kelly sizing display
 
 _state = BotState()
 _bot   = None   # KalshiBot instance (set once the thread starts successfully)
@@ -262,6 +265,26 @@ def api_status():
         # Always show ET so bot-logged and recovered trades use the same clock.
         return {**t, "ts_short": _fmt_et(t.get("timestamp"))}
 
+    # [v2.0] Compute auto-scores for strategy throttling display
+    strategy_scores = {}
+    try:
+        scorer = StrategyScorer()
+        for name in ["LAG", "CONSENSUS", "SNIPER"]:
+            score_val, mult = scorer.score(name)
+            status = "BLOCKED" if mult <= 0 else "THROTTLED" if mult < 1.0 else "FULL"
+            strategy_scores[name] = {"score": round(score_val, 1), "mult": mult, "status": status}
+    except Exception:
+        pass
+
+    # [v2.0] Collect counters from bot instance
+    v2_counters = {}
+    if _bot:
+        v2c = getattr(_bot, 'v2_stats', {})
+        v2_counters = {
+            "disagreements_skipped": v2c.get("disagreements_skipped", 0),
+            "early_exits_triggered": v2c.get("early_exits_triggered", 0),
+        }
+
     return jsonify({
         "running":      _state.running,
         "dry_run":      _state.dry_run,
@@ -276,6 +299,7 @@ def api_status():
         "started_at":   _state.started_at,
         "last_cycle":   _state.last_cycle,
         "error":        _state.error,
+        "balance":      _state.balance,
         "open_trades":  [fmt_open(t) for t in open_trades],
         "history":      [fmt_hist(t) for t in history],
         "lag_stats":    _strat_stats(trades, "LAG"),
@@ -289,6 +313,16 @@ def api_status():
         "entry_price_stats":     _entry_price_stats(trades),
         "entry_price_stats_con": _entry_price_stats(trades, "CONSENSUS"),
         "entry_price_stats_snp": _entry_price_stats(trades, "SNIPER"),
+        # [v2.0] Edge Engine configuration and counters
+        "v2_features": {
+            "kelly_enabled": KELLY_ENABLED,
+            "kelly_fraction": KELLY_FRACTION,
+            "autoscore_enabled": AUTOSCORE_ENABLED,
+            "disagreement_gating": DISAGREEMENT_GATING,
+            "early_exit_enabled": EARLY_EXIT_ENABLED,
+        },
+        "strategy_scores": strategy_scores,
+        "v2_counters": v2_counters,
     })
 
 
@@ -700,6 +734,9 @@ def _bot_thread():
                 _state.halt_reason  = _bot.risk._halt_reason
                 _state.last_cycle   = now_et().isoformat()
                 _state.error        = None
+                # [v2.0] Cache balance for Kelly sizing display
+                if _bot._balance:
+                    _state.balance = _bot._balance
 
             except Exception as e:
                 _state.error = str(e)

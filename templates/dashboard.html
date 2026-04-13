@@ -671,6 +671,7 @@
     <div>Markets <span class="val" id="market-count">—</span></div>
     <div>Prev <span class="val" id="prev-result">—</span></div>
     <div>Stake $<span class="val" id="max-stake">—</span></div>
+    <div>Bal $<span class="val" id="balance">—</span></div>
   </div>
 </header>
 
@@ -750,17 +751,26 @@
   <!-- STAT CARDS -->
   <div class="cards">
     <div class="card card-lag" id="card-lag">
-      <div class="card-title">⚡ LAG Strategy</div>
+      <div class="card-title" style="display:flex; align-items:center; justify-content:space-between;">
+        <span>⚡ LAG Strategy</span>
+        <span class="badge" id="score-badge-LAG" style="margin:0; font-size:10px;"></span>
+      </div>
       <div class="empty-card" id="lag-empty">No settled trades yet</div>
       <div class="stat-grid" id="lag-stats" style="display:none"></div>
     </div>
     <div class="card card-con" id="card-con">
-      <div class="card-title">🔮 Consensus Strategy</div>
+      <div class="card-title" style="display:flex; align-items:center; justify-content:space-between;">
+        <span>🔮 Consensus Strategy</span>
+        <span class="badge" id="score-badge-CONSENSUS" style="margin:0; font-size:10px;"></span>
+      </div>
       <div class="empty-card" id="con-empty">No settled trades yet</div>
       <div class="stat-grid" id="con-stats" style="display:none"></div>
     </div>
     <div class="card card-snp" id="card-snp">
-      <div class="card-title">🎯 Sniper Strategy</div>
+      <div class="card-title" style="display:flex; align-items:center; justify-content:space-between;">
+        <span>🎯 Sniper Strategy</span>
+        <span class="badge" id="score-badge-SNIPER" style="margin:0; font-size:10px;"></span>
+      </div>
       <div class="empty-card" id="snp-empty">No settled trades yet</div>
       <div class="stat-grid" id="snp-stats" style="display:none"></div>
     </div>
@@ -768,6 +778,33 @@
       <div class="card-title">📊 Combined</div>
       <div class="empty-card" id="all-empty">No settled trades yet</div>
       <div class="stat-grid" id="all-stats" style="display:none"></div>
+    </div>
+  </div>
+
+  <!-- v2.0 EDGE ENGINE STATUS -->
+  <div class="card" style="grid-column: 1/-1; padding: 16px 20px;">
+    <h3 style="font-size:13px; color:var(--muted); letter-spacing:.05em; text-transform:uppercase; margin-bottom:12px;">v2.0 Edge Engine</h3>
+    <div style="display:grid; grid-template-columns: repeat(4, 1fr); gap: 16px;">
+      <div>
+        <div style="font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:.04em;">Kelly Sizing</div>
+        <div style="font-size:18px; font-weight:600;" id="v2-kelly">—</div>
+        <div style="font-size:11px; color:var(--muted);" id="v2-kelly-detail"></div>
+      </div>
+      <div>
+        <div style="font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:.04em;">Auto-Scoring</div>
+        <div style="font-size:18px; font-weight:600;" id="v2-autoscore">—</div>
+        <div style="font-size:11px; color:var(--muted);" id="v2-autoscore-detail"></div>
+      </div>
+      <div>
+        <div style="font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:.04em;">Disagreements Skipped</div>
+        <div style="font-size:18px; font-weight:600;" id="v2-disagreements">0</div>
+        <div style="font-size:11px; color:var(--muted);">markets skipped this session</div>
+      </div>
+      <div>
+        <div style="font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:.04em;">Early Exits</div>
+        <div style="font-size:18px; font-weight:600;" id="v2-exits">0</div>
+        <div style="font-size:11px; color:var(--muted);">conviction trades exited early</div>
+      </div>
     </div>
   </div>
 
@@ -1363,6 +1400,7 @@
       prevEl.style.color = prev === 'yes' ? 'var(--green)' : prev === 'no' ? 'var(--red)' : 'var(--muted)';
 
       document.getElementById('max-stake').textContent  = d.max_stake ?? '—';
+      document.getElementById('balance').textContent = d.balance != null ? d.balance.toFixed(0) : '—';
       document.getElementById('daily-limit').textContent = d.daily_limit ?? '—';
 
       // Started / last cycle (always rendered in ET)
@@ -1413,6 +1451,46 @@
       renderStats('con-stats', 'con-empty', d.con_stats);
       renderStats('snp-stats', 'snp-empty', d.snp_stats);
       renderStats('all-stats', 'all-empty', d.all_stats);
+
+      // [v2.0] Update strategy score badges
+      for (const name of ['LAG', 'CONSENSUS', 'SNIPER']) {
+        const badge = document.getElementById(`score-badge-${name}`);
+        if (!badge) continue;
+        const s = (d.strategy_scores || {})[name];
+        if (!s) { badge.textContent = ''; continue; }
+        badge.textContent = `${s.score} ${s.status}`;
+        if (s.status === 'BLOCKED') {
+          badge.style.background = 'rgba(248,81,73,.15)';
+          badge.style.color = 'var(--red)';
+          badge.style.border = '1px solid rgba(248,81,73,.3)';
+        } else if (s.status === 'THROTTLED') {
+          badge.style.background = 'rgba(210,153,34,.15)';
+          badge.style.color = 'var(--yellow)';
+          badge.style.border = '1px solid rgba(210,153,34,.3)';
+        } else {
+          badge.style.background = 'rgba(63,185,80,.15)';
+          badge.style.color = 'var(--green)';
+          badge.style.border = '1px solid rgba(63,185,80,.3)';
+        }
+      }
+
+      // [v2.0] Update v2.0 status panel
+      const v2 = d.v2_features || {};
+      const v2c = d.v2_counters || {};
+      const kellyEl = document.getElementById('v2-kelly');
+      kellyEl.textContent = v2.kelly_enabled ? `ON (${v2.kelly_fraction}x)` : 'OFF';
+      kellyEl.style.color = v2.kelly_enabled ? 'var(--green)' : 'var(--muted)';
+      document.getElementById('v2-kelly-detail').textContent = v2.kelly_enabled ? `quarter-Kelly, bal $${d.balance ? d.balance.toFixed(0) : '?'}` : 'flat stake mode';
+
+      const asEl = document.getElementById('v2-autoscore');
+      asEl.textContent = v2.autoscore_enabled ? 'ON' : 'OFF';
+      asEl.style.color = v2.autoscore_enabled ? 'var(--green)' : 'var(--muted)';
+      const scores = d.strategy_scores || {};
+      const scoreDetails = Object.entries(scores).map(([k, v]) => `${k}: ${v.score}`).join(' | ');
+      document.getElementById('v2-autoscore-detail').textContent = scoreDetails || 'no data yet';
+
+      document.getElementById('v2-disagreements').textContent = v2c.disagreements_skipped ?? 0;
+      document.getElementById('v2-exits').textContent = v2c.early_exits_triggered ?? 0;
 
       // Win Rate by Entry Price widget
       _entryPriceCache = {

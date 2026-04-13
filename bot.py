@@ -1192,14 +1192,16 @@ class LagStrategy:
         price_cents   = int(price_dollars * 100)
         # [v2.0] Kelly sizing (Lag uses flat stake — structural edge, not statistical)
         effective_stake = self.stake
+        kelly_stake = None
         if KELLY_ENABLED and balance:
             ks = kelly_size(balance, KELLY_PRIORS["LAG"]["win_rate"],
                            price_dollars, fallback_stake=self.stake)
             if ks > 0:
                 effective_stake = ks
+                kelly_stake = round(ks, 2)
         count = max(1, int(effective_stake / price_dollars))
 
-        return {
+        signal = {
             "strategy": self.name,
             "ticker":   ticker,
             "side":     side,
@@ -1208,6 +1210,9 @@ class LagStrategy:
             "dollars":  round(count * price_dollars, 2),
             "reason":   f"BTC {btc_change*100:+.2f}% in {LAG_MAX_REPRICE_AGE}s, Kalshi stale {staleness:.0f}s",
         }
+        if kelly_stake is not None:
+            signal["kelly_stake"] = kelly_stake
+        return signal
 
 
 # âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
@@ -1344,6 +1349,7 @@ class ConsensusStrategy:
         price_cents = int(price_dollars * 100)
         # [v2.0] Kelly sizing with strong-momentum and auto-score multipliers
         base_stake = self.stake * (CONSENSUS_STRONG_STAKE_MULT if strong_momentum else 1.0)
+        kelly_stake = None
         if KELLY_ENABLED and balance:
             # Use rolling win rate if enough data, else prior
             rolling_wr = None  # populated by caller via scorer
@@ -1351,6 +1357,8 @@ class ConsensusStrategy:
             ks = kelly_size(balance, prior["win_rate"], price_dollars,
                            fallback_stake=base_stake)
             effective_stake = ks if ks > 0 else base_stake
+            if ks > 0:
+                kelly_stake = round(ks, 2)
         else:
             effective_stake = base_stake
         # [v2.0] Auto-score throttle multiplier
@@ -1360,7 +1368,7 @@ class ConsensusStrategy:
         # [v1.1] Record trade time for cooldown
         self.last_trade_time = now
 
-        return {
+        signal = {
             "strategy": self.name,
             "ticker":   ticker,
             "side":     side,
@@ -1371,6 +1379,9 @@ class ConsensusStrategy:
                          f"| cap={dynamic_max:.2f} mins_left={mins_left or '?'}"
                          f"{' [STRONG x' + str(CONSENSUS_STRONG_STAKE_MULT) + ']' if strong_momentum else ''}"),
         }
+        if kelly_stake is not None:
+            signal["kelly_stake"] = kelly_stake
+        return signal
 
 
 # âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
@@ -1475,6 +1486,7 @@ class SniperStrategy:
             return None  # kill zone -- no edge here
 
         # [v2.0] Kelly sizing per entry mode
+        kelly_stake = None
         if KELLY_ENABLED and balance:
             kelly_key = f"SNIPER_{mode}"
             prior = KELLY_PRIORS.get(kelly_key, {})
@@ -1482,6 +1494,8 @@ class SniperStrategy:
                 ks = kelly_size(balance, prior["win_rate"], price_dollars,
                                fallback_stake=stake)
                 effective_stake = ks if ks > 0 else stake
+                if ks > 0:
+                    kelly_stake = round(ks, 2)
             else:
                 effective_stake = stake
         else:
@@ -1494,7 +1508,7 @@ class SniperStrategy:
         self.last_trade_time = now
 
         mom_60s_str = f"{mom_60s*100:+.3f}%" if mom_60s else "n/a"
-        return {
+        signal = {
             "strategy": self.name,
             "ticker":   ticker,
             "side":     side,
@@ -1507,6 +1521,9 @@ class SniperStrategy:
                          f"{mode} | 5m {mom_5m*100:+.3f}% -> {side.upper()} @ {price_cents}c "
                          f"| 60s: {mom_60s_str}"),
         }
+        if kelly_stake is not None:
+            signal["kelly_stake"] = kelly_stake
+        return signal
 
 
 # âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
@@ -1657,6 +1674,13 @@ class KalshiBot:
         self.scorer    = StrategyScorer()
         self.monitor   = PositionMonitor()
         self._balance  = None             # cached balance, updated each cycle
+        # [v2.0] Telemetry counters for dashboard
+        self.v2_stats  = {
+            "disagreements_skipped": 0,
+            "early_exits_triggered": 0,
+            "kelly_active": KELLY_ENABLED,
+            "last_kelly_sizes": {},  # strategy name → last kelly stake
+        }
         # Seed from existing open trades so we never double up on a market
         # after a Render restart (rebuild_trades_from_api creates RECOVERED
         # records, but traded_this_market was empty → strategies would fire
@@ -1765,6 +1789,7 @@ class KalshiBot:
                             count=ex["count"], strategy_tag="EXT",
                         )
                         if "error" not in resp:
+                            self.v2_stats["early_exits_triggered"] += 1
                             save_trade({
                                 "strategy": "EARLY_EXIT",
                                 "ticker": ex["ticker"],
@@ -1856,6 +1881,7 @@ class KalshiBot:
                 if len(sides) > 1:
                     names = [s["strategy"] for s in signals]
                     print(f"  [{ticker}] Signal disagreement ({names}), skipping market", flush=True)
+                    self.v2_stats["disagreements_skipped"] += 1
                     continue
 
             # Use first (highest-priority) signal
