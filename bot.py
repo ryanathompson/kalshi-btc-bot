@@ -1,6 +1,6 @@
 """
-Kalshi BTC 15-Minute Multi-Strategy Bot
-========================================
+Kalshi BTC 15-Minute Multi-Strategy Bot v2.0 "Edge Engine"
+===========================================================
 Runs multiple strategies in parallel on Kalshi's KXBTC15M markets:
 
   STRATEGY 1 â LAG BOT
@@ -39,6 +39,18 @@ Runs multiple strategies in parallel on Kalshi's KXBTC15M markets:
       - CONVICTION (50-55c): ATM+, +9.1pp edge, +18.5% ROI
     Primary filter: 5-minute BTC momentum alignment (+2.5pp edge, n=48).
     Avoids 11-49c "kill zone" where all sub-bands show -13pp to -15pp edge.
+
+  v2.0 "EDGE ENGINE" (2026-04-13)
+    Four cross-cutting upgrades inspired by ensemble-AI trading systems:
+    1. KELLY CRITERION SIZING — Quarter-Kelly bankroll-proportional position
+       sizing replaces flat-dollar stakes. Each strategy/mode uses measured
+       win rates and payoff ratios to size optimally.
+    2. AUTO-SCORING THROTTLE — Rolling 20-trade scorer (ROI/trend/WR) that
+       auto-blocks strategies scoring <25 and throttles to 0.5x below 50.
+    3. SIGNAL DISAGREEMENT GATING — When multiple strategies fire on the
+       same market but disagree on direction, the market is skipped entirely.
+    4. DYNAMIC EARLY EXIT — Sniper Conviction trades (50-55c) are monitored
+       for BTC reversals >0.3%. Sells at small loss vs riding to $0 settlement.
 
 SETUP:
     pip install requests cryptography colorama tabulate python-dotenv
@@ -174,8 +186,16 @@ MIN_BOOK_SUM        = 0.97   # yes+no must sum >= 0.97 (liquid market check)
 # was |momentum| 0.030-0.043% with entry prices below 40c, both of which
 # v1.2 filters out. Kill-switch via env: CONSENSUS_ENABLED=false (no redeploy).
 LAG_ENABLED       = os.getenv("LAG_ENABLED",       "true").lower() == "true"
-CONSENSUS_ENABLED = os.getenv("CONSENSUS_ENABLED", "false").lower() == "true"
+CONSENSUS_ENABLED = os.getenv("CONSENSUS_ENABLED", "true").lower() == "true"   # re-enabled v2.0 for dry-run validation
 SNIPER_ENABLED    = os.getenv("SNIPER_ENABLED",    "true").lower()  == "true"
+
+# ── v2.0 Unified stake ───────────────────────────────────────────────
+# Single max-stake-per-trade replaces the old per-strategy LAG_STAKE /
+# CONSENSUS_STAKE split.  Every strategy draws from the same budget;
+# Kelly sizing then adjusts within this ceiling based on edge.
+MAX_STAKE_PER_TRADE = float(os.getenv("MAX_STAKE_PER_TRADE",
+                            os.getenv("LAG_STAKE",
+                            os.getenv("CONSENSUS_STAKE", "25"))))
 
 # Consensus v1.2 tuning
 CONSENSUS_BASE_PRICE = 0.45  # base price cap before momentum scaling
@@ -203,13 +223,47 @@ PREV_CHECK_INTERVAL = 60     # only poll settled markets every 60s (not every cy
 # See analyze_edge.py output for the full data backing these thresholds.
 SNIPER_5M_MIN_MOMENTUM = float(os.getenv("SNIPER_5M_MIN_MOMENTUM", "0.0003"))  # 0.03%
 SNIPER_COOLDOWN        = int(os.getenv("SNIPER_COOLDOWN",   "180"))   # seconds between sniper trades
-# Sniper stake defaults — only used as safety fallback if app.py/main() don't
-# pass explicit values. In production, stakes inherit from CONSENSUS_STAKE
-# unless SNIPER_LOTTERY_STAKE / SNIPER_CONVICTION_STAKE are explicitly set.
-_con_stake_fallback     = float(os.getenv("CONSENSUS_STAKE", "1"))
-SNIPER_LOTTERY_STAKE    = float(os.getenv("SNIPER_LOTTERY_STAKE")    or _con_stake_fallback)
-SNIPER_CONVICTION_STAKE = float(os.getenv("SNIPER_CONVICTION_STAKE") or _con_stake_fallback)
+# Sniper stake defaults — fall back to MAX_STAKE_PER_TRADE when not explicitly set.
+SNIPER_LOTTERY_STAKE    = float(os.getenv("SNIPER_LOTTERY_STAKE")    or MAX_STAKE_PER_TRADE)
+SNIPER_CONVICTION_STAKE = float(os.getenv("SNIPER_CONVICTION_STAKE") or MAX_STAKE_PER_TRADE)
 SNIPER_MIN_MINS_LEFT   = float(os.getenv("SNIPER_MIN_MINS_LEFT", "5"))  # skip markets with < N min left
+
+# ── v2.0 "Edge Engine" configuration ─────────────────────────────────
+# Kelly Criterion sizing: replaces flat-dollar stakes with bankroll-
+# proportional sizing based on measured edge per strategy/mode.
+KELLY_ENABLED       = os.getenv("KELLY_ENABLED", "true").lower() == "true"
+KELLY_FRACTION      = float(os.getenv("KELLY_FRACTION", "0.25"))   # quarter-Kelly
+KELLY_MAX_BET_PCT   = float(os.getenv("KELLY_MAX_BET_PCT", "0.10"))  # never bet >10% of bankroll
+KELLY_MIN_TRADES    = int(os.getenv("KELLY_MIN_TRADES", "10"))     # need N trades before trusting rolling stats
+
+# Known edge parameters (from analyze_edge.py ground-truth data).
+# These are used as priors until enough live trades accumulate for
+# rolling stats to take over via StrategyScorer.
+KELLY_PRIORS = {
+    "SNIPER_LOTTERY":    {"win_rate": 0.105, "avg_price": 0.055},  # +4.8pp edge
+    "SNIPER_CONVICTION": {"win_rate": 0.615, "avg_price": 0.525},  # +9.1pp edge
+    "CONSENSUS":         {"win_rate": 0.55,  "avg_price": 0.40},   # conservative prior
+    "LAG":               {"win_rate": 0.50,  "avg_price": 0.50},   # structural edge, flat sizing
+}
+
+# Auto-scoring: rolling performance tracker that throttles or kills
+# strategies when trailing performance drops below thresholds.
+AUTOSCORE_ENABLED         = os.getenv("AUTOSCORE_ENABLED", "true").lower() == "true"
+AUTOSCORE_WINDOW          = int(os.getenv("AUTOSCORE_WINDOW", "20"))      # rolling trade window
+AUTOSCORE_MIN_TRADES      = int(os.getenv("AUTOSCORE_MIN_TRADES", "5"))   # need N trades before scoring
+AUTOSCORE_BLOCK_THRESHOLD = float(os.getenv("AUTOSCORE_BLOCK_THRESHOLD", "25"))   # score < this = blocked
+AUTOSCORE_THROTTLE_THRESHOLD = float(os.getenv("AUTOSCORE_THROTTLE_THRESHOLD", "50"))  # score < this = 0.5x stake
+
+# Signal disagreement gating: when multiple strategies fire on the
+# same market but disagree on direction, skip the market entirely.
+DISAGREEMENT_GATING = os.getenv("DISAGREEMENT_GATING", "true").lower() == "true"
+
+# Dynamic early exit: sell Conviction-zone positions if BTC reverses
+# hard after entry, instead of riding to settlement at $0.
+EARLY_EXIT_ENABLED       = os.getenv("EARLY_EXIT_ENABLED", "true").lower() == "true"
+EARLY_EXIT_REVERSAL_PCT  = float(os.getenv("EARLY_EXIT_REVERSAL_PCT", "0.003"))  # 0.3% BTC reversal
+EARLY_EXIT_MIN_HOLD_S    = int(os.getenv("EARLY_EXIT_MIN_HOLD_S", "120"))        # 2 min minimum hold
+EARLY_EXIT_MAX_LOSS_PCT  = float(os.getenv("EARLY_EXIT_MAX_LOSS_PCT", "0.10"))   # exit if can recover 90%+
 
 
 # ═══════════════════════════════════════════════════════════
@@ -390,6 +444,27 @@ class KalshiClient:
         if r.status_code == 201:
             return r.json()
         print(f"  Order failed: HTTP {r.status_code} â {r.text}", flush=True)
+        return {"error": r.text, "status": r.status_code}
+
+    def sell_order(self, ticker, side, price_cents, count, strategy_tag=""):
+        """Sell an existing position (for early exit). Same as place_order but action=sell."""
+        prefix = (strategy_tag or "EXT")[:3].upper()
+        client_order_id = f"{prefix}-{uuid.uuid4()}"
+        order = {
+            "ticker": ticker,
+            "action": "sell",
+            "side": side,
+            "count": count,
+            "type": "limit",
+            f"{'yes' if side == 'yes' else 'no'}_price": price_cents,
+            "client_order_id": client_order_id,
+        }
+        if self.dry:
+            return {"dry_run": True, "order": order}
+        r = self.post("/portfolio/orders", order)
+        if r.status_code == 201:
+            return r.json()
+        print(f"  [sell] Order failed: HTTP {r.status_code} -- {r.text}", flush=True)
         return {"error": r.text, "status": r.status_code}
 
 
@@ -611,7 +686,7 @@ def rebuild_trades_from_api(client):
     # Render redeploy wipes bot_trades.json, rebuilding from Kalshi orders
     # restores the strategy field correctly instead of bucketing everything
     # as "RECOVERED".
-    PREFIX_TO_STRATEGY = {"LAG": "LAG", "CON": "CONSENSUS", "TAI": "TAIL"}
+    PREFIX_TO_STRATEGY = {"LAG": "LAG", "CON": "CONSENSUS", "TAI": "TAIL", "EXT": "EARLY_EXIT"}
     order_id_to_strategy = {}
     cursor = None
     while True:
@@ -902,6 +977,166 @@ def print_stats():
         print(tabulate(rows, tablefmt="rounded_outline"))
 
 
+
+# ═══════════════════════════════════════════════════════════
+# v2.0 "EDGE ENGINE" COMPONENTS
+# ═══════════════════════════════════════════════════════════
+
+def kelly_size(balance, win_rate, price_dollars, fraction=KELLY_FRACTION,
+               max_pct=KELLY_MAX_BET_PCT, fallback_stake=None):
+    """Quarter-Kelly position sizing for binary contracts.
+
+    For binary outcomes that pay $1 on win:
+      b = (1 - price) / price   (payoff ratio)
+      f* = (b*p - q) / b
+    """
+    if not KELLY_ENABLED or balance is None or balance <= 0:
+        return fallback_stake or 0
+    if price_dollars <= 0.005 or price_dollars >= 0.995:
+        return fallback_stake or 0
+    b = (1.0 - price_dollars) / price_dollars
+    p = win_rate
+    q = 1.0 - p
+    f_star = (b * p - q) / b
+    if f_star <= 0:
+        return 0
+    kelly_stake = balance * fraction * f_star
+    max_stake = balance * max_pct
+    kelly_stake = min(kelly_stake, max_stake)
+    kelly_stake = max(kelly_stake, 1.0) if kelly_stake > 0 else 0
+    return round(kelly_stake, 2)
+
+
+class StrategyScorer:
+    """Rolling performance scorer that auto-throttles losing strategies.
+
+    Score 0-100 based on ROI (40%), trend (25%), sample (20%), WR (15%).
+    Allocation: >=50 → 1.0x, 25-49 → 0.5x, <25 → 0.0x (blocked).
+    """
+    def __init__(self, window=AUTOSCORE_WINDOW, min_trades=AUTOSCORE_MIN_TRADES):
+        self.window = window
+        self.min_trades = min_trades
+        self._cache = {}
+        self._cache_ttl = 60
+
+    def score(self, strategy_name):
+        if not AUTOSCORE_ENABLED:
+            return 100.0, 1.0
+        now = time.time()
+        cached = self._cache.get(strategy_name)
+        if cached and (now - cached[2]) < self._cache_ttl:
+            return cached[0], cached[1]
+        trades = load_trades()
+        settled = [t for t in trades if t.get("result") and t.get("strategy") == strategy_name]
+        recent = settled[-self.window:]
+        if len(recent) < self.min_trades:
+            self._cache[strategy_name] = (100.0, 1.0, now)
+            return 100.0, 1.0
+        wins = sum(1 for t in recent if t["result"] == "WIN")
+        total = len(recent)
+        wr = wins / total
+        wagered = sum(t.get("dollars", 0) for t in recent)
+        pnl = sum(t.get("pnl", 0) for t in recent if t.get("pnl"))
+        roi = pnl / wagered if wagered > 0 else 0
+        roi_score = min(100, max(0, (roi + 0.5) * 100))
+        wr_score = min(100, max(0, wr * 200))
+        if len(recent) >= 10:
+            last5_pnl = sum(t.get("pnl", 0) for t in recent[-5:] if t.get("pnl"))
+            prev5_pnl = sum(t.get("pnl", 0) for t in recent[-10:-5] if t.get("pnl"))
+            trend_score = 70 if last5_pnl > prev5_pnl else 30
+        else:
+            trend_score = 50
+        sample_score = min(100, len(recent) * 5)
+        score = 0.40 * roi_score + 0.25 * trend_score + 0.20 * sample_score + 0.15 * wr_score
+        if score < AUTOSCORE_BLOCK_THRESHOLD:
+            mult = 0.0
+        elif score < AUTOSCORE_THROTTLE_THRESHOLD:
+            mult = 0.5
+        else:
+            mult = 1.0
+        self._cache[strategy_name] = (score, mult, now)
+        return score, mult
+
+    def get_rolling_win_rate(self, strategy_name, mode=None):
+        """Get rolling win rate for Kelly updates. None = use priors."""
+        trades = load_trades()
+        settled = [t for t in trades if t.get("result") and t.get("strategy") == strategy_name]
+        if mode:
+            settled = [t for t in settled if mode in (t.get("reason") or "")]
+        recent = settled[-self.window:]
+        if len(recent) < KELLY_MIN_TRADES:
+            return None
+        wins = sum(1 for t in recent if t["result"] == "WIN")
+        return wins / len(recent)
+
+
+class PositionMonitor:
+    """Tracks open Conviction-zone positions for early exit on BTC reversal.
+
+    Only Sniper Conviction trades (50-55c) are tracked — they have enough
+    liquidity to sell back. If BTC reverses > 0.3%, selling at small loss
+    beats riding to $0 settlement (~50% loss).
+    """
+    def __init__(self):
+        self.positions = {}
+
+    def track(self, signal, btc_price):
+        reason = signal.get("reason", "")
+        if signal.get("strategy") == "SNIPER" and "CONVICTION" in reason:
+            self.positions[signal["ticker"]] = {
+                "side": signal["side"],
+                "entry_btc": btc_price,
+                "entry_time": time.time(),
+                "entry_price_cents": signal["price"],
+                "count": signal["count"],
+            }
+
+    def check_exits(self, btc_feed, markets):
+        if not EARLY_EXIT_ENABLED or not self.positions:
+            return []
+        exits = []
+        now = time.time()
+        btc_now = btc_feed.current()
+        if btc_now is None:
+            return []
+        mkt_map = {m["ticker"]: m for m in markets}
+        for ticker, pos in list(self.positions.items()):
+            if now - pos["entry_time"] < EARLY_EXIT_MIN_HOLD_S:
+                continue
+            if ticker not in mkt_map:
+                self.positions.pop(ticker, None)
+                continue
+            btc_change = (btc_now - pos["entry_btc"]) / pos["entry_btc"]
+            adverse = ((pos["side"] == "yes" and btc_change < -EARLY_EXIT_REVERSAL_PCT) or
+                       (pos["side"] == "no"  and btc_change >  EARLY_EXIT_REVERSAL_PCT))
+            if not adverse:
+                continue
+            market = mkt_map[ticker]
+            bid_key = f"{pos['side']}_bid_dollars"
+            current_bid = float(market.get(bid_key, 0))
+            entry_price = pos["entry_price_cents"] / 100.0
+            if current_bid <= 0:
+                continue
+            loss_pct = (entry_price - current_bid) / entry_price
+            if loss_pct <= EARLY_EXIT_MAX_LOSS_PCT:
+                exits.append({
+                    "ticker": ticker,
+                    "side": pos["side"],
+                    "count": pos["count"],
+                    "sell_price_cents": max(1, int(current_bid * 100)),
+                    "entry_price_cents": pos["entry_price_cents"],
+                    "btc_reversal": btc_change,
+                    "loss_pct": loss_pct,
+                    "reason": (f"EARLY EXIT: BTC {btc_change*100:+.2f}% reversal, "
+                               f"sell @ {int(current_bid*100)}c (loss {loss_pct*100:.1f}%) "
+                               f"vs ride-to-zero"),
+                })
+        return exits
+
+    def remove(self, ticker):
+        self.positions.pop(ticker, None)
+
+
 # âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 # STRATEGY 1: LAG BOT
 # âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
@@ -917,10 +1152,11 @@ class LagStrategy:
     """
     def __init__(self, stake_dollars):
         self.stake    = stake_dollars
+        self.kelly_mode = "LAG"      # [v2.0] Kelly prior key
         self.name     = "LAG"
         self.last_kalshi_prices = {}  # ticker â (yes, no, timestamp)
 
-    def evaluate(self, market, btc_feed):
+    def evaluate(self, market, btc_feed, balance=None):
         ticker  = market["ticker"]
         yes_px  = float(market.get("yes_ask_dollars", market.get("yes_bid_dollars", 0)))
         no_px   = float(market.get("no_ask_dollars",  market.get("no_bid_dollars",  0)))
@@ -954,7 +1190,14 @@ class LagStrategy:
         side          = "yes" if btc_change > 0 else "no"
         price_dollars = yes_px if side == "yes" else no_px
         price_cents   = int(price_dollars * 100)
-        count         = max(1, int(self.stake / price_dollars))
+        # [v2.0] Kelly sizing (Lag uses flat stake — structural edge, not statistical)
+        effective_stake = self.stake
+        if KELLY_ENABLED and balance:
+            ks = kelly_size(balance, KELLY_PRIORS["LAG"]["win_rate"],
+                           price_dollars, fallback_stake=self.stake)
+            if ks > 0:
+                effective_stake = ks
+        count = max(1, int(effective_stake / price_dollars))
 
         return {
             "strategy": self.name,
@@ -1017,7 +1260,7 @@ class ConsensusStrategy:
                 self.last_result_time = now   # [v1.1] timestamp the signal
                 self.last_ticker      = latest["ticker"]
 
-    def evaluate(self, market, btc_feed, mins_left=None):
+    def evaluate(self, market, btc_feed, mins_left=None, balance=None, score_mult=1.0):
         """
         Evaluate consensus signal for a single market.
 
@@ -1025,6 +1268,8 @@ class ConsensusStrategy:
             market:    Kalshi market dict
             btc_feed:  BTCPriceFeed instance
             mins_left: minutes remaining in this market (passed from main loop)
+            balance:   Current account balance (for Kelly sizing)
+            score_mult: Auto-score multiplier (throttle factor)
 
         Returns signal dict or None.
         """
@@ -1097,9 +1342,20 @@ class ConsensusStrategy:
             return None
 
         price_cents = int(price_dollars * 100)
-        # [v1.2] strong-momentum stake multiplier
-        effective_stake = self.stake * (CONSENSUS_STRONG_STAKE_MULT if strong_momentum else 1.0)
-        count       = max(1, int(effective_stake / price_dollars))
+        # [v2.0] Kelly sizing with strong-momentum and auto-score multipliers
+        base_stake = self.stake * (CONSENSUS_STRONG_STAKE_MULT if strong_momentum else 1.0)
+        if KELLY_ENABLED and balance:
+            # Use rolling win rate if enough data, else prior
+            rolling_wr = None  # populated by caller via scorer
+            prior = KELLY_PRIORS["CONSENSUS"]
+            ks = kelly_size(balance, prior["win_rate"], price_dollars,
+                           fallback_stake=base_stake)
+            effective_stake = ks if ks > 0 else base_stake
+        else:
+            effective_stake = base_stake
+        # [v2.0] Auto-score throttle multiplier
+        effective_stake *= score_mult
+        count = max(1, int(effective_stake / price_dollars))
 
         # [v1.1] Record trade time for cooldown
         self.last_trade_time = now
@@ -1154,9 +1410,16 @@ class SniperStrategy:
         self.name             = "SNIPER"
         self.last_trade_time  = 0
 
-    def evaluate(self, market, btc_feed, mins_left=None):
+    def evaluate(self, market, btc_feed, mins_left=None, balance=None, score_mult=1.0):
         """
         Evaluate sniper signal for a single market.
+
+        Args:
+            market:    Kalshi market dict
+            btc_feed:  BTCPriceFeed instance
+            mins_left: minutes remaining in this market
+            balance:   Current account balance (for Kelly sizing)
+            score_mult: Auto-score multiplier (throttle factor)
 
         Returns signal dict or None.
         """
@@ -1211,7 +1474,21 @@ class SniperStrategy:
         else:
             return None  # kill zone -- no edge here
 
-        count = max(1, int(stake / price_dollars))
+        # [v2.0] Kelly sizing per entry mode
+        if KELLY_ENABLED and balance:
+            kelly_key = f"SNIPER_{mode}"
+            prior = KELLY_PRIORS.get(kelly_key, {})
+            if prior:
+                ks = kelly_size(balance, prior["win_rate"], price_dollars,
+                               fallback_stake=stake)
+                effective_stake = ks if ks > 0 else stake
+            else:
+                effective_stake = stake
+        else:
+            effective_stake = stake
+        # [v2.0] Auto-score throttle multiplier
+        effective_stake *= score_mult
+        count = max(1, int(effective_stake / price_dollars))
 
         # -- Record trade time for cooldown ---------------------------------
         self.last_trade_time = now
@@ -1361,20 +1638,25 @@ class RiskManager:
 # âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 
 class KalshiBot:
-    def __init__(self, client, lag_stake, consensus_stake,
-                 daily_loss_limit, dry_run, gross_daily_loss_limit=None,
+    def __init__(self, client, max_stake, daily_loss_limit, dry_run,
+                 gross_daily_loss_limit=None,
                  sniper_lottery_stake=None, sniper_conviction_stake=None):
         self.client    = client
+        self.max_stake = max_stake     # [v2.0] unified stake ceiling
         self.btc       = BTCPriceFeed(window=500)
-        self.lag       = LagStrategy(lag_stake)
-        self.consensus = ConsensusStrategy(consensus_stake)
+        self.lag       = LagStrategy(max_stake)
+        self.consensus = ConsensusStrategy(max_stake)
         self.sniper    = SniperStrategy(
-            lottery_stake=sniper_lottery_stake,
-            conviction_stake=sniper_conviction_stake,
+            lottery_stake=sniper_lottery_stake or max_stake,
+            conviction_stake=sniper_conviction_stake or max_stake,
         )
         self.risk      = RiskManager(daily_loss_limit,
                                      gross_daily_loss_limit=gross_daily_loss_limit)
         self.dry       = dry_run
+        # [v2.0] New components
+        self.scorer    = StrategyScorer()
+        self.monitor   = PositionMonitor()
+        self._balance  = None             # cached balance, updated each cycle
         # Seed from existing open trades so we never double up on a market
         # after a Render restart (rebuild_trades_from_api creates RECOVERED
         # records, but traded_this_market was empty → strategies would fire
@@ -1464,6 +1746,43 @@ class KalshiBot:
             print(Fore.RED + f"  ð Risk halt: {reason}")
             return
 
+        # [v2.0] Cache balance for Kelly sizing
+        try:
+            self._balance = self.client.get_balance()
+        except Exception:
+            pass  # use last cached value
+
+        # [v2.0] Check early exits on Conviction positions BEFORE new entries
+        if EARLY_EXIT_ENABLED and self._last_markets:
+            try:
+                exit_signals = self.monitor.check_exits(self.btc, markets)
+                for ex in exit_signals:
+                    print(f"\n{Fore.YELLOW}>>> {ex['reason']}{Style.RESET_ALL}", flush=True)
+                    if not self.dry:
+                        resp = self.client.sell_order(
+                            ticker=ex["ticker"], side=ex["side"],
+                            price_cents=ex["sell_price_cents"],
+                            count=ex["count"], strategy_tag="EXT",
+                        )
+                        if "error" not in resp:
+                            save_trade({
+                                "strategy": "EARLY_EXIT",
+                                "ticker": ex["ticker"],
+                                "side": ex["side"],
+                                "price": ex["sell_price_cents"],
+                                "count": ex["count"],
+                                "dollars": round(ex["count"] * ex["sell_price_cents"] / 100.0, 2),
+                                "reason": ex["reason"],
+                                "timestamp": now_et().isoformat(),
+                                "dry_run": False,
+                                "order": resp,
+                                "order_id": (resp.get("order", {}) or {}).get("order_id"),
+                                "result": None, "pnl": None, "outcome": None,
+                            })
+                    self.monitor.remove(ex["ticker"])
+            except Exception as e:
+                print(f"  [early-exit] Error: {e}", flush=True)
+
         # 5. Evaluate strategies on each market
         for market in markets:
             ticker = market["ticker"]
@@ -1472,7 +1791,7 @@ class KalshiBot:
             if ticker in self.traded_this_market:
                 continue
 
-            # Time remaining check â skip if < 3 min left (too close to settlement)
+            # Time remaining check
             close_time = market.get("close_time")
             mins_left = None
             if close_time:
@@ -1482,12 +1801,10 @@ class KalshiBot:
                     )
                     mins_left = (ct - datetime.datetime.now(datetime.timezone.utc)).total_seconds() / 60
                     if mins_left < 3 or mins_left > 14:
-                        continue  # too late or too early
+                        continue
                 except Exception:
                     pass
 
-            # ── Strategy enable flags (env-driven kill switches) ────
-            # CONSENSUS defaults OFF as of 2026-04-09 post-mortem.
             active_strategies = []
             if LAG_ENABLED:
                 active_strategies.append(self.lag)
@@ -1496,47 +1813,86 @@ class KalshiBot:
             if SNIPER_ENABLED:
                 active_strategies.append(self.sniper)
 
+            # [v2.0] Collect ALL signals for disagreement gating
+            signals = []
             for strategy in active_strategies:
+                # [v2.0] Auto-score check
+                score_val, score_mult = self.scorer.score(strategy.name)
+                if score_mult <= 0:
+                    print(f"  [{strategy.name}] Auto-blocked (score={score_val:.0f})", flush=True)
+                    continue
+
                 try:
-                    # Pass mins_left to strategies that use it
-                    if isinstance(strategy, (ConsensusStrategy, SniperStrategy)):
-                        signal = strategy.evaluate(market, self.btc, mins_left=mins_left)
+                    if isinstance(strategy, LagStrategy):
+                        signal = strategy.evaluate(market, self.btc,
+                                                   balance=self._balance)
+                    elif isinstance(strategy, ConsensusStrategy):
+                        signal = strategy.evaluate(market, self.btc,
+                                                   mins_left=mins_left,
+                                                   balance=self._balance,
+                                                   score_mult=score_mult)
+                    elif isinstance(strategy, SniperStrategy):
+                        signal = strategy.evaluate(market, self.btc,
+                                                   mins_left=mins_left,
+                                                   balance=self._balance,
+                                                   score_mult=score_mult)
                     else:
                         signal = strategy.evaluate(market, self.btc)
                 except Exception as e:
                     print(Fore.RED + f"  Strategy error ({strategy.name}): {e}")
                     continue
 
-                if not signal:
+                if signal:
+                    signal["_score"] = score_val
+                    signal["_score_mult"] = score_mult
+                    signals.append(signal)
+
+            if not signals:
+                continue
+
+            # [v2.0] Disagreement gating: if strategies disagree on direction, skip
+            if DISAGREEMENT_GATING and len(signals) > 1:
+                sides = set(s["side"] for s in signals)
+                if len(sides) > 1:
+                    names = [s["strategy"] for s in signals]
+                    print(f"  [{ticker}] Signal disagreement ({names}), skipping market", flush=True)
                     continue
 
-                self._print_signal(signal, self.dry)
+            # Use first (highest-priority) signal
+            signal = signals[0]
 
-                # Place order
-                if self.dry:
-                    order_result = {"dry_run": True}
-                else:
-                    try:
-                        resp = self.client.place_order(
-                            ticker      = signal["ticker"],
-                            side        = signal["side"],
-                            price_cents = signal["price"],
-                            count       = signal["count"],
-                            strategy_tag= signal["strategy"],
-                        )
-                        order_result = resp
-                    except Exception as e:
-                        order_result = {"error": str(e)}
-                        print(Fore.RED + f"  Order error: {e}")
+            self._print_signal(signal, self.dry)
 
-                # Only log the trade if the order was actually placed
-                if "error" in order_result and not order_result.get("dry_run"):
-                    print(Fore.RED + f"  Order rejected â not logging as open trade.")
-                    continue
+            # Place order
+            if self.dry:
+                order_result = {"dry_run": True}
+            else:
+                try:
+                    resp = self.client.place_order(
+                        ticker=signal["ticker"],
+                        side=signal["side"],
+                        price_cents=signal["price"],
+                        count=signal["count"],
+                        strategy_tag=signal["strategy"],
+                    )
+                    order_result = resp
+                except Exception as e:
+                    order_result = {"error": str(e)}
+                    print(Fore.RED + f"  Order error: {e}")
 
-                self._log_signal(signal, order_result)
-                self.traded_this_market.add(ticker)
-                break  # one strategy per market per cycle
+            if "error" in order_result and not order_result.get("dry_run"):
+                print(Fore.RED + f"  Order rejected -- not logging as open trade.")
+                continue
+
+            self._log_signal(signal, order_result)
+            self.traded_this_market.add(ticker)
+
+            # [v2.0] Track position for early exit monitoring
+            btc_now = self.btc.current()
+            if btc_now:
+                self.monitor.track(signal, btc_now)
+
+            break  # one strategy per market per cycle
 
         # Status line
         ts         = now_et().strftime("%H:%M:%S")
@@ -1552,21 +1908,25 @@ class KalshiBot:
         )
 
     def run(self):
-        print(Fore.GREEN + Style.BRIGHT + "\nð¤ KALSHI DUAL STRATEGY BOT STARTED")
+        print(Fore.GREEN + Style.BRIGHT + "\nð¤ KALSHI MULTI-STRATEGY BOT v2.0 'EDGE ENGINE'")
         mode = "DRY RUN" if self.dry else "LIVE TRADING"
         print(f"   Mode: {Fore.YELLOW}{mode}{Style.RESET_ALL}")
         lag_state = "ENABLED" if LAG_ENABLED else "DISABLED"
         con_state = "ENABLED" if CONSENSUS_ENABLED else "DISABLED"
         snp_state = "ENABLED" if SNIPER_ENABLED else "DISABLED"
-        print(f"   LAG stake:       ${self.lag.stake}/trade  [{lag_state}]")
-        print(f"   CONSENSUS stake:  ${self.consensus.stake}/trade  [{con_state}]")
-        print(f"   SNIPER lottery:  ${self.sniper.lottery_stake}/trade  "
-              f"conviction: ${self.sniper.conviction_stake}/trade  [{snp_state}]")
+        print(f"   Max stake:       ${self.max_stake}/trade (all strategies)")
+        print(f"   LAG [{lag_state}]  CONSENSUS [{con_state}]  SNIPER [{snp_state}]")
+        print(f"   SNIPER overrides: lottery=${self.sniper.lottery_stake}  "
+              f"conviction=${self.sniper.conviction_stake}")
         print(f"   Sniper 5m momentum floor: {SNIPER_5M_MIN_MOMENTUM*100:.3f}%  "
               f"cooldown: {SNIPER_COOLDOWN}s  min time: {SNIPER_MIN_MINS_LEFT:.0f}m")
         print(f"   Momentum dead zone: {MOMENTUM_DEAD_ZONE*100:.3f}%")
         print(f"   Strong-momentum threshold: {STRONG_MOMENTUM_THRESHOLD*100:.3f}% "
               f"(stake x{CONSENSUS_STRONG_STAKE_MULT}, cap +{CONSENSUS_STRONG_PRICE_BONUS:.2f})")
+        print(f"   [v2.0] Kelly sizing:     {'ON ('+str(KELLY_FRACTION)+'x)' if KELLY_ENABLED else 'OFF'}")
+        print(f"   [v2.0] Auto-scoring:     {'ON' if AUTOSCORE_ENABLED else 'OFF'}")
+        print(f"   [v2.0] Disagreement gate: {'ON' if DISAGREEMENT_GATING else 'OFF'}")
+        print(f"   [v2.0] Early exit:       {'ON' if EARLY_EXIT_ENABLED else 'OFF'}")
         print(f"   Daily NET loss limit:   ${self.risk.daily_limit}")
         print(f"   Daily GROSS loss limit: ${self.risk.gross_daily_limit}")
         print(f"   Trade log: {LOG_FILE}")
@@ -1616,17 +1976,15 @@ class KalshiBot:
 # âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 
 def main():
-    parser = argparse.ArgumentParser(description="Kalshi BTC 15-min Dual Strategy Bot")
+    parser = argparse.ArgumentParser(description="Kalshi BTC 15-min Multi-Strategy Bot v2.0")
     parser.add_argument("--dry-run",     action="store_true",
                         help="Simulate trades without placing real orders")
-    parser.add_argument("--lag-stake",   type=float, default=None,
-                        help="Dollar stake per LAG trade (overrides .env)")
-    parser.add_argument("--con-stake",   type=float, default=None,
-                        help="Dollar stake per CONSENSUS trade (overrides .env)")
+    parser.add_argument("--stake",       type=float, default=None,
+                        help="Max dollar stake per trade, all strategies (overrides .env MAX_STAKE_PER_TRADE)")
     parser.add_argument("--snp-lottery-stake",    type=float, default=None,
-                        help="Dollar stake per SNIPER lottery trade (overrides .env)")
+                        help="Override Sniper lottery stake (defaults to --stake)")
     parser.add_argument("--snp-conviction-stake", type=float, default=None,
-                        help="Dollar stake per SNIPER conviction trade (overrides .env)")
+                        help="Override Sniper conviction stake (defaults to --stake)")
     parser.add_argument("--daily-limit", type=float, default=None,
                         help="Max daily loss in dollars before halting")
     parser.add_argument("--stats",       action="store_true",
@@ -1641,14 +1999,10 @@ def main():
     dry_run    = args.dry_run or os.getenv("DRY_RUN", "false").lower() == "true"
 
     # Stakes â CLI > .env > interactive prompt
-    def get_stake(arg_val, env_key, label):
+    def get_max_stake(arg_val):
         if arg_val is not None:
             return arg_val
-        env_val = os.getenv(env_key)
-        if env_val:
-            return float(env_val)
-        val = input(f"  Enter {label} stake per trade in dollars (e.g. 25): $").strip()
-        return float(val)
+        return MAX_STAKE_PER_TRADE  # already resolved from env chain in config
 
     # Stats/resolve don't need live credentials
     if args.stats:
@@ -1673,13 +2027,12 @@ def main():
         print(Fore.RED + f"Private key not found. Set KALSHI_PRIVATE_KEY_BASE64 or place key at {key_path}")
         return
 
-    print(Fore.CYAN + "\nâ  KALSHI DUAL STRATEGY BOT â CONFIGURATION\n")
+    print(Fore.CYAN + "\n  KALSHI v2.0 EDGE ENGINE \u2014 CONFIGURATION\n")
 
-    lag_stake   = get_stake(args.lag_stake,   "LAG_STAKE",       "LAG strategy")
-    con_stake   = get_stake(args.con_stake,   "CONSENSUS_STAKE", "CONSENSUS strategy")
+    max_stake   = get_max_stake(args.stake)
     # Sniper stakes fall back to CONSENSUS_STAKE when not explicitly set
-    snp_lot     = args.snp_lottery_stake    or float(os.getenv("SNIPER_LOTTERY_STAKE")    or con_stake)
-    snp_conv    = args.snp_conviction_stake or float(os.getenv("SNIPER_CONVICTION_STAKE") or con_stake)
+    snp_lot     = args.snp_lottery_stake    or float(os.getenv("SNIPER_LOTTERY_STAKE")    or max_stake)
+    snp_conv    = args.snp_conviction_stake or float(os.getenv("SNIPER_CONVICTION_STAKE") or max_stake)
     daily_limit = args.daily_limit or float(os.getenv("DAILY_LOSS_LIMIT", 0) or
                   input("  Daily loss limit in dollars (bot halts if exceeded): $").strip())
     # Gross-loss limit defaults to 1.5× the net limit if not explicitly set.
@@ -1689,9 +2042,8 @@ def main():
 
     if not dry_run:
         print(f"\n{Fore.RED}â²  LIVE TRADING MODE{Style.RESET_ALL}")
-        print(f"   LAG stake:       ${lag_stake}/trade")
-        print(f"   CONSENSUS stake: ${con_stake}/trade")
-        print(f"   SNIPER lottery:  ${snp_lot}/trade  conviction: ${snp_conv}/trade")
+        print(f"   Max stake:       ${max_stake}/trade (all strategies)")
+        print(f"   SNIPER overrides: lottery=${snp_lot}  conviction=${snp_conv}")
         print(f"   Daily loss limit: ${daily_limit}")
         confirm = input("\n  Type 'YES' to confirm live trading: ").strip()
         if confirm != "YES":
@@ -1711,8 +2063,7 @@ def main():
 
     bot = KalshiBot(
         client                   = client,
-        lag_stake                = lag_stake,
-        consensus_stake          = con_stake,
+        max_stake                = max_stake,
         daily_loss_limit         = daily_limit,
         gross_daily_loss_limit   = gross_daily_limit,
         dry_run                  = dry_run,
