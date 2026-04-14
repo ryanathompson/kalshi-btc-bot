@@ -672,6 +672,9 @@
     <div>Prev <span class="val" id="prev-result">—</span></div>
     <div>Stake $<span class="val" id="max-stake">—</span></div>
     <div>Bal $<span class="val" id="balance">—</span></div>
+    <label style="display:flex; align-items:center; gap:4px; cursor:pointer; font-size:11px; color:var(--muted);" title="Include simulated dry-run trades in stats and history">
+      <input type="checkbox" id="include-dry-run" style="cursor:pointer;"> Dry Run
+    </label>
   </div>
 </header>
 
@@ -752,24 +755,24 @@
   <div class="cards">
     <div class="card card-lag" id="card-lag">
       <div class="card-title" style="display:flex; align-items:center; justify-content:space-between;">
-        <span>⚡ LAG Strategy</span>
-        <span class="badge" id="score-badge-LAG" style="margin:0; font-size:10px;"></span>
+        <span title="Exploits Kalshi order-book lag vs real-time BTC price. Buys mispriced contracts before the book catches up to spot moves.">⚡ LAG Strategy</span>
+        <span class="badge" id="score-badge-LAG" style="margin:0; font-size:10px;" title="Auto-score (0-100). FULL = 100% stake, THROTTLED = 50%, BLOCKED = paused. Based on rolling 20-trade window of ROI, win rate, and trend."></span>
       </div>
       <div class="empty-card" id="lag-empty">No settled trades yet</div>
       <div class="stat-grid" id="lag-stats" style="display:none"></div>
     </div>
     <div class="card card-con" id="card-con">
       <div class="card-title" style="display:flex; align-items:center; justify-content:space-between;">
-        <span>🔮 Consensus Strategy</span>
-        <span class="badge" id="score-badge-CONSENSUS" style="margin:0; font-size:10px;"></span>
+        <span title="Combines BTC momentum direction with the previous market's settlement outcome to bet on continuation patterns. Uses dynamic price caps and strong-momentum multipliers.">🔮 Consensus Strategy</span>
+        <span class="badge" id="score-badge-CONSENSUS" style="margin:0; font-size:10px;" title="Auto-score (0-100). FULL = 100% stake, THROTTLED = 50%, BLOCKED = paused. Based on rolling 20-trade window of ROI, win rate, and trend."></span>
       </div>
       <div class="empty-card" id="con-empty">No settled trades yet</div>
       <div class="stat-grid" id="con-stats" style="display:none"></div>
     </div>
     <div class="card card-snp" id="card-snp">
       <div class="card-title" style="display:flex; align-items:center; justify-content:space-between;">
-        <span>🎯 Sniper Strategy</span>
-        <span class="badge" id="score-badge-SNIPER" style="margin:0; font-size:10px;"></span>
+        <span title="Data-driven directional strategy using 5-min BTC momentum. Two zones: LOTTERY (1-10c, long-shot asymmetric bets) and CONVICTION (50-55c, high-confidence momentum plays).">🎯 Sniper Strategy</span>
+        <span class="badge" id="score-badge-SNIPER" style="margin:0; font-size:10px;" title="Auto-score (0-100). FULL = 100% stake, THROTTLED = 50%, BLOCKED = paused. Based on rolling 20-trade window of ROI, win rate, and trend."></span>
       </div>
       <div class="empty-card" id="snp-empty">No settled trades yet</div>
       <div class="stat-grid" id="snp-stats" style="display:none"></div>
@@ -1365,7 +1368,9 @@
 
   async function refresh() {
     try {
-      const r   = await fetch('/api/status');
+      const dryCheck = document.getElementById('include-dry-run');
+      const dryParam = dryCheck && dryCheck.checked ? '?include_dry_run=1' : '';
+      const r   = await fetch('/api/status' + dryParam);
       const d   = await r.json();
 
       // Mode badge
