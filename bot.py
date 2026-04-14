@@ -861,6 +861,66 @@ def rebuild_trades_from_api(client):
     return new_trades
 
 
+def dedup_trades():
+    """Remove duplicate trade records that share the same Kalshi order_id.
+
+    After rebuild_trades_from_api() recovers trades, the log may contain
+    both the original bot-logged record AND a 'recovered' record for the
+    same order (due to timezone mismatches in the old ticker+ts dedup).
+    This pass keeps the richer bot-logged record and drops the recovered
+    duplicate.
+    """
+    trades = load_trades()
+    if not trades:
+        return
+
+    def _extract_oid(t):
+        """Return the Kalshi order_id from any nesting depth."""
+        oid = t.get("order_id")
+        if oid:
+            return oid
+        inner = t.get("order") or {}
+        if isinstance(inner, dict):
+            oid = inner.get("order_id")
+            if oid:
+                return oid
+            inner2 = inner.get("order") or {}
+            if isinstance(inner2, dict):
+                return inner2.get("order_id")
+        return None
+
+    seen = {}      # order_id -> index of best record
+    to_drop = set()
+
+    for i, t in enumerate(trades):
+        oid = _extract_oid(t)
+        if not oid:
+            continue
+        if oid in seen:
+            prev_idx = seen[oid]
+            prev = trades[prev_idx]
+            # Prefer the non-recovered record (has richer data)
+            prev_recovered = (prev.get("order") or {}).get("recovered", False)
+            curr_recovered = (t.get("order") or {}).get("recovered", False)
+            if curr_recovered and not prev_recovered:
+                to_drop.add(i)       # drop current (recovered dupe)
+            elif prev_recovered and not curr_recovered:
+                to_drop.add(prev_idx)  # drop previous (recovered dupe)
+                seen[oid] = i
+            else:
+                to_drop.add(i)       # both same type, drop later one
+        else:
+            seen[oid] = i
+
+    if to_drop:
+        cleaned = [t for i, t in enumerate(trades) if i not in to_drop]
+        with open(LOG_FILE, "w") as f:
+            json.dump(cleaned, f, indent=2)
+        print(f"[dedup] Removed {len(to_drop)} duplicate trades from log.", flush=True)
+    else:
+        print("[dedup] No duplicates found.", flush=True)
+
+
 def load_trades():
     if os.path.exists(LOG_FILE):
         with open(LOG_FILE) as f:

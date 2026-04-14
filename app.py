@@ -21,7 +21,7 @@ from dotenv import load_dotenv
 
 from bot import (
     KalshiBot, KalshiClient, load_private_key, load_trades, POLL_INTERVAL,
-    resolve_trades, start_keep_alive, rebuild_trades_from_api,
+    resolve_trades, start_keep_alive, rebuild_trades_from_api, dedup_trades,
     ET, now_et, today_et, parse_trade_ts,
     KELLY_ENABLED, KELLY_FRACTION, AUTOSCORE_ENABLED,
     DISAGREEMENT_GATING, EARLY_EXIT_ENABLED,
@@ -701,6 +701,7 @@ def _bot_thread():
         # Rebuild trade log from Kalshi API (survives Render redeploys)
         try:
             rebuild_trades_from_api(client)
+            dedup_trades()
         except Exception as e:
             print(f"[bot] Trade rebuild warning: {e}", flush=True)
 
