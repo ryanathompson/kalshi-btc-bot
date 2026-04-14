@@ -514,7 +514,7 @@
     .pnl-spark-wrap {
       position: relative;
       width: 100%;
-      height: 96px;
+      height: 180px;
     }
     .pnl-spark {
       width: 100%;
@@ -532,6 +532,23 @@
       font-size: 12px;
     }
     .pnl-spark-empty.active { display: flex; }
+    .pnl-spark-legend {
+      display: flex;
+      gap: 16px;
+      font-size: 11px;
+      color: var(--muted);
+      margin-top: 6px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    .pnl-spark-legend .sw {
+      display: inline-block;
+      width: 8px; height: 8px; border-radius: 50%;
+      margin-right: 6px; vertical-align: middle;
+    }
+    .pnl-spark-legend .sw-btc {
+      width: 14px; height: 2px; border-radius: 1px;
+    }
 
     /* -- HALT CONTROLS (countdown + reset button) -- */
     .halt-controls {
@@ -702,8 +719,14 @@
       </div>
     </div>
     <div class="pnl-spark-wrap">
-      <svg class="pnl-spark" id="pnl-spark" preserveAspectRatio="none" viewBox="0 0 400 96"></svg>
+      <svg class="pnl-spark" id="pnl-spark" viewBox="0 0 800 180"></svg>
       <div class="pnl-spark-empty" id="pnl-spark-empty">No settled trades in this range</div>
+    </div>
+    <div class="pnl-spark-legend">
+      <span><span class="sw" style="background:var(--green)"></span>P/L gain</span>
+      <span><span class="sw" style="background:var(--red)"></span>P/L loss</span>
+      <span><span class="sw sw-btc" style="background:var(--orange)"></span>BTC price (right axis)</span>
+      <span id="pnl-spark-btc-status" style="margin-left:auto; color:var(--muted);"></span>
     </div>
   </div>
 
@@ -966,10 +989,44 @@
   // the source of truth for window boundaries AND headline values. We
   // still use `points` (the pnl_points feed from /api/status) to draw
   // the sparkline, filtered to the same server-provided window.
-  const _pnlTracker = { range: '1D', points: [], windows: null };
+  const _pnlTracker = { range: '1D', points: [], windows: null, btc: null };
+  const _btcCache   = Object.create(null);  // cacheKey -> {fetchedAt, data}
 
   function _rangeLabel(r) {
     return ({'1D':'Past Day','1W':'Past Week','1M':'Past Month','ALL':'All Time'})[r] || '';
+  }
+
+  // Fetch BTC candles from Coinbase's public Exchange API (CORS-enabled).
+  // Returns chronologically-sorted [{ts, v}]; throws on failure so caller
+  // can render without the overlay. Cached for 60s per range.
+  async function _fetchBtcHistory(startMs, endMs, rangeKey) {
+    const span = (endMs - startMs) / 1000;
+    let granularity;
+    if      (span <=  2*86400) granularity =   900;  // 1D -> 15min
+    else if (span <=  8*86400) granularity =  3600;  // 1W -> 1hr
+    else if (span <= 40*86400) granularity = 21600;  // 1M -> 6hr
+    else                       granularity = 86400;  // ALL -> 1day
+
+    // Coinbase caps at 300 candles per request; clamp start if necessary
+    const maxSpanMs  = 299 * granularity * 1000;
+    const rangeStart = Math.max(startMs, endMs - maxSpanMs);
+
+    const cacheKey = `${rangeKey}:${Math.floor(rangeStart/60000)}:${Math.floor(endMs/60000)}`;
+    const cached   = _btcCache[cacheKey];
+    if (cached && (Date.now() - cached.fetchedAt) < 60_000) return cached.data;
+
+    const url = 'https://api.exchange.coinbase.com/products/BTC-USD/candles'
+      + `?granularity=${granularity}`
+      + `&start=${new Date(rangeStart).toISOString()}`
+      + `&end=${new Date(endMs).toISOString()}`;
+    const resp = await fetch(url);
+    if (!resp.ok) throw new Error('coinbase candles http ' + resp.status);
+    const rows = await resp.json();  // [[time_s, low, high, open, close, vol], ...]
+    const data = rows
+      .map(r => ({ ts: r[0] * 1000, v: r[4] }))
+      .sort((a, b) => a.ts - b.ts);
+    _btcCache[cacheKey] = { fetchedAt: Date.now(), data };
+    return data;
   }
 
   function renderPnlTracker() {
@@ -1045,7 +1102,23 @@
     const nowMs = Date.now();
     if (last.ts < nowMs) series.push({ ts: nowMs, v: last.v });
 
-    _drawSpark(series);
+    // Kick off (or reuse) BTC overlay fetch. Render P/L immediately with
+    // whatever btc we have cached, then re-render once the fetch resolves.
+    _drawSpark(series, _pnlTracker.btc);
+    const btcStatusEl = document.getElementById('pnl-spark-btc-status');
+    if (btcStatusEl) btcStatusEl.textContent = 'BTC loading…';
+    _fetchBtcHistory(startMs, Math.min(endMs, nowMs), range)
+      .then(btc => {
+        _pnlTracker.btc = btc;
+        if (btcStatusEl) btcStatusEl.textContent = '';
+        // Only redraw if the user is still on the same range
+        if (_pnlTracker.range === range) _drawSpark(series, btc);
+      })
+      .catch(err => {
+        console.warn('btc history fetch failed:', err);
+        _pnlTracker.btc = null;
+        if (btcStatusEl) btcStatusEl.textContent = 'BTC overlay unavailable';
+      });
 
     // Surface invariant failures — they should never fire; if they do
     // it's a real arithmetic bug worth investigating.
@@ -1054,74 +1127,268 @@
     }
   }
 
-  function _drawSpark(series) {
+  // v3 spark renderer:
+  //   - split fill (green above $0, red below) with a dashed breakeven line
+  //   - stair-step P/L line clipped so above-zero segments are green, below-zero are red
+  //   - optional BTC overlay on a secondary right axis (smooth line)
+  //   - high / low markers + current-value dot
+  //   - hover crosshair + tooltip showing time, P/L, BTC
+  //
+  // plSeries: [{ts, v}]  — chronological; v is window-start-relative cumulative P/L
+  // btcSeries: [{ts, v}] | null — chronological close prices, or null when fetch failed
+  function _drawSpark(plSeries, btcSeries) {
     const svg = document.getElementById('pnl-spark');
     svg.innerHTML = '';
-    if (series.length < 2) return;
+    if (!plSeries || plSeries.length < 2) return;
 
-    const W = 400, H = 96, PAD_X = 4, PAD_Y = 8;
-    const xs = series.map(p => p.ts);
-    const ys = series.map(p => p.v);
+    // Resolve viewBox from actual pixel size so text doesn't get stretched
+    // (preserveAspectRatio is the SVG default "meet" here)
+    const rect = svg.getBoundingClientRect();
+    const W = Math.max(360, Math.round(rect.width) || 800);
+    const H = 180;
+    svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
 
+    const hasBtc = !!(btcSeries && btcSeries.length >= 2);
+    const PAD = { t: 12, r: hasBtc ? 54 : 8, b: 14, l: 42 };
+    const innerW = W - PAD.l - PAD.r;
+    const innerH = H - PAD.t - PAD.b;
+
+    const xs = plSeries.map(p => p.ts);
+    const ys = plSeries.map(p => p.v);
     const xMin = Math.min(...xs);
     const xMax = Math.max(...xs);
     let yMin = Math.min(...ys, 0);
     let yMax = Math.max(...ys, 0);
     if (yMin === yMax) { yMin -= 1; yMax += 1; }
+    // Breathing room so markers/labels don't sit on the edge
+    const yPad = (yMax - yMin) * 0.1;
+    yMin -= yPad; yMax += yPad;
 
     const xRange = (xMax - xMin) || 1;
     const yRange = (yMax - yMin) || 1;
-    const x = t => PAD_X + (t - xMin) / xRange * (W - 2 * PAD_X);
-    const y = v => H - PAD_Y - (v - yMin) / yRange * (H - 2 * PAD_Y);
+    const x    = t => PAD.l + (t - xMin) / xRange * innerW;
+    const yPL  = v => PAD.t + (1 - (v - yMin) / yRange) * innerH;
 
-    const tail    = ys[ys.length - 1];
-    const stroke  = tail >= 0 ? 'var(--green)' : 'var(--red)';
-    const fillCol = tail >= 0 ? 'rgba(63,185,80,.14)' : 'rgba(248,81,73,.14)';
-
-    const ns = 'http://www.w3.org/2000/svg';
-
-    // Zero baseline (only if span crosses 0)
-    if (yMin < 0 && yMax > 0) {
-      const zy = y(0);
-      const line = document.createElementNS(ns, 'line');
-      line.setAttribute('x1', PAD_X);
-      line.setAttribute('x2', W - PAD_X);
-      line.setAttribute('y1', zy);
-      line.setAttribute('y2', zy);
-      line.setAttribute('stroke', 'rgba(139,148,158,.35)');
-      line.setAttribute('stroke-dasharray', '3 3');
-      line.setAttribute('stroke-width', '1');
-      svg.appendChild(line);
+    let yBTC = null, btcMin = 0, btcMax = 0;
+    if (hasBtc) {
+      const bvs = btcSeries.map(p => p.v);
+      btcMin = Math.min(...bvs);
+      btcMax = Math.max(...bvs);
+      if (btcMin === btcMax) { btcMin -= 1; btcMax += 1; }
+      const bPad = (btcMax - btcMin) * 0.12;
+      btcMin -= bPad; btcMax += bPad;
+      yBTC = v => PAD.t + (1 - (v - btcMin) / (btcMax - btcMin)) * innerH;
     }
 
-    // Path: step line (we only know value AT each trade; keeps it monotone)
-    let d = `M ${x(xs[0])} ${y(ys[0])}`;
-    for (let i = 1; i < series.length; i++) {
-      const px = x(xs[i]);
-      const py = y(ys[i]);
-      // Horizontal then vertical = stair-step; smoother than diagonal hops
-      d += ` L ${px} ${y(ys[i - 1])} L ${px} ${py}`;
+    const zeroY = yPL(0);
+
+    // Stair-step P/L path — horizontal then vertical at each point,
+    // matching the prior chart's semantics (P/L is only defined at fills)
+    let d = `M ${x(xs[0]).toFixed(2)} ${yPL(ys[0]).toFixed(2)}`;
+    for (let i = 1; i < plSeries.length; i++) {
+      const px = x(xs[i]).toFixed(2);
+      d += ` L ${px} ${yPL(ys[i-1]).toFixed(2)} L ${px} ${yPL(ys[i]).toFixed(2)}`;
+    }
+    const areaD = d
+      + ` L ${x(xs[xs.length-1]).toFixed(2)} ${zeroY.toFixed(2)}`
+      + ` L ${x(xs[0]).toFixed(2)} ${zeroY.toFixed(2)} Z`;
+
+    // BTC smooth line
+    let btcD = '';
+    if (hasBtc) {
+      btcD = btcSeries
+        .map((p, i) => (i ? 'L' : 'M') + x(p.ts).toFixed(2) + ' ' + yBTC(p.v).toFixed(2))
+        .join(' ');
     }
 
-    // Area fill
-    const area = d
-      + ` L ${x(xs[xs.length - 1])} ${H - PAD_Y}`
-      + ` L ${x(xs[0])} ${H - PAD_Y} Z`;
+    // Extrema (P/L high / low) — pick rightmost tie to match "latest peak"
+    let maxI = 0, minI = 0;
+    for (let i = 1; i < plSeries.length; i++) {
+      if (plSeries[i].v >= plSeries[maxI].v) maxI = i;
+      if (plSeries[i].v <= plSeries[minI].v) minI = i;
+    }
+    const lastI = plSeries.length - 1;
 
-    const areaEl = document.createElementNS(ns, 'path');
-    areaEl.setAttribute('d', area);
-    areaEl.setAttribute('fill', fillCol);
-    areaEl.setAttribute('stroke', 'none');
-    svg.appendChild(areaEl);
+    // BTC right-axis label (3 ticks)
+    const btcAxisLabels = hasBtc ? [btcMax, (btcMin+btcMax)/2, btcMin].map(v => ({
+      y: yBTC(v),
+      text: '$' + Math.round(v).toLocaleString(),
+    })) : [];
 
-    const lineEl = document.createElementNS(ns, 'path');
-    lineEl.setAttribute('d', d);
-    lineEl.setAttribute('fill', 'none');
-    lineEl.setAttribute('stroke', stroke);
-    lineEl.setAttribute('stroke-width', '2');
-    lineEl.setAttribute('stroke-linecap', 'round');
-    lineEl.setAttribute('stroke-linejoin', 'round');
-    svg.appendChild(lineEl);
+    // ── Render ──────────────────────────────────────────────────────────
+    const tail      = plSeries[lastI].v;
+    const tailColor = tail >= 0 ? 'var(--green)' : 'var(--red)';
+
+    svg.innerHTML = `
+      <defs>
+        <clipPath id="spark-clip-above"><rect x="0" y="0" width="${W}" height="${zeroY}"/></clipPath>
+        <clipPath id="spark-clip-below"><rect x="0" y="${zeroY}" width="${W}" height="${H - zeroY}"/></clipPath>
+        <linearGradient id="spark-grad-green" x1="0" x2="0" y1="0" y2="1">
+          <stop offset="0%"   stop-color="var(--green)" stop-opacity="0.38"/>
+          <stop offset="100%" stop-color="var(--green)" stop-opacity="0.04"/>
+        </linearGradient>
+        <linearGradient id="spark-grad-red" x1="0" x2="0" y1="0" y2="1">
+          <stop offset="0%"   stop-color="var(--red)"   stop-opacity="0.04"/>
+          <stop offset="100%" stop-color="var(--red)"   stop-opacity="0.38"/>
+        </linearGradient>
+      </defs>
+
+      <!-- split-fill areas clipped to above/below breakeven -->
+      <path d="${areaD}" fill="url(#spark-grad-green)" clip-path="url(#spark-clip-above)"/>
+      <path d="${areaD}" fill="url(#spark-grad-red)"   clip-path="url(#spark-clip-below)"/>
+
+      <!-- dashed $0 breakeven -->
+      <line x1="${PAD.l}" y1="${zeroY.toFixed(2)}" x2="${W - PAD.r}" y2="${zeroY.toFixed(2)}"
+            stroke="rgba(139,148,158,.45)" stroke-dasharray="3 4" stroke-width="1"/>
+      <text x="${PAD.l - 6}" y="${(zeroY + 3.5).toFixed(2)}" text-anchor="end"
+            font-size="10" fill="var(--muted)">$0</text>
+
+      <!-- BTC overlay (behind P/L line so P/L reads as primary) -->
+      ${hasBtc ? `
+        <path d="${btcD}" stroke="var(--orange)" stroke-width="1.4"
+              fill="none" opacity="0.85" stroke-linejoin="round"/>
+        ${btcAxisLabels.map(a => `
+          <text x="${W - PAD.r + 6}" y="${(a.y + 3.5).toFixed(2)}"
+                font-size="10" fill="var(--orange)" opacity="0.75">${a.text}</text>
+        `).join('')}
+      ` : ''}
+
+      <!-- P/L line split by clip paths so color matches side of the breakeven -->
+      <path d="${d}" stroke="var(--green)" stroke-width="2" fill="none"
+            stroke-linejoin="round" stroke-linecap="round"
+            clip-path="url(#spark-clip-above)"/>
+      <path d="${d}" stroke="var(--red)"   stroke-width="2" fill="none"
+            stroke-linejoin="round" stroke-linecap="round"
+            clip-path="url(#spark-clip-below)"/>
+
+      <!-- high marker -->
+      ${plSeries[maxI].v > 0 ? `
+        <circle cx="${x(plSeries[maxI].ts).toFixed(2)}" cy="${yPL(plSeries[maxI].v).toFixed(2)}"
+                r="3" fill="var(--green)" stroke="var(--panel)" stroke-width="1.5"/>
+        <text x="${(x(plSeries[maxI].ts) + 6).toFixed(2)}" y="${(yPL(plSeries[maxI].v) - 5).toFixed(2)}"
+              font-size="10" fill="var(--green)" font-weight="600">
+          +$${plSeries[maxI].v.toFixed(2)}
+        </text>
+      ` : ''}
+
+      <!-- low marker -->
+      ${plSeries[minI].v < 0 ? `
+        <circle cx="${x(plSeries[minI].ts).toFixed(2)}" cy="${yPL(plSeries[minI].v).toFixed(2)}"
+                r="3" fill="var(--red)" stroke="var(--panel)" stroke-width="1.5"/>
+        <text x="${(x(plSeries[minI].ts) + 6).toFixed(2)}" y="${(yPL(plSeries[minI].v) + 12).toFixed(2)}"
+              font-size="10" fill="var(--red)" font-weight="600">
+          -$${Math.abs(plSeries[minI].v).toFixed(2)}
+        </text>
+      ` : ''}
+
+      <!-- current value dot w/ halo -->
+      <circle cx="${x(plSeries[lastI].ts).toFixed(2)}" cy="${yPL(plSeries[lastI].v).toFixed(2)}"
+              r="7" fill="${tailColor}" opacity="0.18"/>
+      <circle cx="${x(plSeries[lastI].ts).toFixed(2)}" cy="${yPL(plSeries[lastI].v).toFixed(2)}"
+              r="3.5" fill="${tailColor}" stroke="var(--panel)" stroke-width="1.5"/>
+
+      <!-- hover overlay (hidden until mousemove) -->
+      <g id="spark-hover" style="opacity:0; pointer-events:none; transition:opacity .08s;">
+        <line id="spark-hover-line" y1="${PAD.t}" y2="${H - PAD.b}"
+              stroke="rgba(139,148,158,.55)" stroke-dasharray="2 3" stroke-width="1"/>
+        <circle id="spark-hover-pl"  r="3.5" fill="var(--green)" stroke="var(--panel)" stroke-width="1.5"/>
+        ${hasBtc ? `<circle id="spark-hover-btc" r="3" fill="var(--orange)" stroke="var(--panel)" stroke-width="1.5"/>` : ''}
+        <g id="spark-hover-tt">
+          <rect id="spark-hover-bg" rx="6" ry="6" width="132" height="${hasBtc ? 60 : 42}"
+                fill="#1a2030" stroke="#2a3242"/>
+          <text id="spark-hover-time" x="10" y="16" font-size="10.5" fill="var(--muted)"></text>
+          <text id="spark-hover-pl-t" x="10" y="34" font-size="12" font-weight="600"></text>
+          ${hasBtc ? `<text id="spark-hover-btc-t" x="10" y="52" font-size="11" fill="var(--orange)"></text>` : ''}
+        </g>
+      </g>
+
+      <!-- mousemove capture -->
+      <rect id="spark-capture" x="${PAD.l}" y="${PAD.t}"
+            width="${innerW}" height="${innerH}"
+            fill="transparent" pointer-events="all"/>
+    `;
+
+    // ── Hover interactivity ────────────────────────────────────────────
+    const cap     = svg.querySelector('#spark-capture');
+    const hover   = svg.querySelector('#spark-hover');
+    const hLine   = svg.querySelector('#spark-hover-line');
+    const hPL     = svg.querySelector('#spark-hover-pl');
+    const hBTC    = svg.querySelector('#spark-hover-btc');
+    const hTT     = svg.querySelector('#spark-hover-tt');
+    const hTime   = svg.querySelector('#spark-hover-time');
+    const hPLt    = svg.querySelector('#spark-hover-pl-t');
+    const hBTCt   = svg.querySelector('#spark-hover-btc-t');
+
+    function plAt(ts) {
+      // Stair-step lookup: the value at ts is the last point with point.ts <= ts
+      if (ts <= plSeries[0].ts) return plSeries[0].v;
+      if (ts >= plSeries[lastI].ts) return plSeries[lastI].v;
+      // binary search
+      let lo = 0, hi = lastI;
+      while (lo < hi) {
+        const mid = (lo + hi + 1) >> 1;
+        if (plSeries[mid].ts <= ts) lo = mid; else hi = mid - 1;
+      }
+      return plSeries[lo].v;
+    }
+    function btcAt(ts) {
+      if (!hasBtc) return null;
+      if (ts <= btcSeries[0].ts) return btcSeries[0].v;
+      if (ts >= btcSeries[btcSeries.length-1].ts) return btcSeries[btcSeries.length-1].v;
+      let lo = 0, hi = btcSeries.length - 1;
+      while (lo < hi) {
+        const mid = (lo + hi + 1) >> 1;
+        if (btcSeries[mid].ts <= ts) lo = mid; else hi = mid - 1;
+      }
+      return btcSeries[lo].v;
+    }
+    function fmtTime(ts) {
+      const d = new Date(ts);
+      const span = xMax - xMin;
+      const opts = span > 2*86400*1000
+        ? { month:'short', day:'numeric', hour:'numeric', minute:'2-digit' }
+        : { hour:'numeric', minute:'2-digit' };
+      return d.toLocaleString('en-US', opts);
+    }
+
+    cap.addEventListener('mousemove', e => {
+      const r = svg.getBoundingClientRect();
+      const xPx = (e.clientX - r.left) * (W / r.width);
+      const t = xMin + ((xPx - PAD.l) / innerW) * xRange;
+      const tc = Math.max(xMin, Math.min(xMax, t));
+
+      const pxTC = x(tc);
+      const plV  = plAt(tc);
+      const plY  = yPL(plV);
+
+      hover.style.opacity = '1';
+      hLine.setAttribute('x1', pxTC);
+      hLine.setAttribute('x2', pxTC);
+      hPL.setAttribute('cx', pxTC);
+      hPL.setAttribute('cy', plY);
+      hPL.setAttribute('fill', plV >= 0 ? 'var(--green)' : 'var(--red)');
+
+      let btcV = null;
+      if (hasBtc) {
+        btcV = btcAt(tc);
+        const btcY = yBTC(btcV);
+        hBTC.setAttribute('cx', pxTC);
+        hBTC.setAttribute('cy', btcY);
+      }
+
+      // Tooltip position: flip left if it would clip the right edge
+      const ttW = 132, ttH = hasBtc ? 60 : 42;
+      const ttX = (pxTC + 12 + ttW > W - 4) ? pxTC - 12 - ttW : pxTC + 12;
+      const ttY = Math.min(H - PAD.b - ttH, Math.max(PAD.t, plY - ttH/2));
+      hTT.setAttribute('transform', `translate(${ttX}, ${ttY})`);
+
+      hTime.textContent = fmtTime(tc);
+      const sign = plV >= 0 ? '+' : '−';
+      hPLt.setAttribute('fill', plV >= 0 ? 'var(--green)' : 'var(--red)');
+      hPLt.textContent = `${sign}$${Math.abs(plV).toFixed(2)} P/L`;
+      if (hasBtc) hBTCt.textContent = `BTC $${Math.round(btcV).toLocaleString()}`;
+    });
+    cap.addEventListener('mouseleave', () => { hover.style.opacity = '0'; });
   }
 
   // Wire up tab buttons once on load
@@ -1131,6 +1398,7 @@
         document.querySelectorAll('.pnl-tab').forEach(b => b.classList.remove('active'));
         btn.classList.add('active');
         _pnlTracker.range = btn.dataset.range;
+        _pnlTracker.btc   = null;  // force re-fetch for new range
         renderPnlTracker();
       });
     });
