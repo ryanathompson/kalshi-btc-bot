@@ -1446,7 +1446,7 @@
       //   which is fetched in parallel just below so both update together
       _pnlTracker.points = d.pnl_points || [];
       try {
-        const rw = await fetch('/api/pnl_windows');
+        const rw = await fetch('/api/pnl_windows' + dryParam);
         if (rw.ok) _pnlTracker.windows = await rw.json();
       } catch (e) {
         console.warn('pnl_windows fetch failed', e);

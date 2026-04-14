@@ -395,6 +395,10 @@ def api_pnl_windows():
     so they surface even if the dashboard is closed.
     """
     trades = load_trades()
+    # [v2.1] Dry-run filter: match /api/status behaviour
+    include_dry = request.args.get("include_dry_run", "0") == "1"
+    if not include_dry:
+        trades = [t for t in trades if not t.get("dry_run")]
     # Pass bot.py's own parse_trade_ts so the dashboard buckets trades
     # into the same calendar day as the RiskManager halt timer does.
     result = compute_windows(

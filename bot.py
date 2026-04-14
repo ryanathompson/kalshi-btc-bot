@@ -753,6 +753,26 @@ def rebuild_trades_from_api(client):
         orders[f.get("order_id", f.get("fill_id", ""))].append(f)
 
     existing = load_trades()
+    # Build a set of known order IDs for dedup.  Bot-logged trades store
+    # the order_id at the top level OR nested inside order.order.order_id
+    # or order.order_id (recovered).  We normalise all three paths.
+    existing_order_ids = set()
+    for t in existing:
+        oid = t.get("order_id")
+        if oid:
+            existing_order_ids.add(oid)
+        inner = t.get("order") or {}
+        if isinstance(inner, dict):
+            oid2 = inner.get("order_id")
+            if oid2:
+                existing_order_ids.add(oid2)
+            inner2 = inner.get("order") or {}
+            if isinstance(inner2, dict):
+                oid3 = inner2.get("order_id")
+                if oid3:
+                    existing_order_ids.add(oid3)
+    # Fallback: also keep the old ticker+ts dedup for legacy trades
+    # that pre-date the order_id storage.
     existing_tickers_ts = {
         (t.get("ticker", ""), t.get("timestamp", "")[:16])
         for t in existing
@@ -766,7 +786,9 @@ def rebuild_trades_from_api(client):
         side = f0.get("side", "")  # "yes" or "no"
         ts = f0.get("created_time") or f0.get("ts", "")
 
-        # Skip if we already have this trade logged
+        # Skip if we already have this trade logged (by order_id or ticker+ts)
+        if order_id in existing_order_ids:
+            continue
         if (ticker, ts[:16]) in existing_tickers_ts:
             continue
 
