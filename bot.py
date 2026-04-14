@@ -269,8 +269,14 @@ EARLY_EXIT_MAX_LOSS_PCT  = float(os.getenv("EARLY_EXIT_MAX_LOSS_PCT", "0.10"))  
 # asymmetric upside but stakes are capped to limit bleed during dry
 # streaks.  Kelly tends to oversize these because the payout multiple
 # is huge, even when the actual win rate doesn't support it.
-CHEAP_CONTRACT_PRICE     = int(''.join(c for c in os.getenv("CHEAP_CONTRACT_PRICE", "25") if c.isdigit()) or "25")  # cents threshold
-CHEAP_CONTRACT_MAX_STAKE = float(os.getenv("CHEAP_CONTRACT_MAX_STAKE", "5.0"))  # max $ on cheap entries
+# [v2.2] Cheap-contract cap raised from 25c/$5 → 45c/$2 after 2026-04-14
+# post-mortem: Consensus blew up on 31–41c positions sized at 15–20ct,
+# all below the prior 25c threshold, so the cap never fired. Every losing
+# Consensus cheap trade that day was in the 30–45c band. The new default
+# covers the full cheap-tail entry zone where Kelly was over-sizing.
+# Override via env if needed — e.g. CHEAP_CONTRACT_PRICE=35 for a softer cap.
+CHEAP_CONTRACT_PRICE     = int(''.join(c for c in os.getenv("CHEAP_CONTRACT_PRICE", "45") if c.isdigit()) or "45")  # cents threshold
+CHEAP_CONTRACT_MAX_STAKE = float(os.getenv("CHEAP_CONTRACT_MAX_STAKE", "2.0"))  # max $ on cheap entries
 
 
 # ═══════════════════════════════════════════════════════════
@@ -933,6 +939,57 @@ def save_trade(trade):
     trades.append(trade)
     with open(LOG_FILE, "w") as f:
         json.dump(trades, f, indent=2)
+
+
+def close_trade_by_early_exit(ticker, side, count, entry_cents, exit_cents,
+                               exit_reason=""):
+    """Finalize the most recent open entry trade matching (ticker,side,count)
+    with realized P&L from an early-exit sell.
+
+    This is what we do **instead of** save_trade()-ing a new strategy="EARLY_EXIT"
+    row: the dashboard's per-strategy stats were counting the exit separately
+    from the entry, so early-exit wins appeared as "None final position" and
+    never got credited to the SNIPER/CONSENSUS bucket that originated the
+    position. Here we update the originating record in-place.
+
+    Semantics:
+      - Finds the trade by (ticker, side, count, result is None).
+      - Sets result=WIN if exit_proceeds > entry_cost else LOSS. We use
+        strict P&L sign (not "exit > entry" as a policy flag) so a small
+        stop-loss exit correctly shows as a LOSS, not a WIN.
+      - Marks closed_by_exit=True so resolve_trades() skips this row when
+        the market later settles.
+
+    Returns True on success, False if no matching open trade was found.
+    """
+    trades = load_trades()
+    entry_cost    = round(count * entry_cents / 100.0, 4)
+    exit_proceeds = round(count * exit_cents  / 100.0, 4)
+    pnl           = round(exit_proceeds - entry_cost, 2)
+
+    # Iterate most-recent-first: if the bot happened to open the same
+    # (ticker,side,count) twice in a row, we want to close the newest one.
+    for t in reversed(trades):
+        if t.get("result"):
+            continue
+        if t.get("ticker") != ticker:
+            continue
+        if t.get("side")   != side:
+            continue
+        if t.get("count")  != count:
+            continue
+        t["result"]         = "WIN" if pnl > 0 else "LOSS"
+        t["pnl"]            = pnl
+        t["exit_reason"]    = "EARLY_EXIT"
+        t["exit_price"]     = exit_cents
+        t["exit_payout"]    = exit_proceeds
+        t["closed_by_exit"] = True
+        if exit_reason:
+            t["exit_detail"] = exit_reason
+        with open(LOG_FILE, "w") as f:
+            json.dump(trades, f, indent=2)
+        return True
+    return False
 
 
 def resolve_trades(client):
@@ -1893,20 +1950,39 @@ class KalshiBot:
                         )
                         if "error" not in resp:
                             self.v2_stats["early_exits_triggered"] += 1
-                            save_trade({
-                                "strategy": "EARLY_EXIT",
-                                "ticker": ex["ticker"],
-                                "side": ex["side"],
-                                "price": ex["sell_price_cents"],
-                                "count": ex["count"],
-                                "dollars": round(ex["count"] * ex["sell_price_cents"] / 100.0, 2),
-                                "reason": ex["reason"],
-                                "timestamp": now_et().isoformat(),
-                                "dry_run": False,
-                                "order": resp,
-                                "order_id": (resp.get("order", {}) or {}).get("order_id"),
-                                "result": None, "pnl": None, "outcome": None,
-                            })
+                            # [v2.2] Attribute exit P&L to the ORIGINATING
+                            # strategy by finalizing the entry record in-place
+                            # instead of saving a separate "EARLY_EXIT" row.
+                            # See close_trade_by_early_exit() docstring.
+                            closed = close_trade_by_early_exit(
+                                ticker=ex["ticker"],
+                                side=ex["side"],
+                                count=ex["count"],
+                                entry_cents=ex["entry_price_cents"],
+                                exit_cents=ex["sell_price_cents"],
+                                exit_reason=ex.get("reason", ""),
+                            )
+                            if not closed:
+                                # Fallback: no matching open trade found
+                                # (shouldn't happen, but don't silently drop
+                                # the exit — log it so we can audit later).
+                                save_trade({
+                                    "strategy":    "EARLY_EXIT",
+                                    "ticker":      ex["ticker"],
+                                    "side":        ex["side"],
+                                    "price":       ex["sell_price_cents"],
+                                    "count":       ex["count"],
+                                    "dollars":     round(ex["count"] * ex["sell_price_cents"] / 100.0, 2),
+                                    "reason":      ex["reason"],
+                                    "timestamp":   now_et().isoformat(),
+                                    "dry_run":     False,
+                                    "order":       resp,
+                                    "order_id":    (resp.get("order", {}) or {}).get("order_id"),
+                                    "result":      None,
+                                    "pnl":         None,
+                                    "outcome":     None,
+                                    "_orphan_exit": True,
+                                })
                     self.monitor.remove(ex["ticker"])
             except Exception as e:
                 print(f"  [early-exit] Error: {e}", flush=True)

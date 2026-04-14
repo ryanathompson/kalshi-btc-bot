@@ -428,6 +428,99 @@ def api_pnl_windows():
 
 
 # ────────────────────────────────────────────────────────────
+# RECONCILIATION — ground-truth P&L from Kalshi API (bypasses
+# bot_trades.json). Surfaced here so the dashboard / a nightly
+# scheduled puller can read it without shelling into Render.
+#
+# The /api/status ledger trusts resolve_trades(), which marks ghost
+# (never-filled) orders WIN/LOSS at settlement. This endpoint computes
+# P&L from /portfolio/fills and /portfolio/settlements directly, so
+# the numbers match what actually moved in the Kalshi account.
+#
+# Cached for 60s because the full pull is paginated and not free;
+# the dashboard polls this way more than Kalshi's data actually moves.
+# ─────────────────────────────────────────────────────────────
+
+_reconcile_cache = {"ts": 0.0, "payload": None, "error": None}
+_RECONCILE_TTL_S = 60.0
+
+def _build_reconcile_payload():
+    """Pull fills/settlements/orders and run reconcile_pnl.compute_true_pnl.
+
+    Runs on the same KalshiClient the bot is using so there's no extra
+    auth wiring. Returns the JSON-serializable payload or raises.
+    """
+    if _bot is None or _bot.client is None:
+        raise RuntimeError("Bot client not initialized")
+    from reconcile_pnl import (
+        fetch_all_fills, fetch_all_settlements, fetch_all_orders,
+        compute_true_pnl,
+    )
+    fills = fetch_all_fills(_bot.client)
+    setts = fetch_all_settlements(_bot.client)
+    orders = fetch_all_orders(_bot.client)
+    truth = compute_true_pnl(fills, setts, orders)
+
+    # Per-strategy rollup from ground truth (not from bot_trades.json)
+    by_strat: dict = {}
+    for p in truth["positions"]:
+        if not p.get("result"):
+            continue
+        s = p.get("strategy") or "UNKNOWN"
+        b = by_strat.setdefault(s, {"n": 0, "w": 0, "l": 0,
+                                     "cost": 0.0, "pnl": 0.0})
+        b["n"]    += 1
+        b["w"]    += 1 if p["result"] == "WIN" else 0
+        b["l"]    += 1 if p["result"] == "LOSS" else 0
+        b["cost"] += float(p.get("cost") or 0)
+        b["pnl"]  += float(p.get("pnl")  or 0)
+    for s, b in by_strat.items():
+        b["wr"]  = round(b["w"] / b["n"] * 100, 1) if b["n"] else 0.0
+        b["roi"] = round(b["pnl"] / b["cost"] * 100, 1) if b["cost"] else 0.0
+        b["pnl"] = round(b["pnl"], 2)
+        b["cost"] = round(b["cost"], 2)
+
+    return {
+        "generated_at": now_et().isoformat(),
+        "summary":      truth["summary"],
+        "by_strategy":  by_strat,
+        # Only return settled positions to keep the payload small; the
+        # caller can filter further. Unsettled count is in summary.
+        "positions":    [p for p in truth["positions"] if p.get("result")],
+    }
+
+
+@app.route("/api/reconcile")
+def api_reconcile():
+    """Ground-truth P&L from Kalshi /portfolio/fills + /portfolio/settlements.
+
+    Query params:
+      force=1    — bypass the 60s cache (use sparingly, Kalshi is paginated).
+    """
+    force = request.args.get("force", "0") == "1"
+    now_s = time.time()
+    if (not force
+        and _reconcile_cache["payload"] is not None
+        and now_s - _reconcile_cache["ts"] < _RECONCILE_TTL_S):
+        payload = dict(_reconcile_cache["payload"])
+        payload["_cached"] = True
+        payload["_cache_age_s"] = round(now_s - _reconcile_cache["ts"], 1)
+        return jsonify(payload)
+
+    try:
+        payload = _build_reconcile_payload()
+    except Exception as e:
+        _reconcile_cache["error"] = str(e)
+        app.logger.exception("reconcile failed")
+        return jsonify({"error": str(e)}), 500
+
+    _reconcile_cache.update({"ts": now_s, "payload": payload, "error": None})
+    payload = dict(payload)
+    payload["_cached"] = False
+    return jsonify(payload)
+
+
+# ────────────────────────────────────────────────────────────
 # ANALYSIS PAGE — wraps backtest_consensus.py for non-technical use
 # ─────────────────────────────────────────────────────────────
 #
