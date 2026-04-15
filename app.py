@@ -356,6 +356,36 @@ def api_resolve():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/rebuild", methods=["POST"])
+def api_rebuild():
+    """Manually trigger rebuild_trades_from_api() + dedup + resolve.
+
+    Useful when the local bot_trades.json is missing fills that should
+    have been recovered from Kalshi -- e.g. after a dedup-logic fix, so
+    the operator can force a re-sync without restarting the service
+    (restart halts trading for minutes).
+
+    Returns counts before/after so it's obvious how many records were
+    added.
+    """
+    if _bot is None:
+        return jsonify({"error": "Bot not initialized"}), 503
+    try:
+        before = len(load_trades())
+        rebuild_trades_from_api(_bot.client)
+        dedup_trades()
+        n_resolved = resolve_trades(_bot.client)
+        after = len(load_trades())
+        return jsonify({
+            "trades_before":  before,
+            "trades_after":   after,
+            "trades_added":   after - before,
+            "resolved":       n_resolved,
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/reset_halt", methods=["POST"])
 def api_reset_halt():
     """Manually clear the RiskManager halt state.

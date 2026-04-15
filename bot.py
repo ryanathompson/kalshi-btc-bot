@@ -788,11 +788,21 @@ def rebuild_trades_from_api(client):
                 oid3 = inner2.get("order_id")
                 if oid3:
                     existing_order_ids.add(oid3)
-    # Fallback: also keep the old ticker+ts dedup for legacy trades
-    # that pre-date the order_id storage.
+    # Legacy records without an order_id: match on (ticker, FULL timestamp)
+    # as a last-resort fallback. The previous version truncated the
+    # timestamp to minute precision (ts[:16]), which silently collapsed
+    # distinct orders that happened on the same ticker within the same
+    # minute — e.g. the paired duplicate fills caused by the boundary
+    # race. Using the full timestamp keeps legacy-record dedup working
+    # while allowing multiple distinct fills on the same ticker.
     existing_tickers_ts = {
-        (t.get("ticker", ""), t.get("timestamp", "")[:16])
+        (t.get("ticker", ""), t.get("timestamp", ""))
         for t in existing
+        if not (
+            t.get("order_id")
+            or (t.get("order") or {}).get("order_id")
+            or ((t.get("order") or {}).get("order") or {}).get("order_id")
+        )
     }
 
     new_trades = []
@@ -803,10 +813,15 @@ def rebuild_trades_from_api(client):
         side = f0.get("side", "")  # "yes" or "no"
         ts = f0.get("created_time") or f0.get("ts", "")
 
-        # Skip if we already have this trade logged (by order_id or ticker+ts)
+        # Skip if we already have this trade logged. order_id is the
+        # primary key — Kalshi guarantees it's unique per order. The
+        # (ticker, timestamp) fallback only covers truly legacy records
+        # that were logged before order_id storage existed (the set is
+        # filtered to those records above, so it can't accidentally
+        # swallow distinct fills on the same ticker).
         if order_id in existing_order_ids:
             continue
-        if (ticker, ts[:16]) in existing_tickers_ts:
+        if existing_tickers_ts and (ticker, ts) in existing_tickers_ts:
             continue
 
         # Aggregate across partial fills
