@@ -436,12 +436,23 @@ class KalshiClient:
         return d.get("balance", 0) / 100  # cents â dollars
 
     def place_order(self, ticker, side, price_cents, count, strategy_tag=""):
-        # Tag the client_order_id with a 3-letter strategy prefix so that
-        # rebuild_trades_from_api() can recover strategy attribution after a
-        # redeploy (Render's filesystem is ephemeral and bot_trades.json
-        # gets wiped). The prefix is preserved by Kalshi on /portfolio/orders.
-        prefix = (strategy_tag or "UNK")[:3].upper()
-        client_order_id = f"{prefix}-{uuid.uuid4()}"
+        # client_order_id serves two purposes:
+        #   1. Strategy attribution after Render redeploy — the 3-letter prefix
+        #      is preserved by Kalshi on /portfolio/orders so rebuild_trades_from_api()
+        #      can recover which strategy placed each fill even after bot_trades.json
+        #      is wiped by Render's ephemeral filesystem.
+        #   2. Idempotency — Kalshi treats client_order_id as an idempotency key:
+        #      "If an order with this client_order_id has already been placed, this
+        #      request will be idempotent and return the existing order." Using a
+        #      deterministic id keyed on (strategy, ticker, date) means a repeat call
+        #      within the same day (from a retry, clock-boundary re-fire, or other
+        #      race) CANNOT create a duplicate fill server-side. Previously this used
+        #      a fresh uuid4 per call, which bypassed idempotency entirely and let
+        #      bugs like the 15-min-boundary dedup clear generate real duplicate
+        #      fills on Kalshi.
+        prefix          = (strategy_tag or "UNK")[:3].upper()
+        date_tag        = now_et().strftime("%Y%m%d")
+        client_order_id = f"{prefix}-{ticker}-{date_tag}"
         order = {
             "ticker": ticker,
             "action": "buy",
@@ -2150,9 +2161,23 @@ class KalshiBot:
         while True:
             try:
                 self.run_once()
-                # Clear traded set every 15 min
-                if int(time.time()) % 900 < POLL_INTERVAL:
-                    self.traded_this_market.clear()
+                # Prune traded_this_market to tickers that are STILL ACTIVE.
+                #
+                # Previously: `if int(time.time()) % 900 < POLL_INTERVAL: clear()`,
+                # which wiped the set for the first few seconds of every :00/:15/:30/:45
+                # boundary. But Kalshi 15-min markets settle on those same boundaries
+                # and the next window opens — meaning a market purchased at 8:29:55
+                # (still ~15m of remaining life) got its dedup entry wiped at 8:30:00
+                # and was re-traded at 8:30:05. That race produced actual duplicate
+                # fills on Kalshi (same target, same size, same cost, paired in history).
+                #
+                # Market-list pruning is self-correcting: Kalshi stops returning a
+                # ticker once its window settles, so intersecting against the most
+                # recent active market set drops only truly-gone markets and never
+                # exposes a still-tradeable ticker to a re-entry.
+                active_tickers = {m.get("ticker") for m in (self._last_markets or [])}
+                if active_tickers:
+                    self.traded_this_market.intersection_update(active_tickers)
                 # Resolve settled trades + back-fill fill timestamps every 60s
                 if time.time() - _last_resolve >= 60:
                     try:
