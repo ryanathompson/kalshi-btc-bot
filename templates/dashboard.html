@@ -344,6 +344,7 @@
     .pill-snp    { background: rgba(63,185,80,.1);  color: var(--green);  }
     .pill-win    { background: rgba(63,185,80,.12);  color: var(--green);  }
     .pill-loss   { background: rgba(248,81,73,.12);  color: var(--red);    }
+    .pill-nofill { background: rgba(139,148,158,.12); color: var(--muted); }
     .pill-dry    { background: rgba(210,153,34,.1);  color: var(--yellow); }
 
     .pos-num { color: var(--green); }
@@ -1663,11 +1664,19 @@
     tbody.innerHTML = trades.map(t => {
       const stratPill  = pill(t.strategy, {LAG:'lag',CONSENSUS:'con',SNIPER:'snp'}[t.strategy]||'con');
       const sidePill   = pill(t.side?.toUpperCase(), t.side === 'yes' ? 'yes' : 'no');
-      const resultPill = pill(t.result, t.result === 'WIN' ? 'win' : 'loss');
+      // NO_FILL: order submitted but Kalshi never matched — neither a win
+      // nor a loss, render with a neutral muted pill instead of red.
+      const resultClass = t.result === 'WIN'    ? 'win'
+                        : t.result === 'LOSS'   ? 'loss'
+                        : t.result === 'NO_FILL'? 'nofill'
+                        : 'loss';
+      const resultPill = pill(t.result, resultClass);
       const pnl = t.pnl;
-      const pnlStr = pnl != null
-        ? `<span class="${pnl >= 0 ? 'pos-num' : 'neg-num'}">${pnl >= 0 ? '+' : ''}${fmt$(pnl)}</span>`
-        : '—';
+      const pnlStr = t.result === 'NO_FILL'
+        ? `<span class="muted">$0.00</span>`
+        : (pnl != null
+            ? `<span class="${pnl >= 0 ? 'pos-num' : 'neg-num'}">${pnl >= 0 ? '+' : ''}${fmt$(pnl)}</span>`
+            : '—');
       return `<tr>
         <td class="muted">${t.ts_short || '—'}</td>
         <td>${stratPill}</td>
