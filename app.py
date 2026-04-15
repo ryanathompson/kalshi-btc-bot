@@ -22,7 +22,7 @@ from dotenv import load_dotenv
 from bot import (
     KalshiBot, KalshiClient, load_private_key, load_trades, POLL_INTERVAL,
     resolve_trades, start_keep_alive, rebuild_trades_from_api, dedup_trades,
-    ET, now_et, today_et, parse_trade_ts,
+    ET, now_et, today_et, parse_trade_ts, is_positioned,
     KELLY_ENABLED, KELLY_FRACTION, AUTOSCORE_ENABLED,
     DISAGREEMENT_GATING, EARLY_EXIT_ENABLED,
     CHEAP_CONTRACT_PRICE, CHEAP_CONTRACT_MAX_STAKE,
@@ -71,10 +71,12 @@ _bot   = None   # KalshiBot instance (set once the thread starts successfully)
 
 def _strat_stats(trades, name=None):
     """Return stats dict for settled trades. name=None â all strategies."""
+    # NO_FILL trades (order placed but Kalshi never matched) are excluded
+    # from stats — no position was held, so win-rate / ROI should ignore them.
     if name:
-        subset = [t for t in trades if t.get("result") and t.get("strategy") == name]
+        subset = [t for t in trades if is_positioned(t) and t.get("strategy") == name]
     else:
-        subset = [t for t in trades if t.get("result")]
+        subset = [t for t in trades if is_positioned(t)]
 
     if not subset:
         return None
@@ -131,7 +133,9 @@ def _entry_price_stats(trades, strategy=None):
         b["wr"]     = None
 
     for t in trades:
-        if not t.get("result"):
+        # Only include trades that actually held a position — NO_FILL would
+        # pollute both the band's trade count and its "losses" count.
+        if not is_positioned(t):
             continue
         if strategy and t.get("strategy") != strategy:
             continue
@@ -146,7 +150,7 @@ def _entry_price_stats(trades, strategy=None):
                 b["trades"] += 1
                 if t["result"] == "WIN":
                     b["wins"] += 1
-                else:
+                else:  # LOSS (NO_FILL already excluded above)
                     b["losses"] += 1
                 break
 
@@ -190,7 +194,10 @@ def _pnl_points(trades):
     """
     settled = []
     for t in trades:
-        if not t.get("result"):
+        # NO_FILL trades have pnl=0 but never actually moved the portfolio —
+        # including them would add flat steps to the sparkline at times
+        # nothing actually happened.
+        if not is_positioned(t):
             continue
         if t.get("pnl") is None:
             continue

@@ -1003,29 +1003,148 @@ def close_trade_by_early_exit(ticker, side, count, entry_cents, exit_cents,
     return False
 
 
+def is_positioned(t):
+    """True if the trade resulted in a real held position (WIN or LOSS).
+
+    NO_FILL trades are logged locally for observability — the bot submitted
+    an order but Kalshi returned no matching fills — but they should be
+    excluded from win-rate, ROI, and win/loss counts because no capital was
+    at risk and no outcome was realized. Use this helper wherever stats
+    assume a binary WIN/LOSS universe.
+    """
+    return t.get("result") in ("WIN", "LOSS")
+
+
 def resolve_trades(client):
-    """Check settled markets and update trade outcomes."""
+    """
+    Mark settled trades with their outcome and realized P/L.
+
+    Previously this trusted the locally-logged `dollars` / `price` / `count`
+    (copied from the strategy's placement *intent*) and computed synthetic
+    P/L from the market result alone. That produced phantom +$X WINs on
+    orders that Kalshi never filled — e.g. the bot logged a 22-contract
+    @ 22¢ order, Kalshi rejected or matched zero, the YES market settled,
+    and resolve marked it a $17.16 WIN even though no position was ever
+    held.
+
+    This version reconciles against `/portfolio/fills` before assigning a
+    result:
+
+      * No fill rows for this order_id → `result = "NO_FILL"`, `pnl = 0`
+        (position never existed; market outcome is irrelevant).
+      * One or more fills → aggregate partials, compute `filled_count`
+        and `filled_dollars` from Kalshi's real numbers, then set P/L as
+        `filled_count − filled_dollars` on WIN (each winning contract
+        pays $1) or `−filled_dollars` on LOSS.
+
+    Dry-run records and legacy records without an `order_id` fall back to
+    the old intent-based calc since there's nothing to reconcile against.
+    """
     trades = load_trades()
     changed = 0
+
+    # Batch-fetch fills once per resolve pass and index by order_id. We
+    # paginate a bit so long-running pending trades (e.g. after a Render
+    # restart) can still be reconciled; in steady state the first page
+    # covers everything that settled since the previous 60s tick.
+    fills_by_order = {}
+    cursor = None
+    for _ in range(5):  # cap at ~1000 fills
+        params = {"limit": 200}
+        if cursor:
+            params["cursor"] = cursor
+        try:
+            resp = client.get("/portfolio/fills", params=params)
+        except Exception as e:
+            print(f"[resolve] Fills fetch error: {e}", flush=True)
+            break
+        for f in resp.get("fills") or []:
+            oid = f.get("order_id")
+            if oid:
+                fills_by_order.setdefault(oid, []).append(f)
+        cursor = resp.get("cursor")
+        if not cursor:
+            break
+
     for t in trades:
         if t.get("result"):
             continue
+
         mkt = client.get_market(t["ticker"])
         if not mkt:
             continue
-        result = mkt.get("result")
-        if not result:
+        outcome = mkt.get("result")
+        if not outcome:
             continue
-        t["outcome"] = result
-        won = (t["side"] == result)
+
+        # ── dry-run + legacy records: old intent-based calc ──────────
+        # These records have no real Kalshi order_id to join against
+        # (dry runs never placed an order; legacy trades predate the
+        # order_id field). The best we can do is treat the logged size
+        # as the filled size.
+        is_dry   = bool(t.get("dry_run"))
+        order_id = t.get("order_id")
+        if is_dry or not order_id:
+            t["outcome"] = outcome
+            won          = (t["side"] == outcome)
+            t["result"]  = "WIN" if won else "LOSS"
+            price        = (t.get("price") or 0) / 100
+            size         = t.get("dollars") or 0
+            if won and price > 0:
+                t["pnl"] = round(size / price * (1 - price), 2)
+            else:
+                t["pnl"] = -round(size, 2)
+            changed += 1
+            continue
+
+        # ── live path: reconcile against real Kalshi fills ───────────
+        order_fills = fills_by_order.get(order_id, [])
+
+        # Aggregate across partial fills on this order_id.
+        side        = t["side"]
+        price_key   = "yes_price_dollars" if side == "yes" else "no_price_dollars"
+        total_count = 0.0
+        total_cost  = 0.0
+        for f in order_fills:
+            # Kalshi sometimes exposes fractional fills under count_fp; fall
+            # back to count (integer) for older responses.
+            try:
+                c = float(f.get("count_fp") or f.get("count") or 0)
+            except (TypeError, ValueError):
+                c = 0.0
+            try:
+                px = float(f.get(price_key) or 0)
+            except (TypeError, ValueError):
+                px = 0.0
+            total_count += c
+            total_cost  += c * px
+
+        # Record what actually filled so the dashboard / analysis scripts
+        # can see it without re-querying Kalshi.
+        t["filled_count"]   = (int(total_count)
+                               if total_count == int(total_count)
+                               else round(total_count, 4))
+        t["filled_dollars"] = round(total_cost, 2)
+        t["outcome"]        = outcome
+
+        if total_count <= 0:
+            # Order was submitted but never matched — no position was held.
+            # pnl stays at 0 and downstream helpers (is_positioned) exclude
+            # it from win-rate / ROI.
+            t["result"] = "NO_FILL"
+            t["pnl"]    = 0
+            changed += 1
+            continue
+
+        won = (side == outcome)
         t["result"] = "WIN" if won else "LOSS"
-        price = t["price"] / 100
-        size  = t["dollars"]
         if won:
-            t["pnl"] = round(size / price * (1 - price), 2)
+            # Each winning contract pays $1; cost was total_cost.
+            t["pnl"] = round(total_count * 1.0 - total_cost, 2)
         else:
-            t["pnl"] = -round(size, 2)
+            t["pnl"] = -round(total_cost, 2)
         changed += 1
+
     if changed:
         with open(LOG_FILE, "w") as f:
             json.dump(trades, f, indent=2)
@@ -1100,7 +1219,9 @@ def update_fill_times(client):
 
 def print_stats():
     trades = load_trades()
-    settled = [t for t in trades if t.get("result")]
+    # Exclude NO_FILL from stats — they never held a position, so win-rate /
+    # ROI calcs would be distorted if we included them.
+    settled = [t for t in trades if is_positioned(t)]
     if not settled:
         print(Fore.YELLOW + "No settled trades yet.")
         return
@@ -1184,7 +1305,10 @@ class StrategyScorer:
         if cached and (now - cached[2]) < self._cache_ttl:
             return cached[0], cached[1]
         trades = load_trades()
-        settled = [t for t in trades if t.get("result") and t.get("strategy") == strategy_name]
+        # NO_FILL trades shouldn't influence auto-scoring: no capital at risk,
+        # no outcome. is_positioned() filters them out of win-rate / ROI.
+        settled = [t for t in trades
+                   if is_positioned(t) and t.get("strategy") == strategy_name]
         recent = settled[-self.window:]
         if len(recent) < self.min_trades:
             self._cache[strategy_name] = (100.0, 1.0, now)
@@ -1217,7 +1341,8 @@ class StrategyScorer:
     def get_rolling_win_rate(self, strategy_name, mode=None):
         """Get rolling win rate for Kelly updates. None = use priors."""
         trades = load_trades()
-        settled = [t for t in trades if t.get("result") and t.get("strategy") == strategy_name]
+        settled = [t for t in trades
+                   if is_positioned(t) and t.get("strategy") == strategy_name]
         if mode:
             settled = [t for t in settled if mode in (t.get("reason") or "")]
         recent = settled[-self.window:]
