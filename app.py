@@ -588,6 +588,326 @@ def api_reconcile():
 
 
 # ────────────────────────────────────────────────────────────
+# SELF-SERVE ANALYSIS REPORT — /api/report/last24h and /report/last24h
+# ────────────────────────────────────────────────────────────
+# Pre-aggregates everything a reviewer would compute by hand from
+# /api/status history: strategy splits, price-band breakdown, STRONG flag
+# effect, top winners/losers, and recent run. Window defaults to 24h but
+# accepts ?hours=N. Returns JSON from /api/report/last24h, markdown from
+# /report/last24h (browser-friendly; paste straight into chat).
+
+def _build_report(hours: int = 24) -> dict:
+    """Aggregate last `hours` of history into a structured report dict.
+
+    Pulls from load_trades() — same source as /api/status — so the numbers
+    match what the live dashboard shows. Excludes dry-run trades.
+    """
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+    cutoff  = now_utc - datetime.timedelta(hours=hours)
+    cutoff_ms = int(cutoff.timestamp() * 1000)
+
+    raw = [t for t in load_trades() if not t.get("dry_run")]
+
+    # Filter to window
+    trades = []
+    for t in raw:
+        ms = _to_epoch_ms(t.get("timestamp"))
+        if ms is not None and ms >= cutoff_ms:
+            trades.append(t)
+
+    # Overall + per-strategy stats (reuse existing helpers)
+    overall   = _strat_stats(trades) or {}
+    consensus = _strat_stats(trades, "CONSENSUS") or {}
+    sniper    = _strat_stats(trades, "SNIPER")    or {}
+    lag       = _strat_stats(trades, "LAG")       or {}
+
+    # Price bands — window-scoped, not cumulative
+    bands     = _entry_price_stats(trades)
+    bands_con = _entry_price_stats(trades, "CONSENSUS")
+    bands_snp = _entry_price_stats(trades, "SNIPER")
+
+    # STRONG-flag effect on CONSENSUS (STRONG x1.5 momentum boost)
+    con_settled = [t for t in trades
+                   if t.get("strategy") == "CONSENSUS" and is_positioned(t)]
+    def _pack(subset):
+        if not subset:
+            return {"trades": 0, "wins": 0, "losses": 0, "wr": None, "pnl": 0.0}
+        wins = sum(1 for t in subset if t.get("result") == "WIN")
+        pnl  = sum(t.get("pnl") or 0 for t in subset)
+        return {
+            "trades": len(subset),
+            "wins":   wins,
+            "losses": len(subset) - wins,
+            "wr":     round(wins / len(subset) * 100, 1),
+            "pnl":    round(pnl, 2),
+        }
+    strong_flag = {
+        "with_strong":    _pack([t for t in con_settled
+                                 if "STRONG" in (t.get("reason") or "")]),
+        "without_strong": _pack([t for t in con_settled
+                                 if "STRONG" not in (t.get("reason") or "")]),
+    }
+
+    # Cheap-cap effect (CHEAP_CAP applied on this specific trade)
+    cheap_capped = [t for t in trades
+                    if is_positioned(t)
+                    and "CHEAP_CAP" in (t.get("reason") or "")]
+
+    # Top winners / losers by PnL
+    settled_with_pnl = [t for t in trades
+                        if is_positioned(t) and t.get("pnl") is not None]
+    def _compact(t):
+        return {
+            "strategy":  t.get("strategy"),
+            "ticker":    t.get("ticker"),
+            "side":      t.get("side"),
+            "price":     t.get("price"),
+            "pnl":       round(t.get("pnl") or 0, 2),
+            "result":    t.get("result"),
+            "timestamp": t.get("timestamp"),
+            "reason":    t.get("reason"),
+        }
+    top_winners = sorted(settled_with_pnl, key=lambda t: t.get("pnl") or 0,
+                         reverse=True)[:5]
+    top_losers  = sorted(settled_with_pnl, key=lambda t: t.get("pnl") or 0)[:5]
+
+    # Last 10 trades chronologically (most recent first)
+    def _sort_key(t):
+        ms = _to_epoch_ms(t.get("timestamp"))
+        return ms if ms is not None else -1
+    recent = sorted(trades, key=_sort_key, reverse=True)[:10]
+
+    # Notable runs: longest streak of consecutive losses in settled trades
+    settled_sorted = sorted([t for t in trades if is_positioned(t)],
+                            key=_sort_key)
+    longest_loss_streak = 0
+    current_loss_streak = 0
+    streak_start_ts = None
+    streak_range = None
+    for t in settled_sorted:
+        if t.get("result") == "LOSS":
+            if current_loss_streak == 0:
+                streak_start_ts = t.get("timestamp")
+            current_loss_streak += 1
+            if current_loss_streak > longest_loss_streak:
+                longest_loss_streak = current_loss_streak
+                streak_range = (streak_start_ts, t.get("timestamp"))
+        else:
+            current_loss_streak = 0
+
+    # v2 counters (idle features surface here for quick-look)
+    v2_counters = {}
+    if _bot is not None:
+        v2c = getattr(_bot, "v2_stats", {}) or {}
+        v2_counters = {
+            "disagreements_skipped": v2c.get("disagreements_skipped", 0),
+            "early_exits_triggered": v2c.get("early_exits_triggered", 0),
+            "cheap_caps_applied":    v2c.get("cheap_caps_applied", 0),
+        }
+
+    return {
+        "window": {
+            "hours":      hours,
+            "cutoff_utc": cutoff.isoformat(),
+            "now_utc":    now_utc.isoformat(),
+        },
+        "bot_state": {
+            "balance":     _state.balance,
+            "halted":      _state.halted,
+            "halt_reason": _state.halt_reason,
+            "daily_limit": _state.daily_limit,
+            "started_at":  _state.started_at,
+            "last_cycle":  _state.last_cycle,
+        },
+        "summary":    overall,
+        "by_strategy": {
+            "CONSENSUS": consensus,
+            "SNIPER":    sniper,
+            "LAG":       lag,
+        },
+        "price_bands": {
+            "all":       bands,
+            "CONSENSUS": bands_con,
+            "SNIPER":    bands_snp,
+        },
+        "consensus_strong_flag": strong_flag,
+        "cheap_capped": {
+            "count":      len(cheap_capped),
+            "pnl":        round(sum(t.get("pnl") or 0 for t in cheap_capped), 2),
+            "wins":       sum(1 for t in cheap_capped if t.get("result") == "WIN"),
+            "losses":     sum(1 for t in cheap_capped if t.get("result") == "LOSS"),
+        },
+        "top_winners":         [_compact(t) for t in top_winners],
+        "top_losers":          [_compact(t) for t in top_losers],
+        "recent":              [_compact(t) for t in recent],
+        "longest_loss_streak": {
+            "count": longest_loss_streak,
+            "from":  streak_range[0] if streak_range else None,
+            "to":    streak_range[1] if streak_range else None,
+        },
+        "v2_counters": v2_counters,
+    }
+
+
+@app.route("/api/report/last24h")
+def api_report_last24h():
+    """Self-serve analysis report — JSON. See _build_report for fields."""
+    try:
+        hours = int(request.args.get("hours", "24"))
+        hours = max(1, min(hours, 168))  # clamp 1h to 1 week
+    except ValueError:
+        hours = 24
+    try:
+        return jsonify(_build_report(hours))
+    except Exception as e:
+        app.logger.exception("report build failed")
+        return jsonify({"error": str(e)}), 500
+
+
+def _format_report_md(r: dict) -> str:
+    """Render the report dict as paste-ready markdown."""
+    out = []
+    w = r.get("window", {})
+    bs = r.get("bot_state", {})
+    out.append(f"# Kalshi Bot — Last {w.get('hours', 24)}h Report")
+    out.append("")
+    out.append(f"_Window: {w.get('cutoff_utc', '?')} → {w.get('now_utc', '?')}_")
+    out.append("")
+    out.append(f"Balance **${bs.get('balance')}** · daily limit **${bs.get('daily_limit')}** "
+               f"· halted: **{bs.get('halted')}** · last cycle: {bs.get('last_cycle')}")
+    out.append("")
+
+    s = r.get("summary") or {}
+    out.append("## Summary")
+    out.append("")
+    out.append(f"- Attempts: **{s.get('attempted', 0)}** "
+               f"(filled {s.get('total', 0)}, "
+               f"no-fills {s.get('no_fills', 0)}, "
+               f"fill rate {s.get('fill_rate', 0)}%)")
+    out.append(f"- Record: **{s.get('wins', 0)}W / {s.get('losses', 0)}L** "
+               f"(WR {s.get('wr', 0)}%)")
+    out.append(f"- Wagered: **${s.get('wagered', 0)}** · "
+               f"PnL: **${s.get('pnl', 0)}** · ROI: **{s.get('roi', 0)}%**")
+    out.append("")
+
+    out.append("## By strategy")
+    out.append("")
+    out.append("| Strategy | Attempts | Filled | W/L | WR | PnL | ROI |")
+    out.append("| --- | --- | --- | --- | --- | --- | --- |")
+    for name in ("CONSENSUS", "SNIPER", "LAG"):
+        st = (r.get("by_strategy") or {}).get(name) or {}
+        if not st:
+            continue
+        out.append(
+            f"| {name} | {st.get('attempted', 0)} | {st.get('total', 0)} | "
+            f"{st.get('wins', 0)}/{st.get('losses', 0)} | "
+            f"{st.get('wr', 0)}% | ${st.get('pnl', 0)} | {st.get('roi', 0)}% |"
+        )
+    out.append("")
+
+    out.append("## Price bands (window-scoped)")
+    out.append("")
+    for label, key in [("All strategies", "all"),
+                       ("CONSENSUS", "CONSENSUS"),
+                       ("SNIPER",    "SNIPER")]:
+        bands = (r.get("price_bands") or {}).get(key) or []
+        if not any(b.get("trades") for b in bands):
+            continue
+        out.append(f"**{label}**")
+        out.append("")
+        out.append("| Band | Trades | W/L | WR |")
+        out.append("| --- | --- | --- | --- |")
+        for b in bands:
+            if not b.get("trades"):
+                continue
+            wr = f"{b.get('wr')}%" if b.get('wr') is not None else "—"
+            out.append(f"| {b.get('label')} | {b.get('trades')} | "
+                       f"{b.get('wins')}/{b.get('losses')} | {wr} |")
+        out.append("")
+
+    sf = r.get("consensus_strong_flag") or {}
+    if (sf.get("with_strong", {}).get("trades") or
+        sf.get("without_strong", {}).get("trades")):
+        out.append("## CONSENSUS STRONG-flag effect")
+        out.append("")
+        out.append("| Variant | Trades | W/L | WR | PnL |")
+        out.append("| --- | --- | --- | --- | --- |")
+        for tag, label in [("with_strong", "STRONG x1.5"),
+                           ("without_strong", "no STRONG")]:
+            sub = sf.get(tag) or {}
+            if not sub.get("trades"):
+                continue
+            wr = f"{sub.get('wr')}%" if sub.get('wr') is not None else "—"
+            out.append(f"| {label} | {sub.get('trades')} | "
+                       f"{sub.get('wins')}/{sub.get('losses')} | {wr} | "
+                       f"${sub.get('pnl')} |")
+        out.append("")
+
+    cc = r.get("cheap_capped") or {}
+    if cc.get("count"):
+        out.append(f"## CHEAP_CAP triggered: **{cc['count']}** trades "
+                   f"({cc.get('wins', 0)}W / {cc.get('losses', 0)}L, "
+                   f"net PnL **${cc.get('pnl', 0)}**)")
+        out.append("")
+
+    ls = r.get("longest_loss_streak") or {}
+    if ls.get("count", 0) >= 3:
+        out.append(f"## Longest loss streak: **{ls['count']}** consecutive "
+                   f"(from {ls.get('from')} → {ls.get('to')})")
+        out.append("")
+
+    def _dump_trades(title, rows):
+        if not rows:
+            return
+        out.append(f"## {title}")
+        out.append("")
+        out.append("| Time | Strategy | Ticker | Side | Price | PnL | Reason |")
+        out.append("| --- | --- | --- | --- | --- | --- | --- |")
+        for t in rows:
+            reason = (t.get("reason") or "")[:80].replace("|", "/")
+            out.append(
+                f"| {t.get('timestamp', '')[:19]} | {t.get('strategy')} | "
+                f"{t.get('ticker')} | {t.get('side')} | {t.get('price')}c | "
+                f"${t.get('pnl')} | {reason} |"
+            )
+        out.append("")
+
+    _dump_trades("Top 5 winners", r.get("top_winners") or [])
+    _dump_trades("Top 5 losers",  r.get("top_losers")  or [])
+    _dump_trades("Most recent 10", r.get("recent")     or [])
+
+    v2 = r.get("v2_counters") or {}
+    if v2:
+        out.append("## v2 counters (session lifetime, not window)")
+        out.append("")
+        out.append(f"- disagreements_skipped: **{v2.get('disagreements_skipped', 0)}**")
+        out.append(f"- early_exits_triggered: **{v2.get('early_exits_triggered', 0)}**")
+        out.append(f"- cheap_caps_applied:    **{v2.get('cheap_caps_applied', 0)}**")
+        out.append("")
+
+    return "\n".join(out)
+
+
+@app.route("/report/last24h")
+def report_last24h_view():
+    """Browser-friendly markdown view of the report — copy/paste into chat."""
+    try:
+        hours = int(request.args.get("hours", "24"))
+        hours = max(1, min(hours, 168))
+    except ValueError:
+        hours = 24
+    try:
+        md = _format_report_md(_build_report(hours))
+    except Exception as e:
+        app.logger.exception("report render failed")
+        return f"Error building report: {e}", 500
+    # Serve as plain text so it's trivially pasteable. Browsers render
+    # plain text raw; markdown formatting is preserved verbatim.
+    from flask import Response
+    return Response(md, mimetype="text/plain; charset=utf-8")
+
+
+# ────────────────────────────────────────────────────────────
 # ANALYSIS PAGE — wraps backtest_consensus.py for non-technical use
 # ─────────────────────────────────────────────────────────────
 #

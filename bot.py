@@ -278,6 +278,14 @@ EARLY_EXIT_MAX_LOSS_PCT  = float(os.getenv("EARLY_EXIT_MAX_LOSS_PCT", "0.10"))  
 CHEAP_CONTRACT_PRICE     = int(''.join(c for c in os.getenv("CHEAP_CONTRACT_PRICE", "45") if c.isdigit()) or "45")  # cents threshold
 CHEAP_CONTRACT_MAX_STAKE = float(os.getenv("CHEAP_CONTRACT_MAX_STAKE", "2.0"))  # max $ on cheap entries
 
+# [v2.2] Hard floor on entry price — sub-25c band was bleeding badly in live trading.
+# Cumulative 24h analysis (docs/trade_analysis_2026-04-15.md):
+#   - Overall 1-24c:    4 wins / 65 trades = 6.2% WR (need ~10%+ to break even)
+#   - SNIPER 1-24c:     0 wins / 12 trades = 0% WR (LOTTERY backtest was wrong)
+#   - CONSENSUS 1-24c:  2 wins / 31 trades = 6.5% WR
+# Applied to BOTH strategies before any sizing logic. Set to 0 via env to disable.
+MIN_ENTRY_PRICE_CENTS = int(''.join(c for c in os.getenv("MIN_ENTRY_PRICE_CENTS", "25") if c.isdigit()) or "25")
+
 
 # ═══════════════════════════════════════════════════════════
 # KEEP-ALIVE (prevents Render free-tier spin-down)
@@ -1761,6 +1769,12 @@ class ConsensusStrategy:
             return None
 
         price_cents = int(price_dollars * 100)
+
+        # [v2.2] Hard floor — skip sub-25c entries (live WR 6.5%, bleed too fast).
+        # See MIN_ENTRY_PRICE_CENTS config block for rationale.
+        if price_cents < MIN_ENTRY_PRICE_CENTS:
+            return None
+
         # [v2.0] Kelly sizing with strong-momentum and auto-score multipliers
         base_stake = self.stake * (CONSENSUS_STRONG_STAKE_MULT if strong_momentum else 1.0)
         kelly_stake = None
@@ -1894,8 +1908,15 @@ class SniperStrategy:
         price_dollars = yes_px if side == "yes" else no_px
         price_cents   = int(price_dollars * 100)
 
+        # [v2.2] Hard floor — skip sub-25c entries (LOTTERY live WR 0/12).
+        # See MIN_ENTRY_PRICE_CENTS config block for rationale.
+        if price_cents < MIN_ENTRY_PRICE_CENTS:
+            return None
+
         # -- Entry price zone filter ----------------------------------------
         # LOTTERY: 1-10c | CONVICTION: 50-55c | KILL ZONE: 11-49c, 56c+
+        # NOTE: LOTTERY branch is now unreachable given the 25c floor above,
+        # but kept for clarity and for restoring if MIN_ENTRY_PRICE_CENTS=0.
         if 1 <= price_cents <= 10:
             mode  = "LOTTERY"
             stake = self.lottery_stake
