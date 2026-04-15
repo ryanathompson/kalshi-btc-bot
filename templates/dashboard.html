@@ -479,6 +479,17 @@
     }
     .pnl-tracker-value.pos { color: var(--green); }
     .pnl-tracker-value.neg { color: var(--red); }
+    .pnl-tracker-pct {
+      font-size: 14px;
+      font-weight: 600;
+      letter-spacing: -.01em;
+      line-height: 1.1;
+      margin-top: 2px;
+      color: var(--muted);
+    }
+    .pnl-tracker-pct.pos { color: var(--green); }
+    .pnl-tracker-pct.neg { color: var(--red); }
+    .pnl-tracker-pct:empty { display: none; }
     .pnl-tracker-range {
       font-size: 11px;
       color: var(--muted);
@@ -709,6 +720,7 @@
           <span id="pnl-trend-arrow">▲</span> Profit/Loss
         </div>
         <div class="pnl-tracker-value" id="pnl-trend-value">—</div>
+        <div class="pnl-tracker-pct"   id="pnl-trend-pct"></div>
         <div class="pnl-tracker-range" id="pnl-trend-range">Past Day</div>
       </div>
       <div class="pnl-tracker-tabs" role="tablist" aria-label="Profit/Loss range">
@@ -1036,6 +1048,7 @@
     const valueEl  = document.getElementById('pnl-trend-value');
     const arrowEl  = document.getElementById('pnl-trend-arrow');
     const rangeEl  = document.getElementById('pnl-trend-range');
+    const pctEl    = document.getElementById('pnl-trend-pct');
     const emptyEl  = document.getElementById('pnl-spark-empty');
 
     rangeEl.textContent = _rangeLabel(range);
@@ -1047,6 +1060,7 @@
       valueEl.className   = 'pnl-tracker-value';
       arrowEl.textContent = '•';
       arrowEl.style.color = 'var(--muted)';
+      if (pctEl) { pctEl.textContent = ''; pctEl.className = 'pnl-tracker-pct'; }
       emptyEl.classList.add('active');
       _drawSpark([]);
       return;
@@ -1068,6 +1082,24 @@
     arrowEl.style.color = headline > 0 ? 'var(--green)'
                         : headline < 0 ? 'var(--red)'
                         : 'var(--muted)';
+
+    // ROI for the window: the server returns it as a fraction (0.382 = 38.2%).
+    // Put it directly under the dollar figure so the scale of the P/L is
+    // obvious — "+$48" means different things on $50 vs $500 of cost basis.
+    if (pctEl) {
+      const roi = w.roi;  // fraction, or 0 / null when no trades
+      const wagered = w.wagered || 0;
+      if (roi == null || wagered === 0) {
+        pctEl.textContent = '';
+        pctEl.className   = 'pnl-tracker-pct';
+      } else {
+        const pct     = roi * 100;
+        const pctSign = pct >= 0 ? '+' : '';
+        pctEl.textContent = `${pctSign}${pct.toFixed(2)}%`;
+        pctEl.className   = 'pnl-tracker-pct ' +
+          (pct > 0 ? 'pos' : pct < 0 ? 'neg' : '');
+      }
+    }
 
     // Build the sparkline from the pnl_points feed, filtered to the
     // same server-provided window. Start the series at startMs with
@@ -1423,11 +1455,28 @@
     function vcls(id, c)   { document.getElementById(id).className = 'pnl-value ' + c; }
     function scls(id, c)   { document.getElementById(id).className = 'pnl-sub ' + c; }
 
-    // Trades
+    // Trades + fill rate.  NO_FILL records are orders we submitted that
+    // Kalshi never matched — surfacing the fill rate lets us watch for
+    // liquidity issues / aggressive pricing at a glance.
+    const attempted = s ? s.attempted : null;
+    const noFills   = s ? s.no_fills  : null;
+    const fillRate  = s ? s.fill_rate : null;
     set('pnl-trades', totalTrades || '—');
-    set('pnl-trades-sub', openCount
-      ? `<span class="open-lbl">${openCount} open</span>`
-      : (totalSettled ? `${totalSettled} settled` : ''));
+    const parts = [];
+    if (openCount) parts.push(`<span class="open-lbl">${openCount} open</span>`);
+    if (totalSettled) parts.push(`${totalSettled} settled`);
+    if (fillRate != null && attempted) {
+      const color = fillRate >= 95 ? 'var(--green)'
+                  : fillRate >= 80 ? 'var(--yellow)'
+                  : 'var(--red)';
+      const noFillTxt = noFills ? ` (${noFills} unfilled)` : '';
+      parts.push(
+        `<span style="color:${color}" title="Percent of submitted orders that actually matched a fill on Kalshi. `
+        + `NO_FILL = order placed but Kalshi returned no fill (rejected, priced through book, canceled, etc.)">`
+        + `${fillRate}% fill${noFillTxt}</span>`
+      );
+    }
+    set('pnl-trades-sub', parts.join(' · '));
 
     // Won / Lost
     if (wins != null) {

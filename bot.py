@@ -1166,6 +1166,123 @@ def resolve_trades(client):
     return changed
 
 
+def reconcile_trades(client):
+    """
+    Re-verify already-resolved trades against real Kalshi fills and flip
+    any that never actually filled from WIN/LOSS to NO_FILL.
+
+    resolve_trades() only touches records where result is None, so trades
+    that were marked WIN/LOSS by the pre-reconciliation logic stay stuck
+    with phantom P/L even after the fix shipped. This pass sweeps them:
+
+      * For each non-dry-run trade with an order_id and result in
+        (WIN, LOSS), fetch its actual fills.
+      * If no fills → flip to result="NO_FILL", pnl=0.
+      * If fills exist but the logged `filled_*` fields are absent
+        (pre-fix records), back-fill them from the real numbers and
+        recompute pnl on the true basis.
+
+    Safe to run on a healthy log — it only rewrites records whose
+    ground-truth state contradicts their logged state.
+
+    Returns a dict with counts: {"flipped_to_nofill", "recomputed", "scanned"}.
+    """
+    trades = load_trades()
+
+    # Batch-fetch fills once (same strategy as resolve_trades).
+    fills_by_order = {}
+    cursor = None
+    for _ in range(10):  # cap at ~2000 fills to be thorough on first run
+        params = {"limit": 200}
+        if cursor:
+            params["cursor"] = cursor
+        try:
+            resp = client.get("/portfolio/fills", params=params)
+        except Exception as e:
+            print(f"[reconcile] Fills fetch error: {e}", flush=True)
+            break
+        for f in resp.get("fills") or []:
+            oid = f.get("order_id")
+            if oid:
+                fills_by_order.setdefault(oid, []).append(f)
+        cursor = resp.get("cursor")
+        if not cursor:
+            break
+
+    flipped   = 0
+    recomputed = 0
+    scanned   = 0
+    changed   = False
+
+    for t in trades:
+        if t.get("dry_run"):
+            continue
+        if t.get("result") not in ("WIN", "LOSS"):
+            continue
+        order_id = t.get("order_id")
+        if not order_id:
+            continue
+        scanned += 1
+
+        order_fills = fills_by_order.get(order_id, [])
+        side        = t.get("side")
+        price_key   = "yes_price_dollars" if side == "yes" else "no_price_dollars"
+        total_count = 0.0
+        total_cost  = 0.0
+        for f in order_fills:
+            try:
+                c = float(f.get("count_fp") or f.get("count") or 0)
+            except (TypeError, ValueError):
+                c = 0.0
+            try:
+                px = float(f.get(price_key) or 0)
+            except (TypeError, ValueError):
+                px = 0.0
+            total_count += c
+            total_cost  += c * px
+
+        if total_count <= 0:
+            # Logged as WIN/LOSS but Kalshi shows no fills — phantom.
+            t["result"]         = "NO_FILL"
+            t["pnl"]            = 0
+            t["filled_count"]   = 0
+            t["filled_dollars"] = 0.0
+            flipped += 1
+            changed = True
+            continue
+
+        # Back-fill real fill data if pre-fix resolve logged only intent.
+        if "filled_count" not in t or "filled_dollars" not in t:
+            t["filled_count"]   = (int(total_count)
+                                   if total_count == int(total_count)
+                                   else round(total_count, 4))
+            t["filled_dollars"] = round(total_cost, 2)
+            # Recompute P/L on the real basis — the old synthetic calc
+            # used the intent price/count which can differ from fills.
+            won = (t.get("result") == "WIN")
+            if won:
+                t["pnl"] = round(total_count * 1.0 - total_cost, 2)
+            else:
+                t["pnl"] = -round(total_cost, 2)
+            recomputed += 1
+            changed = True
+
+    if changed:
+        with open(LOG_FILE, "w") as f:
+            json.dump(trades, f, indent=2)
+
+    print(
+        f"[reconcile] scanned={scanned} flipped_to_NO_FILL={flipped} "
+        f"recomputed={recomputed}",
+        flush=True,
+    )
+    return {
+        "scanned":           scanned,
+        "flipped_to_nofill": flipped,
+        "recomputed":        recomputed,
+    }
+
+
 def update_fill_times(client):
     """
     Back-fill fill_timestamp + fill_latency_s on any live-logged trades that

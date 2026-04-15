@@ -21,7 +21,8 @@ from dotenv import load_dotenv
 
 from bot import (
     KalshiBot, KalshiClient, load_private_key, load_trades, POLL_INTERVAL,
-    resolve_trades, start_keep_alive, rebuild_trades_from_api, dedup_trades,
+    resolve_trades, reconcile_trades, start_keep_alive,
+    rebuild_trades_from_api, dedup_trades,
     ET, now_et, today_et, parse_trade_ts, is_positioned,
     KELLY_ENABLED, KELLY_FRACTION, AUTOSCORE_ENABLED,
     DISAGREEMENT_GATING, EARLY_EXIT_ENABLED,
@@ -72,14 +73,34 @@ _bot   = None   # KalshiBot instance (set once the thread starts successfully)
 def _strat_stats(trades, name=None):
     """Return stats dict for settled trades. name=None â all strategies."""
     # NO_FILL trades (order placed but Kalshi never matched) are excluded
-    # from stats — no position was held, so win-rate / ROI should ignore them.
+    # from win/loss/ROI stats — no position was held — but we track them
+    # separately so the dashboard can surface a fill-rate metric.
     if name:
-        subset = [t for t in trades if is_positioned(t) and t.get("strategy") == name]
+        all_attempted = [t for t in trades if t.get("strategy") == name
+                         and t.get("result") in ("WIN", "LOSS", "NO_FILL")]
     else:
-        subset = [t for t in trades if is_positioned(t)]
+        all_attempted = [t for t in trades
+                         if t.get("result") in ("WIN", "LOSS", "NO_FILL")]
+    subset = [t for t in all_attempted if is_positioned(t)]
+
+    if not all_attempted:
+        return None
+
+    no_fills   = sum(1 for t in all_attempted if t.get("result") == "NO_FILL")
+    attempted  = len(all_attempted)
+    fill_rate  = (len(subset) / attempted * 100) if attempted else 0
 
     if not subset:
-        return None
+        # Edge case: every attempt was NO_FILL. Still return a dict so the
+        # dashboard can surface the fill-rate warning rather than showing
+        # an empty-state.
+        return {
+            "wins": 0, "losses": 0, "total": 0,
+            "wr": 0, "wwr": 0, "wagered": 0, "pnl": 0, "roi": 0,
+            "no_fills":  no_fills,
+            "attempted": attempted,
+            "fill_rate": round(fill_rate, 1),
+        }
 
     wins    = sum(1 for t in subset if t["result"] == "WIN")
     total   = len(subset)
@@ -97,6 +118,11 @@ def _strat_stats(trades, name=None):
         "wagered": round(wagered, 2),
         "pnl":     round(pnl, 2),
         "roi":     round(pnl / wagered * 100, 2) if wagered else 0,
+        # Fill rate: how many orders we submitted actually held a position.
+        # NO_FILL counts as an "attempt" but not a positioned trade.
+        "no_fills":  no_fills,
+        "attempted": attempted,
+        "fill_rate": round(fill_rate, 1),
     }
 
 
@@ -375,12 +401,16 @@ def api_rebuild():
         rebuild_trades_from_api(_bot.client)
         dedup_trades()
         n_resolved = resolve_trades(_bot.client)
+        # Re-verify already-resolved records against real fills. Flips
+        # phantom WINs (logged by pre-fix resolve logic) to NO_FILL.
+        recon = reconcile_trades(_bot.client)
         after = len(load_trades())
         return jsonify({
-            "trades_before":  before,
-            "trades_after":   after,
-            "trades_added":   after - before,
-            "resolved":       n_resolved,
+            "trades_before":    before,
+            "trades_after":     after,
+            "trades_added":     after - before,
+            "resolved":         n_resolved,
+            "reconciled":       recon,
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
