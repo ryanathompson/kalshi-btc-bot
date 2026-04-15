@@ -286,6 +286,15 @@ CHEAP_CONTRACT_MAX_STAKE = float(os.getenv("CHEAP_CONTRACT_MAX_STAKE", "2.0"))  
 # Applied to BOTH strategies before any sizing logic. Set to 0 via env to disable.
 MIN_ENTRY_PRICE_CENTS = int(''.join(c for c in os.getenv("MIN_ENTRY_PRICE_CENTS", "25") if c.isdigit()) or "25")
 
+# [v2.4] CONSENSUS STRONG-only gate. In a choppy-BTC regime on 2026-04-15,
+# non-STRONG CONSENSUS was the dominant bleed:
+#   - CON STRONG    (x1.5 momentum): 14 trades, 50.0% WR, PnL  -$0.73  (breakeven)
+#   - CON no-STRONG:                 26 trades, 23.1% WR, PnL -$53.62  (100% of CON loss)
+# With this flag enabled (default), CONSENSUS returns no signal unless
+# strong_momentum is True. Set CONSENSUS_STRONG_ONLY=false via env to
+# restore the pre-v2.4 behavior and re-admit non-STRONG CONSENSUS entries.
+CONSENSUS_STRONG_ONLY = os.getenv("CONSENSUS_STRONG_ONLY", "true").lower() == "true"
+
 
 # ═══════════════════════════════════════════════════════════
 # KEEP-ALIVE (prevents Render free-tier spin-down)
@@ -1746,6 +1755,13 @@ class ConsensusStrategy:
         # signal is in the band where live wins concentrated. Apply a stake
         # multiplier and extend the price cap by CONSENSUS_STRONG_PRICE_BONUS.
         strong_momentum = abs(btc_change) >= STRONG_MOMENTUM_THRESHOLD
+
+        # [v2.4] STRONG-only gate — skip when non-STRONG momentum is all we
+        # have. Live data showed non-STRONG CON at 23% WR vs STRONG CON at
+        # 50% WR; non-STRONG was the whole bleed. See CONSENSUS_STRONG_ONLY
+        # config block for the underlying numbers.
+        if CONSENSUS_STRONG_ONLY and not strong_momentum:
+            return None
 
         # ── [v1.1] Dynamic price cap ──────────────────────────
         # Base threshold of 0.45, scales up to CONSENSUS_MAX_PRICE with

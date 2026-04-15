@@ -27,6 +27,7 @@ from bot import (
     KELLY_ENABLED, KELLY_FRACTION, AUTOSCORE_ENABLED,
     DISAGREEMENT_GATING, EARLY_EXIT_ENABLED,
     CHEAP_CONTRACT_PRICE, CHEAP_CONTRACT_MAX_STAKE,
+    MIN_ENTRY_PRICE_CENTS, CONSENSUS_STRONG_ONLY,
     StrategyScorer,
 )
 
@@ -362,6 +363,8 @@ def api_status():
             "early_exit_enabled": EARLY_EXIT_ENABLED,
             "cheap_cap_price": CHEAP_CONTRACT_PRICE,
             "cheap_cap_max_stake": CHEAP_CONTRACT_MAX_STAKE,
+            "min_entry_price_cents": MIN_ENTRY_PRICE_CENTS,
+            "consensus_strong_only": CONSENSUS_STRONG_ONLY,
         },
         "strategy_scores": strategy_scores,
         "v2_counters": v2_counters,
