@@ -263,7 +263,7 @@ DISAGREEMENT_GATING = os.getenv("DISAGREEMENT_GATING", "true").lower() == "true"
 EARLY_EXIT_ENABLED       = os.getenv("EARLY_EXIT_ENABLED", "true").lower() == "true"
 EARLY_EXIT_REVERSAL_PCT  = float(os.getenv("EARLY_EXIT_REVERSAL_PCT", "0.003"))  # 0.3% BTC reversal
 EARLY_EXIT_MIN_HOLD_S    = int(os.getenv("EARLY_EXIT_MIN_HOLD_S", "120"))        # 2 min minimum hold
-EARLY_EXIT_MAX_LOSS_PCT  = float(os.getenv("EARLY_EXIT_MAX_LOSS_PCT", "0.10"))   # exit if can recover 90%+
+EARLY_EXIT_MAX_LOSS_PCT  = float(os.getenv("EARLY_EXIT_MAX_LOSS_PCT", "0.40"))   # [v2.5] widened from 0.10 — see docs/v2_feature_audit_2026-04-15.md
 
 # Cheap-contract stake cap: lottery-ticket entries (<25c) keep their
 # asymmetric upside but stakes are capped to limit bleed during dry
