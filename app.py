@@ -28,6 +28,8 @@ from bot import (
     DISAGREEMENT_GATING, EARLY_EXIT_ENABLED,
     CHEAP_CONTRACT_PRICE, CHEAP_CONTRACT_MAX_STAKE,
     MIN_ENTRY_PRICE_CENTS, CONSENSUS_STRONG_ONLY,
+    SNIPER_5M_MIN_MOMENTUM, SNIPER_REQUIRE_60S_CONFIRM,
+    SNIPER_60S_CONFIRM_MIN,
     StrategyScorer,
 )
 
@@ -365,6 +367,10 @@ def api_status():
             "cheap_cap_max_stake": CHEAP_CONTRACT_MAX_STAKE,
             "min_entry_price_cents": MIN_ENTRY_PRICE_CENTS,
             "consensus_strong_only": CONSENSUS_STRONG_ONLY,
+            # [v3.0] SNIPER signal quality filters
+            "sniper_5m_min_momentum": SNIPER_5M_MIN_MOMENTUM,
+            "sniper_require_60s_confirm": SNIPER_REQUIRE_60S_CONFIRM,
+            "sniper_60s_confirm_min": SNIPER_60S_CONFIRM_MIN,
         },
         "strategy_scores": strategy_scores,
         "v2_counters": v2_counters,

@@ -221,7 +221,12 @@ PREV_CHECK_INTERVAL = 60     # only poll settled markets every 60s (not every cy
 
 # Sniper v1.0 tuning — derived from edge analysis of 136 ground-truth fills
 # See analyze_edge.py output for the full data backing these thresholds.
-SNIPER_5M_MIN_MOMENTUM = float(os.getenv("SNIPER_5M_MIN_MOMENTUM", "0.0003"))  # 0.03%
+# [v3.0] Raised from 0.0003 (0.03%) → 0.0006 (0.06%).  Four days of SNIPER-
+# only data (193 fills, 50% WR) showed the 0.03% floor caught noise trades
+# that diluted the edge.  Top-5 winners consistently had 5m moves ≥ 0.04%;
+# losers clustered at the 0.03-0.05% floor.  Doubling the threshold filters
+# the weakest signals.  Override via env: SNIPER_5M_MIN_MOMENTUM=0.0003.
+SNIPER_5M_MIN_MOMENTUM = float(os.getenv("SNIPER_5M_MIN_MOMENTUM", "0.0006"))  # 0.06%
 SNIPER_COOLDOWN        = int(os.getenv("SNIPER_COOLDOWN",   "180"))   # seconds between sniper trades
 # Sniper stake defaults — fall back to MAX_STAKE_PER_TRADE when not explicitly set.
 SNIPER_LOTTERY_STAKE    = float(os.getenv("SNIPER_LOTTERY_STAKE")    or MAX_STAKE_PER_TRADE)
@@ -240,8 +245,14 @@ KELLY_MIN_TRADES    = int(os.getenv("KELLY_MIN_TRADES", "10"))     # need N trad
 # These are used as priors until enough live trades accumulate for
 # rolling stats to take over via StrategyScorer.
 KELLY_PRIORS = {
-    "SNIPER_LOTTERY":    {"win_rate": 0.105, "avg_price": 0.055},  # +4.8pp edge
-    "SNIPER_CONVICTION": {"win_rate": 0.615, "avg_price": 0.525},  # +9.1pp edge
+    "SNIPER_LOTTERY":    {"win_rate": 0.105, "avg_price": 0.055},  # +4.8pp edge (backtest — zone unreachable with 25c floor)
+    # [v3.0] Conviction prior lowered from 0.615 → 0.52.  Four days of live
+    # SNIPER-only data showed 50% WR on 193 fills — the backtest 61.5% WR
+    # was optimistic.  0.52 is a conservative estimate for post-v3-filter WR
+    # (tighter momentum floor + 60s confirm should lift above coin-flip, but
+    # we don't want Kelly oversizing before we prove it).  Rolling stats via
+    # StrategyScorer will override this prior once KELLY_MIN_TRADES fills.
+    "SNIPER_CONVICTION": {"win_rate": 0.52,  "avg_price": 0.525},  # conservative live-adjusted
     "CONSENSUS":         {"win_rate": 0.55,  "avg_price": 0.40},   # conservative prior
     "LAG":               {"win_rate": 0.50,  "avg_price": 0.50},   # structural edge, flat sizing
 }
@@ -294,6 +305,16 @@ MIN_ENTRY_PRICE_CENTS = int(''.join(c for c in os.getenv("MIN_ENTRY_PRICE_CENTS"
 # strong_momentum is True. Set CONSENSUS_STRONG_ONLY=false via env to
 # restore the pre-v2.4 behavior and re-admit non-STRONG CONSENSUS entries.
 CONSENSUS_STRONG_ONLY = os.getenv("CONSENSUS_STRONG_ONLY", "true").lower() == "true"
+
+# [v3.0] 60-second momentum confirmation for SNIPER.
+# The existing 60s check only *blocks* contradictions (60s opposes 5m).
+# This upgrade *requires* positive confirmation: 60s must move in the same
+# direction as 5m above a minimum magnitude.  Without confirmation, many
+# SNIPER entries fire on decaying or stalled momentum that happened to
+# clear 5m threshold but isn't actively continuing — these are coin flips.
+# Set SNIPER_REQUIRE_60S_CONFIRM=false via env to disable.
+SNIPER_REQUIRE_60S_CONFIRM = os.getenv("SNIPER_REQUIRE_60S_CONFIRM", "true").lower() == "true"
+SNIPER_60S_CONFIRM_MIN     = float(os.getenv("SNIPER_60S_CONFIRM_MIN", "0.0001"))  # 0.01% — same direction required
 
 
 # ═══════════════════════════════════════════════════════════
@@ -1917,6 +1938,18 @@ class SniperStrategy:
         if mom_60s is not None and abs(mom_60s) > 0.0003:
             if (mom_5m > 0 and mom_60s < -0.0003) or \
                (mom_5m < 0 and mom_60s > 0.0003):
+                return None
+
+        # [v3.0] 60-second confirmation: require that short-term momentum is
+        # actively moving in the same direction as 5m, not just not-reversed.
+        # Many losing entries fired on stale/decaying momentum where 60s was
+        # near zero — technically not contradicting but not confirming either.
+        if SNIPER_REQUIRE_60S_CONFIRM:
+            if mom_60s is None:
+                return None  # no 60s data = can't confirm
+            same_direction = (mom_5m > 0 and mom_60s > SNIPER_60S_CONFIRM_MIN) or \
+                             (mom_5m < 0 and mom_60s < -SNIPER_60S_CONFIRM_MIN)
+            if not same_direction:
                 return None
 
         # -- Direction from 5-min momentum ----------------------------------
