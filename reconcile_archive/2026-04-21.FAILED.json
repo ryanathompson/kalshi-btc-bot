@@ -1,0 +1,9 @@
+{
+  "date": "2026-04-21",
+  "status": "FAILED",
+  "reason": "Claude in Chrome extension not reachable; Chrome MCP unavailable across multiple retries (initial + 10s + 30s waits).",
+  "endpoint": "https://kalshi-btc-bot-jxul.onrender.com/api/reconcile",
+  "fallback_attempted": false,
+  "note": "Per scheduled-task spec: egress proxy blocks onrender.com, so curl/WebFetch fallback is not permitted. SIXTH consecutive miss (after 2026-04-16 through 2026-04-20). Chrome extension has now been offline for 6 straight days — nightly reconcile snapshot is broken until user restores the Claude in Chrome extension (Chrome open + extension signed in). No interactive recovery possible from a scheduled run.",
+  "captured_at_utc": "2026-04-22T04:17:41Z"
+}
