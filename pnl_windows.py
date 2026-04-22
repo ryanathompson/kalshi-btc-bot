@@ -22,8 +22,11 @@ Bucketing rules
 All windows are calendar-aligned to America/New_York (ET, with DST).
 
   * 1D  = [midnight ET today, now]
+  * 3D  = [midnight ET 2 days ago, now]  (3 calendar days)
   * 1W  = [midnight ET 6 days ago, now]  (i.e. today + 6 prior full days = 7 calendar days)
-  * 1M  = [midnight ET 29 days ago, now] (30 calendar days)
+  * 30D = [midnight ET 29 days ago, now] (30 calendar days; formerly labeled 1M)
+  * 60D = [midnight ET 59 days ago, now] (60 calendar days)
+  * 90D = [midnight ET 89 days ago, now] (90 calendar days)
   * ALL = [epoch, now]                   (every settled trade ever)
 
 A trade belongs to a window iff its *settlement* happened inside the window.
@@ -34,8 +37,8 @@ and matches the semantics RiskManager uses.
 
 Sanity invariant
 ----------------
-Calendar windows are strictly nested: any trade in 1D is also in 1W is also
-in 1M. Therefore:
+Calendar windows are strictly nested: any trade in 1D is also in 3D is also
+in 1W is also in 30D is also in 60D is also in 90D is also in ALL. Therefore:
 
     pnl_1w == pnl_1d + sum(pnl of trades in [1W_start, 1D_start))
 
@@ -51,6 +54,14 @@ The "1D loss > 1W loss" concern that motivated this module cannot itself
 violate these invariants (it's consistent with the math when intermediate
 days were net positive). So any invariant failure is a real bug, separate
 from that concern.
+
+Window order (for monotonicity checks and client rendering)
+-----------------------------------------------------------
+WINDOW_ORDER is the canonical left-to-right order for tabs in the dashboard
+AND the expected nesting order for the invariant checker. Changing this
+tuple requires updating:
+  * templates/dashboard.html   — tab button list + _rangeLabel map
+  * app.py:_filter_trades_by_range — window-key validator
 """
 from __future__ import annotations
 
@@ -62,6 +73,24 @@ from zoneinfo import ZoneInfo
 
 ET = ZoneInfo("America/New_York")
 log = logging.getLogger(__name__)
+
+# Canonical tab order — sync with dashboard.html. Changing this requires
+# updating the HTML tab list and the JS range-label / BTC-granularity map.
+WINDOW_ORDER: tuple[str, ...] = ("1D", "3D", "1W", "30D", "60D", "90D", "ALL")
+
+# Number of full ET-calendar days each window spans, anchored at today.
+# "None" means unbounded on the start side (i.e. ALL goes back to epoch).
+# The value N means the window starts at midnight ET (today - (N-1)), so
+# the window contains exactly N calendar days including today.
+_WINDOW_DAYS: dict[str, Optional[int]] = {
+    "1D":  1,
+    "3D":  3,
+    "1W":  7,
+    "30D": 30,
+    "60D": 60,
+    "90D": 90,
+    "ALL": None,
+}
 
 
 # ---- timestamp parsing ------------------------------------------------------
@@ -112,20 +141,26 @@ class Window:
 
 
 def build_windows(now: datetime) -> dict[str, Window]:
-    """Build the 1D/1W/1M/ALL window boundaries anchored at 'now'.
+    """Build the 1D/3D/1W/30D/60D/90D/ALL window boundaries anchored at 'now'.
 
     'now' must be an ET-aware datetime. 'ALL' uses a sentinel start far in
     the past (unix epoch 0 in ET) — any real trade will fall inside it.
+
+    Window definitions are driven by _WINDOW_DAYS so the set of windows can
+    be extended without touching this function's body.
     """
     assert now.tzinfo is not None, "now must be timezone-aware"
     now_et = now.astimezone(ET)
     today = now_et.date()
-    return {
-        "1D": Window("1D", _midnight_et(today), now_et),
-        "1W": Window("1W", _midnight_et(today - timedelta(days=6)), now_et),
-        "1M": Window("1M", _midnight_et(today - timedelta(days=29)), now_et),
-        "ALL": Window("ALL", datetime(1970, 1, 1, tzinfo=ET), now_et),
-    }
+    out: dict[str, Window] = {}
+    for label in WINDOW_ORDER:
+        days = _WINDOW_DAYS[label]
+        if days is None:
+            start = datetime(1970, 1, 1, tzinfo=ET)
+        else:
+            start = _midnight_et(today - timedelta(days=days - 1))
+        out[label] = Window(label, start, now_et)
+    return out
 
 
 # ---- aggregation ------------------------------------------------------------
@@ -178,8 +213,8 @@ def compute_windows(
 
     Returns
     -------
-    dict with keys 1D, 1W, 1M, ALL → WindowStats dicts, plus '_invariants'
-    containing the result of check_invariants().
+    dict with keys 1D, 3D, 1W, 30D, 60D, 90D, ALL → WindowStats dicts, plus
+    '_invariants' containing the result of check_invariants().
     """
     if now is None:
         now = datetime.now(ET)
@@ -198,7 +233,8 @@ def compute_windows(
         parsed.append((dt, t))
     parsed.sort(key=lambda pt: pt[0])
 
-    # Bucket into windows — strictly nested so a trade in 1D is also in 1W/1M/ALL.
+    # Bucket into windows — strictly nested so a trade in 1D is also in
+    # 3D/1W/30D/60D/90D/ALL (see check_invariants for the monotonicity test).
     stats: dict[str, WindowStats] = {}
     for label, win in windows.items():
         in_win = [(dt, t) for dt, t in parsed if win.contains(dt)]
@@ -211,9 +247,12 @@ def compute_windows(
         roi = (pnl / wagered) if wagered else 0.0
         days_covered = len({dt.date() for dt, _ in in_win})
 
-        # Per-day breakdown for the 1W and 1M windows
+        # Per-day breakdown for the multi-day windows (everything except
+        # 1D, which is already a single day, and ALL, which is unbounded
+        # and would produce an unbounded list). Consumers that only want
+        # a short breakdown can truncate on the client.
         daily_pnl: list[dict] = []
-        if label in ("1W", "1M"):
+        if label in ("3D", "1W", "30D", "60D", "90D"):
             by_day: dict[date, dict] = {}
             for dt, t in in_win:
                 d = dt.date()
@@ -253,13 +292,11 @@ def check_invariants(stats: dict[str, WindowStats]) -> dict:
     win/loss distribution. Any failure is a real bug, not a math artifact.
 
     Invariants:
-      I1: trades_1D <= trades_1W <= trades_1M <= trades_ALL
-      I2: wins_1D   <= wins_1W   <= wins_1M   <= wins_ALL
-      I3: losses_1D <= losses_1W <= losses_1M <= losses_ALL
-      I4: wagered_1D <= wagered_1W <= wagered_1M <= wagered_ALL
-      I5: days_covered is monotonic too
+      I1..In: for each tracked field, the value is monotonically non-decreasing
+      across WINDOW_ORDER (1D <= 3D <= 1W <= 30D <= 60D <= 90D <= ALL).
+      Fields checked: trades, wins, losses, wagered, days_covered.
     """
-    order = ("1D", "1W", "1M", "ALL")
+    order = WINDOW_ORDER
     failures: list[str] = []
 
     def mono(field: str) -> None:
@@ -348,15 +385,54 @@ def _selftest() -> None:
             pnl=0, wins=wins, losses=losses, trades=trades,
             wagered=0, win_rate=0, roi=0,
         )
+    # Build a fully-populated invalid dict with every window required by
+    # WINDOW_ORDER so check_invariants doesn't KeyError before it finds
+    # the real problem (wins monotonic violation between 1D and 3D).
     bad = {
         "1D":  _ws("1D",  wins=5, losses=0, trades=5),
+        "3D":  _ws("3D",  wins=3, losses=0, trades=3),
         "1W":  _ws("1W",  wins=3, losses=0, trades=3),
-        "1M":  _ws("1M",  wins=3, losses=0, trades=3),
+        "30D": _ws("30D", wins=3, losses=0, trades=3),
+        "60D": _ws("60D", wins=3, losses=0, trades=3),
+        "90D": _ws("90D", wins=3, losses=0, trades=3),
         "ALL": _ws("ALL", wins=3, losses=0, trades=3),
     }
     inv = check_invariants(bad)
     assert not inv["ok"], "invariant checker should flag this"
     assert any("wins" in f for f in inv["failures"])
+
+    # Scenario 7: new windows exist and are ordered correctly
+    r = compute_windows([], now=now)
+    assert list(r.keys())[:len(WINDOW_ORDER)] == list(WINDOW_ORDER), \
+        f"window keys not in WINDOW_ORDER: {list(r.keys())}"
+    for label in WINDOW_ORDER:
+        assert label in r, f"missing window {label}"
+        assert r[label]["pnl"] == 0.0
+        assert r[label]["trades"] == 0
+
+    # Scenario 8: monotonic nesting across the full window set
+    # 1 trade today, 1 trade 5 days ago, 1 trade 45 days ago, 1 trade 75 days
+    # ago, 1 trade 200 days ago. Verify each window contains the expected
+    # count and that invariants hold.
+    def _days_ago(n: int) -> str:
+        d = (now - timedelta(days=n)).astimezone(ET)
+        return d.isoformat()
+    trades = [
+        {"timestamp": _days_ago(0),   "pnl": 1, "result": "WIN", "dollars": 10},
+        {"timestamp": _days_ago(5),   "pnl": 1, "result": "WIN", "dollars": 10},
+        {"timestamp": _days_ago(45),  "pnl": 1, "result": "WIN", "dollars": 10},
+        {"timestamp": _days_ago(75),  "pnl": 1, "result": "WIN", "dollars": 10},
+        {"timestamp": _days_ago(200), "pnl": 1, "result": "WIN", "dollars": 10},
+    ]
+    r = compute_windows(trades, now=now)
+    assert r["1D"]["trades"]  == 1, r["1D"]
+    assert r["3D"]["trades"]  == 1, r["3D"]   # 5-day-ago trade is NOT in 3D
+    assert r["1W"]["trades"]  == 2, r["1W"]   # today + 5d ago
+    assert r["30D"]["trades"] == 2, r["30D"]  # still just those two
+    assert r["60D"]["trades"] == 3, r["60D"]  # adds the 45d-ago trade
+    assert r["90D"]["trades"] == 4, r["90D"]  # adds the 75d-ago trade
+    assert r["ALL"]["trades"] == 5, r["ALL"]
+    assert r["_invariants"]["ok"], r["_invariants"]
 
     print("pnl_windows._selftest: all scenarios passed")
 

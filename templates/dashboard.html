@@ -505,6 +505,57 @@
       gap: 2px;
       align-self: flex-start;
     }
+
+    /* ── GLOBAL DATE-RANGE TOOLBAR ──
+       Sits at the top of <main> and governs every panel below. Sticky so
+       it stays visible as the user scrolls through strategy cards / trade
+       history. Reuses .pnl-tab pill styling to match the old in-card look. */
+    .range-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      flex-wrap: wrap;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 10px 16px;
+      /* Stick just below the site header (header is z-index 100, sticky at top:0).
+         Header height = 12px padding + 24px h1 line-height + 12px padding + 1px border ≈ 49px.
+         We pin to 48px so the toolbar kisses the bottom of the header once
+         the user starts scrolling. Nudge if the header padding ever changes. */
+      position: sticky;
+      top: 48px;
+      z-index: 50;
+    }
+    .range-bar-title {
+      display: flex;
+      align-items: baseline;
+      gap: 10px;
+      min-width: 0;
+    }
+    .range-bar-eyebrow {
+      font-size: 10px;
+      letter-spacing: .14em;
+      text-transform: uppercase;
+      color: var(--muted);
+      font-weight: 600;
+    }
+    .range-bar-label {
+      font-size: 14px;
+      font-weight: 700;
+      color: var(--text);
+      letter-spacing: -.01em;
+    }
+    .range-bar-tabs {
+      display: inline-flex;
+      background: rgba(255,255,255,.03);
+      border: 1px solid var(--border);
+      border-radius: 9px;
+      padding: 3px;
+      gap: 2px;
+      flex-wrap: wrap;
+    }
     .pnl-tab {
       background: transparent;
       border: none;
@@ -713,7 +764,31 @@
   <div id="error-banner"></div>
   <div id="halt-banner"></div>
 
-  <!-- PROFIT / LOSS TRACKER (time-windowed w/ sparkline) -->
+  <!-- GLOBAL DATE-RANGE TOOLBAR
+       Governs every panel below — P/L tracker, stats bar, strategy cards,
+       v2 Edge Engine counters, Win Rate by Entry Price, and trade history.
+       The v2 Edge Engine *config* row (Kelly Sizing, Auto-Scoring) and the
+       in-memory session counters (Disagreements Skipped, Early Exits,
+       Cheap Caps) are intentionally not windowed — they are settings /
+       session state, not derivable from the trade log. -->
+  <div class="range-bar" id="range-bar" role="toolbar" aria-label="Dashboard date range">
+    <div class="range-bar-title">
+      <span class="range-bar-eyebrow">Showing</span>
+      <span class="range-bar-label" id="range-bar-label">Past Day</span>
+    </div>
+    <div class="range-bar-tabs" role="tablist">
+      <button class="pnl-tab active" type="button" data-range="1D">1D</button>
+      <button class="pnl-tab"        type="button" data-range="3D">3D</button>
+      <button class="pnl-tab"        type="button" data-range="1W">1W</button>
+      <button class="pnl-tab"        type="button" data-range="30D">30D</button>
+      <button class="pnl-tab"        type="button" data-range="60D">60D</button>
+      <button class="pnl-tab"        type="button" data-range="90D">90D</button>
+      <button class="pnl-tab"        type="button" data-range="ALL">ALL</button>
+    </div>
+  </div>
+
+  <!-- PROFIT / LOSS TRACKER (time-windowed w/ sparkline)
+       Range selector lives in the global toolbar above. -->
   <div class="pnl-tracker" id="pnl-tracker">
     <div class="pnl-tracker-top">
       <div class="pnl-tracker-left">
@@ -723,12 +798,6 @@
         <div class="pnl-tracker-value" id="pnl-trend-value">—</div>
         <div class="pnl-tracker-pct"   id="pnl-trend-pct"></div>
         <div class="pnl-tracker-range" id="pnl-trend-range">Past Day</div>
-      </div>
-      <div class="pnl-tracker-tabs" role="tablist" aria-label="Profit/Loss range">
-        <button class="pnl-tab active" type="button" data-range="1D">1D</button>
-        <button class="pnl-tab"        type="button" data-range="1W">1W</button>
-        <button class="pnl-tab"        type="button" data-range="1M">1M</button>
-        <button class="pnl-tab"        type="button" data-range="ALL">ALL</button>
       </div>
     </div>
     <div class="pnl-spark-wrap">
@@ -997,28 +1066,54 @@
     return `<span class="pill pill-${cls}">${text}</span>`;
   }
 
+  // ── Dashboard range (ALL sections obey this) ──────────────────────
+  // Single source of truth for the selected date window. The top-of-page
+  // toolbar writes to it; refresh() echoes it on every /api/status call
+  // so the server-side filter stays in sync. _pnlTracker.range mirrors
+  // this so the old P/L-rendering code can stay untouched.
+  const VALID_RANGES = ['1D','3D','1W','30D','60D','90D','ALL'];
+  let _dashRange = '1D';
+
   // ── Profit/Loss tracker (calendar-aligned ET, server-computed) ────
   // `windows` holds the most recent /api/pnl_windows response, which is
   // the source of truth for window boundaries AND headline values. We
   // still use `points` (the pnl_points feed from /api/status) to draw
   // the sparkline, filtered to the same server-provided window.
-  const _pnlTracker = { range: '1D', points: [], windows: null, btc: null };
+  const _pnlTracker = { range: _dashRange, points: [], windows: null, btc: null };
   const _btcCache   = Object.create(null);  // cacheKey -> {fetchedAt, data}
 
   function _rangeLabel(r) {
-    return ({'1D':'Past Day','1W':'Past Week','1M':'Past Month','ALL':'All Time'})[r] || '';
+    return ({
+      '1D':  'Past Day',
+      '3D':  'Past 3 Days',
+      '1W':  'Past Week',
+      '30D': 'Past 30 Days',
+      '60D': 'Past 60 Days',
+      '90D': 'Past 90 Days',
+      'ALL': 'All Time',
+    })[r] || '';
   }
 
   // Fetch BTC candles from Coinbase's public Exchange API (CORS-enabled).
   // Returns chronologically-sorted [{ts, v}]; throws on failure so caller
   // can render without the overlay. Cached for 60s per range.
+  //
+  // Granularity bands are chosen to stay under Coinbase's 300-candle-per-
+  // request cap for every window we offer:
+  //   1D  (~1d)   @ 15min  →   ~96 candles
+  //   3D  (~3d)  @ 15min  →  ~288 candles
+  //   1W  (~7d)  @ 1hr    →  ~168 candles
+  //   30D         @ 6hr    →  ~120 candles
+  //   60D         @ 6hr    →  ~240 candles
+  //   90D         @ 1day   →   ~90 candles   (6hr would hit 360, over cap)
+  //   ALL         @ 1day   →  clamped to ~299 days by maxSpanMs below
   async function _fetchBtcHistory(startMs, endMs, rangeKey) {
     const span = (endMs - startMs) / 1000;
     let granularity;
-    if      (span <=  2*86400) granularity =   900;  // 1D -> 15min
-    else if (span <=  8*86400) granularity =  3600;  // 1W -> 1hr
-    else if (span <= 40*86400) granularity = 21600;  // 1M -> 6hr
-    else                       granularity = 86400;  // ALL -> 1day
+    if      (span <=  3.5*86400) granularity =   900;  // 1D, 3D -> 15min
+    else if (span <=    8*86400) granularity =  3600;  // 1W     -> 1hr
+    else if (span <=   62*86400) granularity = 21600;  // 30D,60D -> 6hr
+    else                         granularity = 86400;  // 90D,ALL -> 1day
 
     // Coinbase caps at 300 candles per request; clamp start if necessary
     const maxSpanMs  = 299 * granularity * 1000;
@@ -1424,15 +1519,24 @@
     cap.addEventListener('mouseleave', () => { hover.style.opacity = '0'; });
   }
 
-  // Wire up tab buttons once on load
+  // Wire up the global range toolbar once on load.
+  // Clicking a range flips _dashRange and re-runs refresh() — that
+  // re-fetches /api/status?range=<key> so strategy cards, stats bar,
+  // price-band table, and trade history all re-scope server-side.
+  // _pnlTracker mirrors the same range so renderPnlTracker keeps working.
   document.addEventListener('DOMContentLoaded', () => {
     document.querySelectorAll('.pnl-tab').forEach(btn => {
       btn.addEventListener('click', () => {
+        const r = btn.dataset.range;
+        if (!VALID_RANGES.includes(r)) return;
         document.querySelectorAll('.pnl-tab').forEach(b => b.classList.remove('active'));
         btn.classList.add('active');
-        _pnlTracker.range = btn.dataset.range;
-        _pnlTracker.btc   = null;  // force re-fetch for new range
-        renderPnlTracker();
+        _dashRange         = r;
+        _pnlTracker.range  = r;
+        _pnlTracker.btc    = null;  // force re-fetch for new range
+        const lbl = document.getElementById('range-bar-label');
+        if (lbl) lbl.textContent = _rangeLabel(r);
+        refresh();                  // re-query server with new ?range=
       });
     });
   });
@@ -1695,8 +1799,19 @@
   async function refresh() {
     try {
       const dryCheck = document.getElementById('include-dry-run');
-      const dryParam = dryCheck && dryCheck.checked ? '?include_dry_run=1' : '';
-      const r   = await fetch('/api/status' + dryParam);
+      // Build the querystring once so /api/status and /api/pnl_windows
+      // stay in sync on both the dry-run flag and the selected range.
+      const params = new URLSearchParams();
+      if (dryCheck && dryCheck.checked) params.set('include_dry_run', '1');
+      if (_dashRange && _dashRange !== 'ALL') params.set('range', _dashRange);
+      const statusQs = params.toString() ? '?' + params.toString() : '';
+      // /api/pnl_windows always returns every window — the selection is
+      // applied client-side in renderPnlTracker — so only dry-run needs
+      // to be forwarded here.
+      const windowsParams = new URLSearchParams();
+      if (dryCheck && dryCheck.checked) windowsParams.set('include_dry_run', '1');
+      const windowsQs = windowsParams.toString() ? '?' + windowsParams.toString() : '';
+      const r   = await fetch('/api/status' + statusQs);
       const d   = await r.json();
 
       // Mode badge
@@ -1767,12 +1882,15 @@
       }
 
       // P&L tracker (calendar-windowed card w/ sparkline)
-      // - points come from /api/status (sparkline data)
+      // - points come from /api/status (sparkline data; always full-range
+      //   regardless of the selected window, so the sparkline's window-
+      //   start offset calculation has history to work from)
       // - window boundaries + headline totals come from /api/pnl_windows
       //   which is fetched in parallel just below so both update together
       _pnlTracker.points = d.pnl_points || [];
+      _pnlTracker.range  = _dashRange;  // keep the P/L card in sync with the toolbar
       try {
-        const rw = await fetch('/api/pnl_windows' + dryParam);
+        const rw = await fetch('/api/pnl_windows' + windowsQs);
         if (rw.ok) _pnlTracker.windows = await rw.json();
       } catch (e) {
         console.warn('pnl_windows fetch failed', e);

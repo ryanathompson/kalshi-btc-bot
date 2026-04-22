@@ -33,7 +33,7 @@ from bot import (
     StrategyScorer,
 )
 
-from pnl_windows import compute_windows
+from pnl_windows import compute_windows, build_windows, WINDOW_ORDER
 
 from backtest_consensus import (
     fetch_history, run_sweep, interpret_sweep,
@@ -249,6 +249,34 @@ def _pnl_points(trades):
     return points
 
 
+def _filter_trades_by_range(trades, range_key: str):
+    """Return trades whose ET-aware timestamp falls inside the given window.
+
+    Valid range_key values are defined by pnl_windows.WINDOW_ORDER
+    (1D, 3D, 1W, 30D, 60D, 90D, ALL). Unknown keys fall through to ALL
+    so a typo in the querystring never silently empties the dashboard.
+
+    Note: this filters by trade timestamp (when it was placed) rather
+    than settlement time. We do the same thing in pnl_windows.py so the
+    two windowed views stay consistent — see that module's header for
+    why the placed-at timestamp is a fine proxy for "when P&L booked".
+    """
+    if range_key == "ALL" or range_key not in WINDOW_ORDER:
+        return list(trades)
+    win = build_windows(now_et())[range_key]
+    out = []
+    for t in trades:
+        dt = parse_trade_ts(t.get("timestamp"))
+        if dt is None:
+            # Unparseable timestamps are dropped from windowed views on
+            # purpose — they'd double-count against ALL otherwise, and we
+            # already log the warning in compute_windows.
+            continue
+        if win.contains(dt.astimezone(ET)):
+            out.append(t)
+    return out
+
+
 # âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 # FLASK ROUTES
 # âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
@@ -271,6 +299,19 @@ def api_status():
     if not include_dry:
         trades = [t for t in trades if not t.get("dry_run")]
 
+    # Global date-range filter. The dashboard's top-of-page tab bar sends
+    # this on every refresh; it scopes everything that's derivable from
+    # settled trade history (strategy stats, price-band win rates, total
+    # aggregate). Kept separate from the per-trade `trades` list below so
+    # pnl_points can remain full-range (the sparkline needs pre-window
+    # history to compute the window-start offset).
+    range_key = (request.args.get("range") or "ALL").upper()
+    if range_key not in WINDOW_ORDER:
+        range_key = "ALL"
+    scoped = _filter_trades_by_range(trades, range_key) if range_key != "ALL" else trades
+
+    # Open trades are not scoped — a position opened before the window is
+    # still open *now* and needs to be visible on the dashboard.
     open_trades = [t for t in trades if not t.get("result")]
 
     # Sort by parsed epoch ms, not raw string — bot-logged (ET-aware),
@@ -280,7 +321,7 @@ def api_status():
         ms = _to_epoch_ms(t.get("timestamp"))
         return ms if ms is not None else -1
     history = sorted(
-        [t for t in trades if t.get("result")],
+        [t for t in scoped if t.get("result")],
         key=_sort_key,
         reverse=True,
     )[:100]
@@ -345,17 +386,27 @@ def api_status():
         "balance":      _state.balance,
         "open_trades":  [fmt_open(t) for t in open_trades],
         "history":      [fmt_hist(t) for t in history],
-        "lag_stats":    _strat_stats(trades, "LAG"),
-        "con_stats":    _strat_stats(trades, "CONSENSUS"),
-        "snp_stats":    _strat_stats(trades, "SNIPER"),
-        "all_stats":    _strat_stats(trades),
+        # Strategy aggregates honor the range filter so the dashboard
+        # cards show stats for the selected window (1D / 3D / 1W / 30D /
+        # 60D / 90D / ALL).
+        "lag_stats":    _strat_stats(scoped, "LAG"),
+        "con_stats":    _strat_stats(scoped, "CONSENSUS"),
+        "snp_stats":    _strat_stats(scoped, "SNIPER"),
+        "all_stats":    _strat_stats(scoped),
+        # pnl_points is intentionally NOT scoped — the sparkline uses the
+        # full chronological series and computes the "window start" offset
+        # from points that pre-date the window boundary. Scoping here
+        # would zero the sparkline at window start instead of rendering
+        # the window-relative cumulative P/L correctly.
         "pnl_points":   _pnl_points(trades),
-        # Win-rate breakdown by entry price band — used by the dashboard
-        # widget. We expose both an "all-strategy" view and a CONSENSUS-only
-        # view since the price-band signal is most actionable for Consensus.
-        "entry_price_stats":     _entry_price_stats(trades),
-        "entry_price_stats_con": _entry_price_stats(trades, "CONSENSUS"),
-        "entry_price_stats_snp": _entry_price_stats(trades, "SNIPER"),
+        # Win-rate breakdown by entry price band — windowed so the 1-24c /
+        # 25-39c / 40-55c numbers reflect only the selected period.
+        "entry_price_stats":     _entry_price_stats(scoped),
+        "entry_price_stats_con": _entry_price_stats(scoped, "CONSENSUS"),
+        "entry_price_stats_snp": _entry_price_stats(scoped, "SNIPER"),
+        # Echo the applied range so the client can sanity-check (e.g.
+        # warn if a bad ?range= fell through to ALL).
+        "range":        range_key,
         # [v2.0] Edge Engine configuration and counters
         "v2_features": {
             "kelly_enabled": KELLY_ENABLED,
@@ -457,7 +508,7 @@ def api_reset_halt():
 
 @app.route("/api/pnl_windows")
 def api_pnl_windows():
-    """Windowed P&L for 1D/1W/1M/ALL, calendar-aligned to ET.
+    """Windowed P&L for 1D/3D/1W/30D/60D/90D/ALL, calendar-aligned to ET.
 
     Replaces the client-side rolling-window math in dashboard.html with
     one server-side computation so (a) the 1D display matches the halt
@@ -488,8 +539,9 @@ def api_pnl_windows():
     try:
         if _bot is not None:
             halted = bool(_bot.risk._halted)
-            for k in ("1D", "1W", "1M", "ALL"):
-                result[k]["halt_active"] = halted
+            for k in WINDOW_ORDER:
+                if k in result:
+                    result[k]["halt_active"] = halted
             if halted:
                 result["_halt_reason"] = _bot.risk._halt_reason
     except Exception:
