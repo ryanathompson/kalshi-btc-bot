@@ -890,19 +890,21 @@ def rebuild_trades_from_api(client):
         # fall back to "RECOVERED" for legacy orders without a prefix.
         recovered_strategy = order_id_to_strategy.get(order_id, "RECOVERED")
         trade = {
-            "strategy":  recovered_strategy,
-            "ticker":    ticker,
-            "side":      side,
-            "price":     price_cents,
-            "count":     int(total_count) if total_count == int(total_count) else total_count,
-            "dollars":   dollars,
-            "reason":    f"Rebuilt from Kalshi API (order {order_id[:8]}...)",
-            "timestamp": ts,
-            "dry_run":   False,
-            "order":     {"order_id": order_id, "recovered": True},
-            "outcome":   outcome,
-            "result":    result,
-            "pnl":       pnl,
+            "strategy":      recovered_strategy,
+            "ticker":        ticker,
+            "side":          side,
+            "price":         price_cents,
+            "count":         int(total_count) if total_count == int(total_count) else total_count,
+            "dollars":       dollars,
+            "reason":        f"Rebuilt from Kalshi API (order {order_id[:8]}...)",
+            "timestamp":     ts,
+            "dry_run":       False,
+            "is_beta":       False,  # Kalshi-sourced fills are always live
+            "beta_model_id": None,
+            "order":         {"order_id": order_id, "recovered": True},
+            "outcome":       outcome,
+            "result":        result,
+            "pnl":           pnl,
         }
         new_trades.append(trade)
 
@@ -1602,10 +1604,12 @@ class LagStrategy:
     Trade:  Buy YES if BTC went up (prices will catch up upward)
             Buy NO  if BTC went down
     """
-    def __init__(self, stake_dollars):
+    def __init__(self, stake_dollars, *, is_beta=False, beta_model_id=None):
         self.stake    = stake_dollars
         self.kelly_mode = "LAG"      # [v2.0] Kelly prior key
         self.name     = "LAG"
+        self.is_beta       = is_beta
+        self.beta_model_id = beta_model_id
         self.last_kalshi_prices = {}  # ticker â (yes, no, timestamp)
 
     def evaluate(self, market, btc_feed, balance=None):
@@ -1689,9 +1693,11 @@ class ConsensusStrategy:
       5. Trade cooldown     â CONSENSUS_COOLDOWN seconds between trades
       6. API throttle       â update_previous polls every PREV_CHECK_INTERVAL, not every cycle
     """
-    def __init__(self, stake_dollars):
+    def __init__(self, stake_dollars, *, is_beta=False, beta_model_id=None):
         self.stake              = stake_dollars
         self.name               = "CONSENSUS"
+        self.is_beta            = is_beta
+        self.beta_model_id      = beta_model_id
         self.last_result        = None   # "yes" or "no"
         self.last_result_time   = 0      # timestamp when last_result was set
         self.last_ticker        = None
@@ -1886,10 +1892,12 @@ class SniperStrategy:
          Too little time = no room for momentum continuation.
     """
 
-    def __init__(self, lottery_stake=None, conviction_stake=None):
+    def __init__(self, lottery_stake=None, conviction_stake=None, *, is_beta=False, beta_model_id=None):
         self.lottery_stake    = lottery_stake or SNIPER_LOTTERY_STAKE
         self.conviction_stake = conviction_stake or SNIPER_CONVICTION_STAKE
         self.name             = "SNIPER"
+        self.is_beta          = is_beta
+        self.beta_model_id    = beta_model_id
         self.last_trade_time  = 0
 
     def evaluate(self, market, btc_feed, mins_left=None, balance=None, score_mult=1.0):
@@ -2167,6 +2175,14 @@ class KalshiBot:
         self.risk      = RiskManager(daily_loss_limit,
                                      gross_daily_loss_limit=gross_daily_loss_limit)
         self.dry       = dry_run
+        # Beta strategy registry. Beta strategies always run dry-run, produce
+        # trade records tagged is_beta=True + beta_model_id=<id>, and do NOT
+        # participate in auto-scoring, disagreement gating, or position
+        # monitoring. Populated in Phase 3 — empty by default.
+        self.beta_strategies      = []
+        # Per-beta-model per-cycle dedup. Separate from self.traded_this_market
+        # so beta open positions don't block live strategies and vice versa.
+        self.beta_traded_by_model = {}  # model_id -> set of tickers
         # [v2.0] New components
         self.scorer    = StrategyScorer()
         self.monitor   = PositionMonitor()
@@ -2186,6 +2202,10 @@ class KalshiBot:
         self.traded_this_market = set()
         try:
             for t in load_trades():
+                # Skip beta trades — they share the market space but live in
+                # their own book, so open beta positions must not block live.
+                if t.get("is_beta"):
+                    continue
                 if not t.get("result") and t.get("ticker"):
                     self.traded_this_market.add(t["ticker"])
             if self.traded_this_market:
@@ -2207,10 +2227,18 @@ class KalshiBot:
             if not order_id:
                 order_id = order_result.get("order_id")
 
+        # Beta signals are ALWAYS dry-run regardless of global self.dry.
+        # Live signals inherit self.dry. This invariant is enforced here so no
+        # caller can accidentally log a beta trade as live.
+        is_beta_signal = bool(signal.get("is_beta"))
+        record_dry_run = True if is_beta_signal else self.dry
+
         record = {
             **signal,
             "timestamp":       now_et().isoformat(),  # placement time (bot-side)
-            "dry_run":         self.dry,
+            "dry_run":         record_dry_run,
+            "is_beta":         is_beta_signal,
+            "beta_model_id":   signal.get("beta_model_id"),
             "order":           order_result,
             "order_id":        order_id,
             "fill_timestamp":  None,   # populated by update_fill_times()
@@ -2224,7 +2252,10 @@ class KalshiBot:
 
     def _print_signal(self, signal, dry):
         color = Fore.CYAN if signal["strategy"] == "LAG" else Fore.MAGENTA
-        tag   = "[DRY]" if dry else "[LIVE]"
+        if signal.get("is_beta"):
+            tag = f"[BETA:{signal.get('beta_model_id','')}]"
+        else:
+            tag = "[DRY]" if dry else "[LIVE]"
         print(
             f"\n{color}âº {signal['strategy']} {tag}{Style.RESET_ALL}  "
             f"{signal['ticker']}  "
@@ -2440,6 +2471,65 @@ class KalshiBot:
                 self.monitor.track(signal, btc_now)
 
             break  # one strategy per market per cycle
+
+        # ─────────────────────────────────────────────────────────
+        # BETA PASS — isolated from live.
+        # ─────────────────────────────────────────────────────────
+        # Beta strategies evaluate independently of the live loop above.
+        # They do NOT participate in disagreement gating, auto-scoring,
+        # position monitoring (early exit), or the shared traded_this_market
+        # dedup set. Each beta model gets its own per-cycle dedup.
+        # Orders are ALWAYS treated as dry-run. If a beta strategy raises,
+        # we log and continue — one bad beta must not halt the live loop.
+        for beta_strategy in self.beta_strategies:
+            model_id = getattr(beta_strategy, "beta_model_id", None) or beta_strategy.name
+            traded = self.beta_traded_by_model.setdefault(model_id, set())
+            for market in markets:
+                ticker = market["ticker"]
+                if ticker in traded:
+                    continue
+
+                # Time remaining check — mirror live pass
+                close_time = market.get("close_time")
+                mins_left = None
+                if close_time:
+                    try:
+                        ct = datetime.datetime.fromisoformat(
+                            close_time.replace("Z", "+00:00")
+                        )
+                        mins_left = (ct - datetime.datetime.now(datetime.timezone.utc)).total_seconds() / 60
+                        if mins_left < 3 or mins_left > 14:
+                            continue
+                    except Exception:
+                        pass
+
+                try:
+                    # Best-effort dispatch: newer beta strategies accept balance
+                    # and mins_left; fall back to a bare signature if not.
+                    try:
+                        signal = beta_strategy.evaluate(
+                            market, self.btc, mins_left=mins_left,
+                            balance=self._balance, score_mult=1.0,
+                        )
+                    except TypeError:
+                        signal = beta_strategy.evaluate(market, self.btc)
+                except Exception as e:
+                    print(Fore.RED + f"  [beta:{model_id}] evaluate error: {e}", flush=True)
+                    continue
+
+                if not signal:
+                    continue
+
+                # Stamp beta provenance on the signal before logging.
+                signal["is_beta"]       = True
+                signal["beta_model_id"] = model_id
+
+                self._print_signal(signal, dry=True)
+                order_result = {"dry_run": True, "reason": "beta"}
+                self._log_signal(signal, order_result)
+                traded.add(ticker)
+                # No break — beta models evaluate all markets each cycle,
+                # subject only to per-model cooldown and per-cycle dedup.
 
         # Status line
         ts         = now_et().strftime("%H:%M:%S")

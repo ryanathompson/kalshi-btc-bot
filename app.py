@@ -303,6 +303,11 @@ def api_status():
     include_dry = request.args.get("include_dry_run", "0") == "1"
     if not include_dry:
         trades = [t for t in trades if not t.get("dry_run")]
+    # Beta filter: main dashboard shows live-only by default. Beta trades are
+    # isolated on /beta/<model_id>. Escape hatch: ?include_beta=1.
+    include_beta = request.args.get("include_beta", "0") == "1"
+    if not include_beta:
+        trades = [t for t in trades if not t.get("is_beta")]
 
     # Global date-range filter. The dashboard's top-of-page tab bar sends
     # this on every refresh; it scopes everything that's derivable from
@@ -531,6 +536,10 @@ def api_pnl_windows():
     include_dry = request.args.get("include_dry_run", "0") == "1"
     if not include_dry:
         trades = [t for t in trades if not t.get("dry_run")]
+    # Beta filter: PnL windows are live-only by default.
+    include_beta = request.args.get("include_beta", "0") == "1"
+    if not include_beta:
+        trades = [t for t in trades if not t.get("is_beta")]
     # Pass bot.py's own parse_trade_ts so the dashboard buckets trades
     # into the same calendar day as the RiskManager halt timer does.
     result = compute_windows(
@@ -704,13 +713,17 @@ def _build_report(hours: int = 24) -> dict:
     """Aggregate last `hours` of history into a structured report dict.
 
     Pulls from load_trades() — same source as /api/status — so the numbers
-    match what the live dashboard shows. Excludes dry-run trades.
+    match what the live dashboard shows. Excludes dry-run AND beta trades
+    (beta belongs on /beta/<model_id>, not the live report).
     """
     now_utc = datetime.datetime.now(datetime.timezone.utc)
     cutoff  = now_utc - datetime.timedelta(hours=hours)
     cutoff_ms = int(cutoff.timestamp() * 1000)
 
-    raw = [t for t in load_trades() if not t.get("dry_run")]
+    raw = [
+        t for t in load_trades()
+        if not t.get("dry_run") and not t.get("is_beta")
+    ]
 
     # Filter to window
     trades = []
