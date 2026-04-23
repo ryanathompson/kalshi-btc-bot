@@ -323,6 +323,29 @@ EARLY_EXIT_REVERSAL_PCT  = float(os.getenv("EARLY_EXIT_REVERSAL_PCT", "0.003")) 
 EARLY_EXIT_MIN_HOLD_S    = int(os.getenv("EARLY_EXIT_MIN_HOLD_S", "120"))        # 2 min minimum hold
 EARLY_EXIT_MAX_LOSS_PCT  = float(os.getenv("EARLY_EXIT_MAX_LOSS_PCT", "0.40"))   # [v2.5] widened from 0.10 — see docs/v2_feature_audit_2026-04-15.md
 
+# Consensus edge-gone exit — beta only in phase 1.
+# ──────────────────────────────────────────────────────────────────
+# Unlike the Conviction tracker (which exits on raw BTC reversal),
+# this tracker exits when the Consensus entry *signal* would no
+# longer fire. Two trigger classes:
+#   HARD — signal inverted:
+#     * current momentum_side flipped vs entry (still outside dead_zone)
+#     * last_result flipped vs entry
+#     Action: close regardless of loss, capped at HARD_MAX_LOSS.
+#   SOFT — signal decayed:
+#     * |momentum| fell into dead zone
+#     * last_result aged past PREV_RESULT_MAX_AGE
+#     Action: close only if current loss <= SOFT_MAX_LOSS.
+#
+# Runs as a self-contained beta model (CONSENSUS_V1_WITH_EXIT) that
+# mirrors CONSENSUS_V1 entries and simulates exits against current
+# top-of-book bid. Zero live order activity. Compare net P&L vs the
+# CONSENSUS_V1 ride-to-resolution baseline to measure exit alpha.
+CONSENSUS_EDGE_EXIT_BETA_ENABLED = os.getenv("CONSENSUS_EDGE_EXIT_BETA_ENABLED", "false").lower() == "true"
+CONSENSUS_EDGE_EXIT_MIN_HOLD_S   = int(os.getenv("CONSENSUS_EDGE_EXIT_MIN_HOLD_S",   "90"))
+CONSENSUS_EDGE_EXIT_SOFT_MAX_LOSS = float(os.getenv("CONSENSUS_EDGE_EXIT_SOFT_MAX_LOSS", "0.25"))
+CONSENSUS_EDGE_EXIT_HARD_MAX_LOSS = float(os.getenv("CONSENSUS_EDGE_EXIT_HARD_MAX_LOSS", "0.90"))
+
 # Cheap-contract stake cap: lottery-ticket entries (<25c) keep their
 # asymmetric upside but stakes are capped to limit bleed during dry
 # streaks.  Kelly tends to oversize these because the payout multiple
@@ -1055,7 +1078,7 @@ def save_trade(trade):
 
 
 def close_trade_by_early_exit(ticker, side, count, entry_cents, exit_cents,
-                               exit_reason=""):
+                               exit_reason="", beta_model_id=None):
     """Finalize the most recent open entry trade matching (ticker,side,count)
     with realized P&L from an early-exit sell.
 
@@ -1067,6 +1090,10 @@ def close_trade_by_early_exit(ticker, side, count, entry_cents, exit_cents,
 
     Semantics:
       - Finds the trade by (ticker, side, count, result is None).
+      - If beta_model_id is provided, also requires t.beta_model_id match.
+        This keeps beta exit simulations from accidentally closing a live
+        position that happens to share the same (ticker, side, count).
+        Default None preserves pre-existing live-trade behavior.
       - Sets result=WIN if exit_proceeds > entry_cost else LOSS. We use
         strict P&L sign (not "exit > entry" as a policy flag) so a small
         stop-loss exit correctly shows as a LOSS, not a WIN.
@@ -1090,6 +1117,8 @@ def close_trade_by_early_exit(ticker, side, count, entry_cents, exit_cents,
         if t.get("side")   != side:
             continue
         if t.get("count")  != count:
+            continue
+        if beta_model_id is not None and t.get("beta_model_id") != beta_model_id:
             continue
         t["result"]         = "WIN" if pnl > 0 else "LOSS"
         t["pnl"]            = pnl
@@ -1632,6 +1661,213 @@ class PositionMonitor:
                                f"sell @ {int(current_bid*100)}c (loss {loss_pct*100:.1f}%) "
                                f"vs ride-to-zero"),
                 })
+        return exits
+
+    def remove(self, ticker):
+        self.positions.pop(ticker, None)
+
+
+class ConsensusExitTracker:
+    """Shadow-tracks CONSENSUS_V1_WITH_EXIT beta entries and emits simulated
+    exit signals when the Consensus entry logic would no longer fire in the
+    same direction.
+
+    This differs from PositionMonitor (Conviction tracker) in that the exit
+    trigger is *signal-state-based*, not BTC-drift-based:
+
+      HARD — signal inverted:
+        * current momentum_side flipped vs entry (still outside dead zone)
+        * last_result flipped vs entry
+        Action: close regardless of loss, capped at HARD_MAX_LOSS.
+      SOFT — signal decayed:
+        * |momentum| fell into MOMENTUM_DEAD_ZONE
+        * last_result aged past PREV_RESULT_MAX_AGE
+        Action: close only if current loss <= SOFT_MAX_LOSS.
+      HOLD — everything else (including STRONG→non-STRONG weakening while
+             still in the original direction — logged but not exited in v1).
+
+    Beta-only: exits are simulated against current top-of-book bid; no real
+    sell orders are placed. close_trade_by_early_exit is called with
+    beta_model_id='CONSENSUS_V1_WITH_EXIT' to mutate the correct beta trade
+    record without touching any live positions.
+
+    Entry state only captures what's needed for signal-state evaluation —
+    no entry_btc, because BTC drift isn't a trigger here. That makes
+    rehydration after a Render restart cheap: we can reconstruct state from
+    the trade record alone.
+    """
+    BETA_MODEL_ID = "CONSENSUS_V1_WITH_EXIT"
+
+    def __init__(self):
+        self.positions = {}
+
+    def track(self, signal, btc_price=None):
+        """Capture entry state for an emitted CONSENSUS_V1_WITH_EXIT signal.
+
+        btc_price accepted for signature parity with PositionMonitor.track
+        but ignored here — this tracker doesn't do BTC-drift exits.
+        """
+        if signal.get("beta_model_id") != self.BETA_MODEL_ID:
+            return
+        if signal.get("strategy") != "CONSENSUS":
+            return
+        reason = signal.get("reason", "")
+        # Consensus only fires when momentum_side == previous_side, and
+        # signal["side"] equals both. So entry_momentum_side and
+        # entry_previous are captured as signal["side"] directly.
+        self.positions[signal["ticker"]] = {
+            "side":                signal["side"],
+            "entry_time":          time.time(),
+            "entry_price_cents":   signal["price"],
+            "count":               signal["count"],
+            "entry_momentum_side": signal["side"],
+            "entry_previous":      signal["side"],
+            "strong_at_entry":     "[STRONG" in reason,
+        }
+
+    def rehydrate_from_trades(self):
+        """On startup, repopulate tracker state from any open beta trade
+        records with beta_model_id == CONSENSUS_V1_WITH_EXIT that haven't
+        yet been closed. Uses the trade record's timestamp for entry_time
+        so min-hold gating stays honest across restarts.
+        """
+        try:
+            trades = load_trades()
+        except Exception:
+            return 0
+        restored = 0
+        for t in trades:
+            if t.get("result"):
+                continue
+            if t.get("closed_by_exit"):
+                continue
+            if not t.get("is_beta"):
+                continue
+            if t.get("beta_model_id") != self.BETA_MODEL_ID:
+                continue
+            # Derive entry_time from placement timestamp so min-hold gating
+            # works sensibly after restart.
+            entry_ts = t.get("timestamp")
+            entry_time = time.time()
+            if entry_ts:
+                try:
+                    dt = datetime.datetime.fromisoformat(entry_ts)
+                    entry_time = dt.timestamp()
+                except (ValueError, TypeError):
+                    pass
+            reason = t.get("reason", "")
+            self.positions[t["ticker"]] = {
+                "side":                t["side"],
+                "entry_time":          entry_time,
+                "entry_price_cents":   t.get("price", 0),
+                "count":               t.get("count", 0),
+                "entry_momentum_side": t["side"],
+                "entry_previous":      t["side"],
+                "strong_at_entry":     "[STRONG" in reason,
+            }
+            restored += 1
+        return restored
+
+    def _classify(self, pos, btc_change, current_previous, prev_age_s):
+        """Decide HARD / SOFT / HOLD for a tracked position given the
+        current signal state. Returns (trigger_type, reason_str).
+
+        Pure function — no BTC feed or market dict access, so unit-testable
+        without any runtime dependencies.
+        """
+        momentum_side = None
+        if btc_change is not None and abs(btc_change) >= MOMENTUM_DEAD_ZONE:
+            momentum_side = "yes" if btc_change > 0 else "no"
+
+        # HARD: entry signal explicitly inverted
+        if momentum_side is not None and momentum_side != pos["entry_momentum_side"]:
+            pct = (btc_change or 0) * 100
+            return "HARD", (f"momentum flipped {pos['entry_momentum_side']}->"
+                            f"{momentum_side} (d={pct:+.3f}%)")
+        if current_previous and current_previous != pos["entry_previous"]:
+            return "HARD", (f"previous flipped {pos['entry_previous']}->"
+                            f"{current_previous}")
+
+        # SOFT: entry signal has decayed but not inverted
+        if momentum_side is None:
+            pct = (btc_change or 0) * 100
+            return "SOFT", f"momentum decayed into dead zone (d={pct:+.3f}%)"
+        if (current_previous is not None and prev_age_s is not None
+                and prev_age_s > PREV_RESULT_MAX_AGE):
+            return "SOFT", (f"previous stale (age={prev_age_s:.0f}s > "
+                            f"{PREV_RESULT_MAX_AGE}s)")
+
+        return "HOLD", ""
+
+    def check_exits(self, btc_feed, markets, consensus_ref):
+        """Evaluate exit conditions for all tracked positions.
+
+        Args:
+            btc_feed: BTCPriceFeed instance for current momentum
+            markets: current open market list (for top-of-book bid lookup)
+            consensus_ref: ConsensusStrategy instance whose last_result is
+                the source of truth for the previous-result signal. In
+                practice self.consensus — update_previous runs every cycle
+                regardless of CONSENSUS_ENABLED, so last_result stays fresh.
+
+        Returns a list of exit signal dicts suitable for feeding to
+        close_trade_by_early_exit. Empty list on no-op cycles.
+        """
+        if not CONSENSUS_EDGE_EXIT_BETA_ENABLED or not self.positions:
+            return []
+        exits = []
+        now = time.time()
+        btc_change = btc_feed.pct_change(MOMENTUM_WINDOW)
+        current_previous = consensus_ref.last_result if consensus_ref else None
+        prev_ts = consensus_ref.last_result_time if consensus_ref else 0
+        prev_age_s = (now - prev_ts) if prev_ts else None
+        mkt_map = {m["ticker"]: m for m in markets}
+
+        for ticker, pos in list(self.positions.items()):
+            # Min hold
+            if now - pos["entry_time"] < CONSENSUS_EDGE_EXIT_MIN_HOLD_S:
+                continue
+            # Market no longer open — likely already resolved. Drop
+            # silently; the underlying trade record will settle naturally
+            # via resolve_trades().
+            if ticker not in mkt_map:
+                self.positions.pop(ticker, None)
+                continue
+
+            trigger, why = self._classify(pos, btc_change, current_previous,
+                                          prev_age_s)
+            if trigger == "HOLD":
+                continue
+
+            market = mkt_map[ticker]
+            bid_key = f"{pos['side']}_bid_dollars"
+            current_bid = float(market.get(bid_key, 0))
+            if current_bid <= 0:
+                # No liquidity to exit into — wait it out. This can happen
+                # in the final seconds of a market.
+                continue
+            entry_price = pos["entry_price_cents"] / 100.0
+            loss_pct = (entry_price - current_bid) / entry_price
+
+            # Gate on per-trigger max-loss. SOFT is tighter because the
+            # signal is weaker — we should only exit cheaply.
+            if trigger == "HARD" and loss_pct > CONSENSUS_EDGE_EXIT_HARD_MAX_LOSS:
+                continue
+            if trigger == "SOFT" and loss_pct > CONSENSUS_EDGE_EXIT_SOFT_MAX_LOSS:
+                continue
+
+            exits.append({
+                "ticker":             ticker,
+                "side":               pos["side"],
+                "count":              pos["count"],
+                "sell_price_cents":   max(1, int(current_bid * 100)),
+                "entry_price_cents":  pos["entry_price_cents"],
+                "loss_pct":           loss_pct,
+                "trigger":            trigger,
+                "reason":             (f"EDGE_GONE {trigger}: {why} | sell "
+                                       f"@ {int(current_bid*100)}c "
+                                       f"(loss {loss_pct*100:+.1f}%)"),
+            })
         return exits
 
     def remove(self, ticker):
@@ -2614,9 +2850,30 @@ class KalshiBot:
                 is_beta=True,
                 beta_model_id="EXPIRY_DECAY_V1",
             ))
+        # ── CONSENSUS_V1_WITH_EXIT beta ─────────────────────────────────
+        # Mirrors CONSENSUS_V1's entry logic but adds the edge-gone exit
+        # rule (see ConsensusExitTracker). Both models run simultaneously
+        # so dashboard can diff net P&L between ride-to-resolution
+        # (CONSENSUS_V1) and exit-when-signal-decays (CONSENSUS_V1_WITH_EXIT)
+        # over the same entry universe.
+        if CONSENSUS_EDGE_EXIT_BETA_ENABLED:
+            self.beta_strategies.append(ConsensusStrategy(
+                max_stake,
+                is_beta=True,
+                beta_model_id=ConsensusExitTracker.BETA_MODEL_ID,
+            ))
         # [v2.0] New components
         self.scorer    = StrategyScorer()
         self.monitor   = PositionMonitor()
+        # Beta edge-gone tracker. Self-contained from self.monitor (which
+        # only touches SNIPER Conviction) so there's no risk of
+        # double-tracking or misrouted exits.
+        self.consensus_exit_tracker = ConsensusExitTracker()
+        if CONSENSUS_EDGE_EXIT_BETA_ENABLED:
+            restored = self.consensus_exit_tracker.rehydrate_from_trades()
+            if restored:
+                print(f"  [consensus-exit-beta] rehydrated {restored} open "
+                      f"position(s) from trade log", flush=True)
         self._balance  = None             # cached balance, updated each cycle
         # [v2.0] Telemetry counters for dashboard
         self.v2_stats  = {
@@ -2872,6 +3129,41 @@ class KalshiBot:
             except Exception as e:
                 print(f"  [early-exit] Error: {e}", flush=True)
 
+        # [Beta] Consensus edge-gone exit simulation. Runs each cycle
+        # before the live entry pass so beta exit decisions and live
+        # entry decisions see the same BTC/market state. Dry-run only —
+        # mutates beta trade records in-place via close_trade_by_early_exit
+        # with beta_model_id scoping so no live position is touched.
+        if CONSENSUS_EDGE_EXIT_BETA_ENABLED and self.consensus_exit_tracker.positions:
+            try:
+                beta_exits = self.consensus_exit_tracker.check_exits(
+                    self.btc, markets, self.consensus,
+                )
+                for ex in beta_exits:
+                    print(f"\n{Fore.CYAN}>>> [BETA:"
+                          f"{ConsensusExitTracker.BETA_MODEL_ID}] "
+                          f"{ex['reason']}{Style.RESET_ALL}", flush=True)
+                    closed = close_trade_by_early_exit(
+                        ticker=ex["ticker"],
+                        side=ex["side"],
+                        count=ex["count"],
+                        entry_cents=ex["entry_price_cents"],
+                        exit_cents=ex["sell_price_cents"],
+                        exit_reason=ex["reason"],
+                        beta_model_id=ConsensusExitTracker.BETA_MODEL_ID,
+                    )
+                    if not closed:
+                        # Tracker had a position we couldn't find in the
+                        # trade log (e.g. log rotated, or rehydrated from a
+                        # partial state). Drop it so we don't keep trying.
+                        print(f"  [consensus-exit-beta] WARN: no matching "
+                              f"trade record for {ex['ticker']} "
+                              f"{ex['side']} x{ex['count']} — dropping "
+                              f"tracker entry", flush=True)
+                    self.consensus_exit_tracker.remove(ex["ticker"])
+            except Exception as e:
+                print(f"  [consensus-exit-beta] Error: {e}", flush=True)
+
         # 5. Evaluate strategies on each market
         for market in markets:
             ticker = market["ticker"]
@@ -3048,6 +3340,14 @@ class KalshiBot:
                 order_result = {"dry_run": True, "reason": "beta"}
                 self._log_signal(signal, order_result)
                 traded.add(ticker)
+                # Track CONSENSUS_V1_WITH_EXIT entries for later edge-gone
+                # exit simulation. No-op for other beta model_ids.
+                if signal.get("beta_model_id") == ConsensusExitTracker.BETA_MODEL_ID:
+                    try:
+                        self.consensus_exit_tracker.track(signal)
+                    except Exception as e:
+                        print(Fore.YELLOW + f"  [consensus-exit-beta] "
+                              f"track error: {e}", flush=True)
                 # No break — beta models evaluate all markets each cycle,
                 # subject only to per-model cooldown and per-cycle dedup.
 
