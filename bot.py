@@ -78,6 +78,8 @@ GETTING YOUR API KEY:
 """
 
 import os
+import math
+import re
 import time
 import uuid
 import json
@@ -194,6 +196,17 @@ SNIPER_ENABLED    = os.getenv("SNIPER_ENABLED",    "true").lower()  == "true"
 # beta_model_id for isolated reporting. See /beta on the dashboard.
 # Enable each independently via its own env var.
 CONSENSUS_V1_BETA_ENABLED = os.getenv("CONSENSUS_V1_BETA_ENABLED", "false").lower() == "true"
+EXPIRY_DECAY_V1_BETA_ENABLED = os.getenv("EXPIRY_DECAY_V1_BETA_ENABLED", "false").lower() == "true"
+
+# Expiry-decay tunables. All env-overridable so we can iterate without code
+# changes. Defaults chosen conservatively for v1: narrow time window, wide
+# vol-distance floor, meaningful edge floor. Tighten later after data.
+EXPIRY_DECAY_MAX_SECS_LEFT   = int(os.getenv("EXPIRY_DECAY_MAX_SECS_LEFT",   "180"))
+EXPIRY_DECAY_MIN_SECS_LEFT   = int(os.getenv("EXPIRY_DECAY_MIN_SECS_LEFT",    "20"))
+EXPIRY_DECAY_MIN_DIST_SIGMAS = float(os.getenv("EXPIRY_DECAY_MIN_DIST_SIGMAS", "2.0"))
+EXPIRY_DECAY_MIN_EDGE_CENTS  = int(os.getenv("EXPIRY_DECAY_MIN_EDGE_CENTS",     "3"))
+EXPIRY_DECAY_VOL_WINDOW_S    = int(os.getenv("EXPIRY_DECAY_VOL_WINDOW_S",     "900"))
+EXPIRY_DECAY_COOLDOWN_S      = int(os.getenv("EXPIRY_DECAY_COOLDOWN_S",        "60"))
 
 # ── v2.0 Unified stake ───────────────────────────────────────────────
 # Single max-stake-per-trade replaces the old per-strategy LAG_STAKE /
@@ -2037,6 +2050,224 @@ class SniperStrategy:
         return signal
 
 
+# ──────────────────────────────────────────────────────────────
+# STRATEGY 4: EXPIRY DECAY (beta)
+# ──────────────────────────────────────────────────────────────
+
+_EXPIRY_DECAY_TICKER_RE = re.compile(r"-([TB])(\d+)(?:-(\d+))?$")
+
+
+def _parse_btc_strike(ticker):
+    """Return (lo, hi) dollar strikes for a KXBTC15M ticker.
+
+    For '-T' markets (YES if BTC >= strike), returns (strike, None).
+    For '-B' markets (YES if lo <= BTC <= hi), returns (lo, hi).
+    Returns (None, None) if the suffix doesn't match.
+    """
+    m = _EXPIRY_DECAY_TICKER_RE.search(ticker or "")
+    if not m:
+        return (None, None)
+    kind = m.group(1)
+    if kind == "T":
+        return (float(m.group(2)), None)
+    return (float(m.group(2)),
+            float(m.group(3)) if m.group(3) else None)
+
+
+def _phi(x):
+    """Standard normal CDF. math.erf only; no scipy dependency."""
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def _realized_vol_per_sqrt_s(btc_feed, lookback_s=900, min_samples=30):
+    """Estimate BTC's per-sqrt-second log-return stddev.
+
+    Pulls recent (ts, px) samples from the feed's internal history, builds
+    log-returns normalized by sqrt(dt) so they're on a per-sqrt-second scale,
+    and returns their stddev.
+
+    Returns None on insufficient data. Short-window vol is noisy; callers
+    should expect occasional None and skip those cycles.
+    """
+    try:
+        with btc_feed._lock:
+            hist = list(btc_feed.history)
+    except AttributeError:
+        return None
+    if len(hist) < min_samples:
+        return None
+
+    now = hist[-1][0]
+    cutoff = now - lookback_s
+    window = [(ts, px) for ts, px in hist if ts >= cutoff]
+    if len(window) < min_samples:
+        window = hist[-min_samples:]
+
+    rets_per_sqrt_s = []
+    for i in range(1, len(window)):
+        dt = window[i][0] - window[i-1][0]
+        px_prev = window[i-1][1]
+        px_now  = window[i][1]
+        if dt <= 0 or px_prev <= 0 or px_now <= 0:
+            continue
+        r = math.log(px_now / px_prev)
+        rets_per_sqrt_s.append(r / math.sqrt(dt))
+
+    if len(rets_per_sqrt_s) < min_samples - 10:
+        return None
+    mean = sum(rets_per_sqrt_s) / len(rets_per_sqrt_s)
+    var  = sum((r - mean) ** 2 for r in rets_per_sqrt_s) / max(len(rets_per_sqrt_s) - 1, 1)
+    return math.sqrt(var)
+
+
+class ExpiryDecayStrategy:
+    """
+    Expiry-decay beta model (Phase 4 v1). Beta-only — forced dry-run.
+
+    THESIS:
+      In the final N seconds of a 15-min market, probability converges
+      toward 0 or 1 faster than Kalshi's book reprices. If BTC is deeply
+      into the YES (or deeply into the NO) region relative to short-window
+      realized vol, the opposite-side contract still carries residual risk
+      premium + impatient-seller liquidity. We buy the side the market
+      has effectively decided, collecting a few cents of edge into
+      settlement.
+
+    ENTRY GATES (all must pass):
+      1. Time remaining in [MIN_SECS_LEFT, MAX_SECS_LEFT]
+      2. Vol-normalized distance |log(S/K)| / (sigma * sqrt(T))
+         >= MIN_DIST_SIGMAS
+      3. Model fair value - Kalshi ask >= MIN_EDGE_CENTS (after fees proxy)
+      4. Book sum (yes_ask + no_ask) >= MIN_BOOK_SUM
+
+    FAIR VALUE:
+      Simple GBM with zero drift over the remaining window. BTC realized
+      vol is estimated from the last VOL_WINDOW_S seconds of the feed's
+      own price history, converted to per-sqrt-second. This is the
+      cheapest defensible pricing model; good enough to flag obvious
+      mispricings without falling apart in minutes-to-expiry conditions.
+
+    SIZING:
+      Fixed stake / price_dollars for v1. No Kelly: we have no historical
+      WR for this strategy yet. Revisit after N>=100 simulated fires.
+
+    PROMOTION:
+      See docs/beta_promotion.md. Expect optimistic-sim inflation; require
+      ~2x the edge you'd demand from a live strategy before promoting.
+    """
+
+    def __init__(self, stake_dollars, *,
+                 is_beta=True, beta_model_id="EXPIRY_DECAY_V1"):
+        self.stake           = stake_dollars
+        self.name            = "EXPIRY_DECAY"
+        self.is_beta         = is_beta
+        self.beta_model_id   = beta_model_id
+        self.last_fire_time  = 0.0
+
+    def evaluate(self, market, btc_feed, mins_left=None,
+                 balance=None, score_mult=1.0):
+        # ---- Time gate (converts mins_left → seconds) -----------------
+        if mins_left is None:
+            return None
+        secs_left = mins_left * 60.0
+        if secs_left < EXPIRY_DECAY_MIN_SECS_LEFT:
+            return None
+        if secs_left > EXPIRY_DECAY_MAX_SECS_LEFT:
+            return None
+
+        # ---- Cooldown ---------------------------------------------------
+        now_s = time.time()
+        if now_s - self.last_fire_time < EXPIRY_DECAY_COOLDOWN_S:
+            return None
+
+        # ---- Liquidity --------------------------------------------------
+        ticker  = market["ticker"]
+        yes_ask = float(market.get("yes_ask_dollars", 0) or 0)
+        no_ask  = float(market.get("no_ask_dollars",  0) or 0)
+        if yes_ask <= 0 or no_ask <= 0:
+            return None
+        if yes_ask + no_ask < MIN_BOOK_SUM:
+            return None
+
+        # ---- Parse strike(s) -------------------------------------------
+        lo_strike, hi_strike = _parse_btc_strike(ticker)
+        if lo_strike is None:
+            return None
+
+        # ---- Current BTC + realized vol --------------------------------
+        btc = btc_feed.current()
+        if btc is None or btc <= 0:
+            return None
+        sigma_s = _realized_vol_per_sqrt_s(btc_feed, lookback_s=EXPIRY_DECAY_VOL_WINDOW_S)
+        if sigma_s is None or sigma_s <= 0:
+            return None
+        sigma_T = sigma_s * math.sqrt(secs_left)
+        if sigma_T <= 0:
+            return None
+
+        # ---- Fair value P(YES) via zero-drift GBM ----------------------
+        if hi_strike is None:
+            # -T market: YES if BTC_T >= lo_strike.
+            # P(BTC_T >= K) = P(log(S_T/S_t) >= log(K/S_t)) = 1 - Phi(z)
+            z = math.log(lo_strike / btc) / sigma_T
+            p_yes = 1.0 - _phi(z)
+            dist_sigmas = abs(math.log(btc / lo_strike)) / sigma_T
+        else:
+            # -B market: YES if lo <= BTC_T <= hi.
+            # P(YES) = Phi(z_hi) - Phi(z_lo).
+            z_lo = math.log(lo_strike / btc) / sigma_T
+            z_hi = math.log(hi_strike / btc) / sigma_T
+            p_yes = _phi(z_hi) - _phi(z_lo)
+            if lo_strike <= btc <= hi_strike:
+                dist_sigmas = min(
+                    abs(math.log(btc / lo_strike)) / sigma_T,
+                    abs(math.log(btc / hi_strike)) / sigma_T,
+                )
+            else:
+                nearest = lo_strike if btc < lo_strike else hi_strike
+                dist_sigmas = abs(math.log(btc / nearest)) / sigma_T
+
+        # Numerical guardrails — floating-point underflow near certainty
+        p_yes = max(0.0, min(1.0, p_yes))
+
+        if dist_sigmas < EXPIRY_DECAY_MIN_DIST_SIGMAS:
+            return None
+
+        # ---- Edge check (pick the better side) -------------------------
+        yes_edge_cents = int(round((p_yes        - yes_ask) * 100))
+        no_edge_cents  = int(round(((1.0 - p_yes) - no_ask)  * 100))
+
+        if yes_edge_cents >= no_edge_cents and yes_edge_cents >= EXPIRY_DECAY_MIN_EDGE_CENTS:
+            side, price_dollars, edge_cents, p_side = "yes", yes_ask, yes_edge_cents, p_yes
+        elif no_edge_cents >= EXPIRY_DECAY_MIN_EDGE_CENTS:
+            side, price_dollars, edge_cents, p_side = "no",  no_ask,  no_edge_cents, 1.0 - p_yes
+        else:
+            return None
+
+        if price_dollars <= 0:
+            return None
+        count = max(1, int(self.stake / price_dollars))
+        price_cents = int(round(price_dollars * 100))
+
+        self.last_fire_time = now_s
+
+        strike_repr = (f"{int(lo_strike)}"
+                       if hi_strike is None
+                       else f"{int(lo_strike)}-{int(hi_strike)}")
+        return {
+            "strategy": self.name,
+            "ticker":   ticker,
+            "side":     side,
+            "price":    price_cents,
+            "count":    count,
+            "dollars":  round(count * price_dollars, 2),
+            "reason":   (f"BTC ${btc:,.0f} vs {strike_repr} "
+                         f"| {dist_sigmas:.2f}σ | {secs_left:.0f}s left "
+                         f"| fair {p_side*100:.1f}%, ask {price_cents}c, "
+                         f"edge +{edge_cents}c"),
+        }
+
+
 # âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 # RISK MANAGEMENT
 # âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
@@ -2201,6 +2432,18 @@ class KalshiBot:
                 max_stake,
                 is_beta=True,
                 beta_model_id="CONSENSUS_V1",
+            ))
+        # ── EXPIRY_DECAY_V1 beta (Phase 4) ──────────────────────────────
+        # Fires in the final window of a 15-min market when BTC is deeply
+        # into the YES/NO region vs short-window realized vol. Fully
+        # isolated from live strategies; no interaction with SNIPER despite
+        # both caring about 15-min markets (SNIPER needs >=5 min runway;
+        # expiry decay needs <=3 min).
+        if EXPIRY_DECAY_V1_BETA_ENABLED:
+            self.beta_strategies.append(ExpiryDecayStrategy(
+                max_stake,
+                is_beta=True,
+                beta_model_id="EXPIRY_DECAY_V1",
             ))
         # [v2.0] New components
         self.scorer    = StrategyScorer()
@@ -2527,7 +2770,11 @@ class KalshiBot:
                             close_time.replace("Z", "+00:00")
                         )
                         mins_left = (ct - datetime.datetime.now(datetime.timezone.utc)).total_seconds() / 60
-                        if mins_left < 3 or mins_left > 14:
+                        # Skip freshly-opened markets (>14 min left). No
+                        # lower bound here — late-window beta strategies
+                        # (e.g. expiry decay) need access to the last few
+                        # minutes. Each strategy gates its own time window.
+                        if mins_left > 14:
                             continue
                     except Exception:
                         pass
