@@ -198,6 +198,11 @@ SNIPER_ENABLED    = os.getenv("SNIPER_ENABLED",    "true").lower()  == "true"
 CONSENSUS_V1_BETA_ENABLED = os.getenv("CONSENSUS_V1_BETA_ENABLED", "false").lower() == "true"
 EXPIRY_DECAY_V1_BETA_ENABLED = os.getenv("EXPIRY_DECAY_V1_BETA_ENABLED", "false").lower() == "true"
 
+# One-shot diagnostic: dump the first Kalshi market JSON to stdout so we can
+# see exactly what fields are available (reference price, subtitle, etc.).
+# Flip to true on Render, restart, grab the log line, flip back to false.
+LOG_MARKET_SAMPLE = os.getenv("LOG_MARKET_SAMPLE", "false").lower() == "true"
+
 # Expiry-decay tunables. All env-overridable so we can iterate without code
 # changes. Defaults chosen conservatively for v1: narrow time window, wide
 # vol-distance floor, meaningful edge floor. Tighten later after data.
@@ -2476,6 +2481,7 @@ class KalshiBot:
         except Exception:
             pass
         self._last_markets = []          # exposed for dashboard
+        self._market_sample_logged = False  # one-shot diagnostic flag
 
     def _log_signal(self, signal, order_result):
         # Extract order_id from Kalshi's response so update_fill_times()
@@ -2548,6 +2554,33 @@ class KalshiBot:
             return
 
         self._last_markets = markets  # expose for dashboard
+
+        # One-shot diagnostic dump so we can see the full Kalshi market shape
+        # (looking for reference_price / underlying_value / subtitle fields).
+        # Gated by LOG_MARKET_SAMPLE env flag; prints only once per process.
+        if LOG_MARKET_SAMPLE and not self._market_sample_logged and markets:
+            try:
+                sample = markets[0]
+                print("\n[DIAG market-sample] Full JSON of markets[0]:", flush=True)
+                print(json.dumps(sample, indent=2, default=str), flush=True)
+                print(f"[DIAG market-sample] Keys: {sorted(sample.keys())}",
+                      flush=True)
+                # Also try get_market() for the single-market endpoint —
+                # sometimes Kalshi exposes extra fields there vs the list view.
+                try:
+                    detail = self.client.get_market(sample["ticker"])
+                    if detail:
+                        print("\n[DIAG market-sample] Full JSON of get_market(ticker):",
+                              flush=True)
+                        print(json.dumps(detail, indent=2, default=str), flush=True)
+                        print(f"[DIAG market-sample] Detail keys: {sorted(detail.keys())}",
+                              flush=True)
+                except Exception as e:
+                    print(f"[DIAG market-sample] get_market detail fetch failed: {e}",
+                          flush=True)
+            except Exception as e:
+                print(f"[DIAG market-sample] dump failed: {e}", flush=True)
+            self._market_sample_logged = True
 
         # 3. Update consensus previous result
         try:
