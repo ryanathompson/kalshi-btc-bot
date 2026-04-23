@@ -213,6 +213,13 @@ EXPIRY_DECAY_MIN_EDGE_CENTS  = int(os.getenv("EXPIRY_DECAY_MIN_EDGE_CENTS",     
 EXPIRY_DECAY_VOL_WINDOW_S    = int(os.getenv("EXPIRY_DECAY_VOL_WINDOW_S",     "900"))
 EXPIRY_DECAY_COOLDOWN_S      = int(os.getenv("EXPIRY_DECAY_COOLDOWN_S",        "60"))
 
+# Diagnostic: when true, ExpiryDecayStrategy.evaluate() prints a single line
+# per market evaluation showing which gate blocked (or "FIRE") with the
+# relevant numbers. Sampled at most once per ticker per N seconds to keep
+# the log volume sane.
+EXPIRY_DECAY_VERBOSE          = os.getenv("EXPIRY_DECAY_VERBOSE", "false").lower() == "true"
+EXPIRY_DECAY_VERBOSE_EVERY_S  = int(os.getenv("EXPIRY_DECAY_VERBOSE_EVERY_S", "30"))
+
 # ── v2.0 Unified stake ───────────────────────────────────────────────
 # Single max-stake-per-trade replaces the old per-strategy LAG_STAKE /
 # CONSENSUS_STAKE split.  Every strategy draws from the same budget;
@@ -2459,24 +2466,29 @@ def annotate_correlation(signal, open_trades):
 # STRATEGY 4: EXPIRY DECAY (beta)
 # ──────────────────────────────────────────────────────────────
 
-_EXPIRY_DECAY_TICKER_RE = re.compile(r"-([TB])(\d+)(?:-(\d+))?$")
+def _get_market_strike(market):
+    """Return (strike, strike_type) for a Kalshi KXBTC15M market, or (None, None).
 
-
-def _parse_btc_strike(ticker):
-    """Return (lo, hi) dollar strikes for a KXBTC15M ticker.
-
-    For '-T' markets (YES if BTC >= strike), returns (strike, None).
-    For '-B' markets (YES if lo <= BTC <= hi), returns (lo, hi).
-    Returns (None, None) if the suffix doesn't match.
+    Kalshi exposes the reference directly as `floor_strike` (a float in USD)
+    on the market dict; the ticker suffix (-00/-15/-30/-45) is just the close
+    minute and does NOT encode the strike. `strike_type` is typically
+    "greater_or_equal" for these markets — YES resolves if the final 60s
+    BRTI average >= floor_strike. Re-applied 2026-04-23 after revert in
+    c450179 (DIAG dump in 0ca940b confirmed the floor_strike schema).
     """
-    m = _EXPIRY_DECAY_TICKER_RE.search(ticker or "")
-    if not m:
+    if not isinstance(market, dict):
         return (None, None)
-    kind = m.group(1)
-    if kind == "T":
-        return (float(m.group(2)), None)
-    return (float(m.group(2)),
-            float(m.group(3)) if m.group(3) else None)
+    raw = market.get("floor_strike")
+    if raw is None:
+        return (None, None)
+    try:
+        strike = float(raw)
+    except (TypeError, ValueError):
+        return (None, None)
+    if strike <= 0:
+        return (None, None)
+    stype = market.get("strike_type") or "greater_or_equal"
+    return (strike, stype)
 
 
 def _phi(x):
@@ -2569,73 +2581,91 @@ class ExpiryDecayStrategy:
         self.beta_model_id   = beta_model_id
         self.last_fire_time  = 0.0
 
+    def _vlog(self, ticker, msg):
+        """Per-ticker sampled verbose log (rate-limited by VERBOSE_EVERY_S)."""
+        if not EXPIRY_DECAY_VERBOSE:
+            return
+        if not hasattr(self, "_vlog_last"):
+            self._vlog_last = {}
+        now = time.time()
+        prev = self._vlog_last.get(ticker, 0)
+        if now - prev < EXPIRY_DECAY_VERBOSE_EVERY_S:
+            return
+        self._vlog_last[ticker] = now
+        print(f"  [exp-decay:{ticker}] {msg}", flush=True)
+
     def evaluate(self, market, btc_feed, mins_left=None,
                  balance=None, score_mult=1.0):
+        ticker = market.get("ticker", "?")
+
         # ---- Time gate (converts mins_left → seconds) -----------------
         if mins_left is None:
+            self._vlog(ticker, "BLOCK time: mins_left=None")
             return None
         secs_left = mins_left * 60.0
         if secs_left < EXPIRY_DECAY_MIN_SECS_LEFT:
+            self._vlog(ticker, f"BLOCK time: secs_left={secs_left:.0f} < min={EXPIRY_DECAY_MIN_SECS_LEFT}")
             return None
         if secs_left > EXPIRY_DECAY_MAX_SECS_LEFT:
+            self._vlog(ticker, f"BLOCK time: secs_left={secs_left:.0f} > max={EXPIRY_DECAY_MAX_SECS_LEFT}")
             return None
 
         # ---- Cooldown ---------------------------------------------------
         now_s = time.time()
         if now_s - self.last_fire_time < EXPIRY_DECAY_COOLDOWN_S:
+            self._vlog(ticker, f"BLOCK cooldown: {now_s - self.last_fire_time:.0f}s < {EXPIRY_DECAY_COOLDOWN_S}s")
             return None
 
         # ---- Liquidity --------------------------------------------------
-        ticker  = market["ticker"]
         yes_ask = float(market.get("yes_ask_dollars", 0) or 0)
         no_ask  = float(market.get("no_ask_dollars",  0) or 0)
         if yes_ask <= 0 or no_ask <= 0:
+            self._vlog(ticker, f"BLOCK liquidity: yes_ask={yes_ask} no_ask={no_ask} (zero ask)")
             return None
         if yes_ask + no_ask < MIN_BOOK_SUM:
+            self._vlog(ticker, f"BLOCK liquidity: book_sum={yes_ask + no_ask:.2f} < {MIN_BOOK_SUM}")
             return None
 
-        # ---- Parse strike(s) -------------------------------------------
-        lo_strike, hi_strike = _parse_btc_strike(ticker)
-        if lo_strike is None:
+        # ---- Strike from market.floor_strike --------------------------
+        # Kalshi KXBTC15M markets are strike-based: YES resolves if the
+        # final 60s BRTI average is >= floor_strike (per strike_type).
+        # The strike is NOT in the ticker suffix — that's the close minute.
+        strike, strike_type = _get_market_strike(market)
+        if strike is None:
+            self._vlog(ticker, f"BLOCK strike: floor_strike missing on market dict (keys={sorted(market.keys()) if isinstance(market, dict) else '?'})")
+            return None
+        if strike_type != "greater_or_equal":
+            self._vlog(ticker, f"BLOCK strike: unsupported strike_type={strike_type!r}")
             return None
 
         # ---- Current BTC + realized vol --------------------------------
         btc = btc_feed.current()
         if btc is None or btc <= 0:
+            self._vlog(ticker, f"BLOCK btc: current()={btc}")
             return None
         sigma_s = _realized_vol_per_sqrt_s(btc_feed, lookback_s=EXPIRY_DECAY_VOL_WINDOW_S)
         if sigma_s is None or sigma_s <= 0:
+            self._vlog(ticker, f"BLOCK vol: sigma_s={sigma_s} (insufficient history?)")
             return None
         sigma_T = sigma_s * math.sqrt(secs_left)
         if sigma_T <= 0:
+            self._vlog(ticker, f"BLOCK vol: sigma_T={sigma_T}")
             return None
 
-        # ---- Fair value P(YES) via zero-drift GBM ----------------------
-        if hi_strike is None:
-            # -T market: YES if BTC_T >= lo_strike.
-            # P(BTC_T >= K) = P(log(S_T/S_t) >= log(K/S_t)) = 1 - Phi(z)
-            z = math.log(lo_strike / btc) / sigma_T
-            p_yes = 1.0 - _phi(z)
-            dist_sigmas = abs(math.log(btc / lo_strike)) / sigma_T
-        else:
-            # -B market: YES if lo <= BTC_T <= hi.
-            # P(YES) = Phi(z_hi) - Phi(z_lo).
-            z_lo = math.log(lo_strike / btc) / sigma_T
-            z_hi = math.log(hi_strike / btc) / sigma_T
-            p_yes = _phi(z_hi) - _phi(z_lo)
-            if lo_strike <= btc <= hi_strike:
-                dist_sigmas = min(
-                    abs(math.log(btc / lo_strike)) / sigma_T,
-                    abs(math.log(btc / hi_strike)) / sigma_T,
-                )
-            else:
-                nearest = lo_strike if btc < lo_strike else hi_strike
-                dist_sigmas = abs(math.log(btc / nearest)) / sigma_T
+        # ---- Fair value P(YES) via zero-drift GBM (YES if BTC_T >= K) --
+        z = math.log(strike / btc) / sigma_T
+        p_yes = 1.0 - _phi(z)
+        dist_sigmas = abs(math.log(btc / strike)) / sigma_T
 
         # Numerical guardrails — floating-point underflow near certainty
         p_yes = max(0.0, min(1.0, p_yes))
 
         if dist_sigmas < EXPIRY_DECAY_MIN_DIST_SIGMAS:
+            self._vlog(
+                ticker,
+                f"BLOCK dist: {dist_sigmas:.2f}σ < {EXPIRY_DECAY_MIN_DIST_SIGMAS}σ "
+                f"(BTC ${btc:,.0f} vs {strike:,.0f}, sigma_s={sigma_s:.2e}, secs_left={secs_left:.0f})"
+            )
             return None
 
         # ---- Edge check (pick the better side) -------------------------
@@ -2647,18 +2677,28 @@ class ExpiryDecayStrategy:
         elif no_edge_cents >= EXPIRY_DECAY_MIN_EDGE_CENTS:
             side, price_dollars, edge_cents, p_side = "no",  no_ask,  no_edge_cents, 1.0 - p_yes
         else:
+            self._vlog(
+                ticker,
+                f"BLOCK edge: yes_edge={yes_edge_cents}c no_edge={no_edge_cents}c "
+                f"< min={EXPIRY_DECAY_MIN_EDGE_CENTS}c "
+                f"(p_yes={p_yes:.3f}, yes_ask={yes_ask:.2f}, no_ask={no_ask:.2f})"
+            )
             return None
 
         if price_dollars <= 0:
+            self._vlog(ticker, f"BLOCK price: {price_dollars}")
             return None
         count = max(1, int(self.stake / price_dollars))
         price_cents = int(round(price_dollars * 100))
 
         self.last_fire_time = now_s
 
-        strike_repr = (f"{int(lo_strike)}"
-                       if hi_strike is None
-                       else f"{int(lo_strike)}-{int(hi_strike)}")
+        strike_repr = f"{strike:,.0f}"
+        self._vlog(
+            ticker,
+            f"FIRE {side.upper()} @ {price_cents}c | {dist_sigmas:.2f}σ | "
+            f"fair {p_side*100:.1f}% | edge +{edge_cents}c | secs_left={secs_left:.0f}"
+        )
         return {
             "strategy": self.name,
             "ticker":   ticker,
