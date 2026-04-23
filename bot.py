@@ -2059,24 +2059,31 @@ class SniperStrategy:
 # STRATEGY 4: EXPIRY DECAY (beta)
 # ──────────────────────────────────────────────────────────────
 
-_EXPIRY_DECAY_TICKER_RE = re.compile(r"-([TB])(\d+)(?:-(\d+))?$")
+def _get_market_strike(market):
+    """Return (strike, strike_type) for a Kalshi KXBTC15M market, or (None, None).
 
+    Kalshi exposes the reference directly as `floor_strike` (a float in USD)
+    on the market dict; the ticker suffix (-00/-15/-30/-45) is just the close
+    minute and does NOT encode the strike. `strike_type` is typically
+    "greater_or_equal" for these markets — YES resolves if the final 60s
+    BRTI average ≥ floor_strike.
 
-def _parse_btc_strike(ticker):
-    """Return (lo, hi) dollar strikes for a KXBTC15M ticker.
-
-    For '-T' markets (YES if BTC >= strike), returns (strike, None).
-    For '-B' markets (YES if lo <= BTC <= hi), returns (lo, hi).
-    Returns (None, None) if the suffix doesn't match.
+    We don't try to infer from the ticker; if floor_strike is absent, return
+    (None, None) and let the caller skip the market.
     """
-    m = _EXPIRY_DECAY_TICKER_RE.search(ticker or "")
-    if not m:
+    if not isinstance(market, dict):
         return (None, None)
-    kind = m.group(1)
-    if kind == "T":
-        return (float(m.group(2)), None)
-    return (float(m.group(2)),
-            float(m.group(3)) if m.group(3) else None)
+    raw = market.get("floor_strike")
+    if raw is None:
+        return (None, None)
+    try:
+        strike = float(raw)
+    except (TypeError, ValueError):
+        return (None, None)
+    if strike <= 0:
+        return (None, None)
+    stype = market.get("strike_type") or "greater_or_equal"
+    return (strike, stype)
 
 
 def _phi(x):
@@ -2194,9 +2201,16 @@ class ExpiryDecayStrategy:
         if yes_ask + no_ask < MIN_BOOK_SUM:
             return None
 
-        # ---- Parse strike(s) -------------------------------------------
-        lo_strike, hi_strike = _parse_btc_strike(ticker)
-        if lo_strike is None:
+        # ---- Strike from market.floor_strike --------------------------
+        # Kalshi KXBTC15M markets are strike-based: YES resolves if the
+        # final 60s BRTI average is >= floor_strike (per strike_type).
+        # The strike is NOT in the ticker suffix — that's the close minute.
+        strike, strike_type = _get_market_strike(market)
+        if strike is None:
+            return None
+        # Only "greater_or_equal" is currently observed on KXBTC15M; bail
+        # on anything else so we don't silently misprice an unknown shape.
+        if strike_type != "greater_or_equal":
             return None
 
         # ---- Current BTC + realized vol --------------------------------
@@ -2211,26 +2225,11 @@ class ExpiryDecayStrategy:
             return None
 
         # ---- Fair value P(YES) via zero-drift GBM ----------------------
-        if hi_strike is None:
-            # -T market: YES if BTC_T >= lo_strike.
-            # P(BTC_T >= K) = P(log(S_T/S_t) >= log(K/S_t)) = 1 - Phi(z)
-            z = math.log(lo_strike / btc) / sigma_T
-            p_yes = 1.0 - _phi(z)
-            dist_sigmas = abs(math.log(btc / lo_strike)) / sigma_T
-        else:
-            # -B market: YES if lo <= BTC_T <= hi.
-            # P(YES) = Phi(z_hi) - Phi(z_lo).
-            z_lo = math.log(lo_strike / btc) / sigma_T
-            z_hi = math.log(hi_strike / btc) / sigma_T
-            p_yes = _phi(z_hi) - _phi(z_lo)
-            if lo_strike <= btc <= hi_strike:
-                dist_sigmas = min(
-                    abs(math.log(btc / lo_strike)) / sigma_T,
-                    abs(math.log(btc / hi_strike)) / sigma_T,
-                )
-            else:
-                nearest = lo_strike if btc < lo_strike else hi_strike
-                dist_sigmas = abs(math.log(btc / nearest)) / sigma_T
+        # YES if BTC_T >= strike.
+        # P(BTC_T >= K) = P(log(S_T/S_t) >= log(K/S_t)) = 1 - Phi(z)
+        z = math.log(strike / btc) / sigma_T
+        p_yes = 1.0 - _phi(z)
+        dist_sigmas = abs(math.log(btc / strike)) / sigma_T
 
         # Numerical guardrails — floating-point underflow near certainty
         p_yes = max(0.0, min(1.0, p_yes))
@@ -2256,9 +2255,7 @@ class ExpiryDecayStrategy:
 
         self.last_fire_time = now_s
 
-        strike_repr = (f"{int(lo_strike)}"
-                       if hi_strike is None
-                       else f"{int(lo_strike)}-{int(hi_strike)}")
+        strike_repr = f"{strike:,.0f}"
         return {
             "strategy": self.name,
             "ticker":   ticker,
