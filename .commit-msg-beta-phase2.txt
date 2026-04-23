@@ -1,0 +1,49 @@
+beta: /beta dashboard page + per-model detail views (Phase 2)
+
+Surfaces the beta framework from Phase 1 as a user-visible dashboard.
+Each beta model gets its own isolated view — no cross-model aggregation,
+no mixing with live stats.
+
+New routes:
+- GET /beta                   — grid of model cards
+- GET /beta/<model_id>        — isolated per-model detail page
+- GET /api/beta               — JSON: all models (historical + registered)
+- GET /api/beta/<model_id>    — JSON: one model's stats + open + history
+
+New helpers in app.py:
+- _empty_model_summary(mid, strategy)  — zeroed stats shape
+- _aggregate_beta_by_model(trades)     — group is_beta trades by model_id,
+                                          compute WR / ROI / PnL per model
+- _registered_beta_ids()                — currently-registered models from
+                                          bot.beta_strategies (Phase 3+)
+
+The grid union-merges models that have trade history with models that
+are registered but haven't fired yet, so Phase 0 "waiting for first
+fire" strategies still appear. Models whose historical trades exist but
+that are no longer in bot.beta_strategies render as "retired".
+
+Templates:
+- templates/beta.html         — dark theme, auto-refresh every 10s,
+                                  card grid, Active/Retired status pills
+- templates/beta_detail.html  — summary stats, open positions table,
+                                  trade history table (last 100)
+
+Main dashboard gets a 🧪 Beta nav link in the header next to 🔬 Analysis,
+with a muted-yellow count badge when any models exist. Badge polls
+/api/beta independently of /api/status so a beta API error can't degrade
+the main dashboard.
+
+Isolation tests (Flask test client):
+- /api/beta groups by beta_model_id, no cross-contamination between
+  CONSENSUS_V1 and EXPIRY_DECAY_V1 sample models
+- /api/beta/<model_id> returns only that model's trades; unknown → 404
+- /api/status, /api/report/last24h, /api/pnl_windows still exclude beta
+  by default; ?include_beta=1 escape hatch works for all three
+- Page templates render, reference the right endpoints, match dashboard
+  theme
+
+Still no beta strategies registered in bot.beta_strategies — this commit
+is deployable without functional change to live trading. Empty state
+message on /beta explains that Phase 3 will add CONSENSUS_V1.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
