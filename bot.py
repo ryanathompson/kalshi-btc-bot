@@ -189,6 +189,12 @@ LAG_ENABLED       = os.getenv("LAG_ENABLED",       "true").lower() == "true"
 CONSENSUS_ENABLED = os.getenv("CONSENSUS_ENABLED", "true").lower() == "true"   # re-enabled v2.0 for dry-run validation
 SNIPER_ENABLED    = os.getenv("SNIPER_ENABLED",    "true").lower()  == "true"
 
+# ── Beta models (Phase 3+) ──────────────────────────────────────────
+# Beta strategies run alongside live, always dry-run, tagged with
+# beta_model_id for isolated reporting. See /beta on the dashboard.
+# Enable each independently via its own env var.
+CONSENSUS_V1_BETA_ENABLED = os.getenv("CONSENSUS_V1_BETA_ENABLED", "false").lower() == "true"
+
 # ── v2.0 Unified stake ───────────────────────────────────────────────
 # Single max-stake-per-trade replaces the old per-strategy LAG_STAKE /
 # CONSENSUS_STAKE split.  Every strategy draws from the same budget;
@@ -2178,11 +2184,24 @@ class KalshiBot:
         # Beta strategy registry. Beta strategies always run dry-run, produce
         # trade records tagged is_beta=True + beta_model_id=<id>, and do NOT
         # participate in auto-scoring, disagreement gating, or position
-        # monitoring. Populated in Phase 3 — empty by default.
+        # monitoring.
         self.beta_strategies      = []
         # Per-beta-model per-cycle dedup. Separate from self.traded_this_market
         # so beta open positions don't block live strategies and vice versa.
         self.beta_traded_by_model = {}  # model_id -> set of tickers
+        # ── CONSENSUS_V1 beta (Phase 3) ───────────────────────────
+        # Re-runs the same ConsensusStrategy logic as a shadow model, fully
+        # isolated from the live self.consensus instance (which Ryan turned
+        # off). Uses the same max_stake so simulated P&L is apples-to-apples
+        # with what the live version would have done. State (last_result,
+        # cooldowns, etc.) is fresh on this instance — no cross-talk with
+        # self.consensus beyond the shared previous-result sync in run_once.
+        if CONSENSUS_V1_BETA_ENABLED:
+            self.beta_strategies.append(ConsensusStrategy(
+                max_stake,
+                is_beta=True,
+                beta_model_id="CONSENSUS_V1",
+            ))
         # [v2.0] New components
         self.scorer    = StrategyScorer()
         self.monitor   = PositionMonitor()
@@ -2292,6 +2311,16 @@ class KalshiBot:
             self.consensus.update_previous(markets, self.client)
         except Exception:
             pass
+
+        # Share the same previous-result ground truth with any beta
+        # ConsensusStrategy instances so they don't double-poll the
+        # settled-markets API. The previous-result signal is objective
+        # ground truth — there's no experimental value in each beta
+        # instance querying it independently.
+        for _bs in self.beta_strategies:
+            if isinstance(_bs, ConsensusStrategy):
+                _bs.last_result      = self.consensus.last_result
+                _bs.last_result_time = self.consensus.last_result_time
 
         # 4. Risk check
         ok, reason = self.risk.check(self.client)
@@ -2553,6 +2582,14 @@ class KalshiBot:
         snp_state = "ENABLED" if SNIPER_ENABLED else "DISABLED"
         print(f"   Max stake:       ${self.max_stake}/trade (all strategies)")
         print(f"   LAG [{lag_state}]  CONSENSUS [{con_state}]  SNIPER [{snp_state}]")
+        if self.beta_strategies:
+            beta_ids = ", ".join(
+                getattr(bs, "beta_model_id", None) or bs.name
+                for bs in self.beta_strategies
+            )
+            print(f"   BETA models ({len(self.beta_strategies)}): {beta_ids}")
+        else:
+            print(f"   BETA models: (none registered)")
         print(f"   SNIPER overrides: lottery=${self.sniper.lottery_stake}  "
               f"conviction=${self.sniper.conviction_stake}")
         print(f"   Sniper 5m momentum floor: {SNIPER_5M_MIN_MOMENTUM*100:.3f}%  "
