@@ -1,0 +1,374 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Beta Model — {{ model_id }}</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🧪</text></svg>">
+  <style>
+    :root {
+      --bg:      #0d1117;
+      --panel:   #161b22;
+      --border:  #30363d;
+      --text:    #e6edf3;
+      --muted:   #8b949e;
+      --green:   #3fb950;
+      --red:     #f85149;
+      --yellow:  #d29922;
+      --blue:    #58a6ff;
+      --cyan:    #79c0ff;
+      --purple:  #bc8cff;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 14px;
+      line-height: 1.5;
+    }
+    a { color: var(--blue); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+
+    header {
+      background: var(--panel);
+      border-bottom: 1px solid var(--border);
+      padding: 12px 24px;
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      position: sticky;
+      top: 0;
+      z-index: 100;
+    }
+    header h1 {
+      font-size: 16px;
+      font-weight: 600;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .model-id-chip {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-weight: 700;
+      color: var(--yellow);
+      background: rgba(210, 153, 34, 0.1);
+      border: 1px solid rgba(210, 153, 34, 0.3);
+      padding: 2px 10px;
+      border-radius: 12px;
+      font-size: 12px;
+    }
+    .nav-link {
+      color: var(--muted);
+      font-size: 13px;
+      padding: 4px 10px;
+      border-radius: 6px;
+      border: 1px solid transparent;
+    }
+    .nav-link:hover {
+      color: var(--text);
+      border-color: var(--border);
+      text-decoration: none;
+    }
+
+    .status-pill {
+      font-size: 10px;
+      font-weight: 600;
+      letter-spacing: .06em;
+      text-transform: uppercase;
+      padding: 2px 8px;
+      border-radius: 10px;
+    }
+    .status-pill.active {
+      color: var(--green);
+      background: rgba(63, 185, 80, 0.1);
+      border: 1px solid rgba(63, 185, 80, 0.3);
+    }
+    .status-pill.retired {
+      color: var(--muted);
+      background: rgba(139, 148, 158, 0.08);
+      border: 1px solid var(--border);
+    }
+
+    main {
+      max-width: 1280px;
+      margin: 0 auto;
+      padding: 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+    }
+
+    .summary-card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 20px;
+    }
+    .summary-header {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 16px;
+    }
+    .summary-header .strategy {
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: .06em;
+      color: var(--muted);
+    }
+    .stats-grid {
+      display: grid;
+      grid-template-columns: repeat(6, 1fr);
+      gap: 12px 24px;
+    }
+    @media (max-width: 900px) {
+      .stats-grid { grid-template-columns: repeat(3, 1fr); }
+    }
+    .stat label {
+      display: block;
+      font-size: 10px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: .06em;
+      margin-bottom: 2px;
+    }
+    .stat .v { font-size: 18px; font-weight: 700; }
+    .stat .v.pos { color: var(--green); }
+    .stat .v.neg { color: var(--red); }
+    .stat .v.neu { color: var(--text); }
+    .stat .v.muted { color: var(--muted); }
+
+    .section-title {
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin-bottom: 10px;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      overflow: hidden;
+    }
+    th, td {
+      text-align: left;
+      padding: 8px 12px;
+      font-size: 13px;
+      border-bottom: 1px solid var(--border);
+    }
+    th {
+      background: rgba(255,255,255,0.02);
+      color: var(--muted);
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: .06em;
+      font-weight: 600;
+    }
+    tr:last-child td { border-bottom: none; }
+    td.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+    td.pos { color: var(--green); }
+    td.neg { color: var(--red); }
+    td.muted { color: var(--muted); }
+
+    .empty-row {
+      color: var(--muted);
+      font-style: italic;
+      padding: 24px;
+      text-align: center;
+    }
+    .banner-note {
+      font-size: 12px;
+      color: var(--muted);
+      padding: 10px 14px;
+      background: rgba(210, 153, 34, 0.08);
+      border: 1px solid rgba(210, 153, 34, 0.2);
+      border-radius: 6px;
+    }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>🧪 Beta Model</h1>
+  <span class="model-id-chip">{{ model_id }}</span>
+  <a href="/beta" class="nav-link">← All Beta Models</a>
+  <a href="/" class="nav-link">Live Dashboard →</a>
+</header>
+
+<main>
+
+  <div class="banner-note">
+    All fills below are simulated (optimistic fill at signal price, no slippage modeled). Kalshi has no record of these trades. Promotion bar: see <a href="#">docs/beta_promotion.md</a>.
+  </div>
+
+  <div class="summary-card" id="summary-card">
+    <div class="summary-header">
+      <span id="strategy-name" class="strategy">—</span>
+      <span id="status-pill" class="status-pill retired">Unknown</span>
+    </div>
+    <div class="stats-grid">
+      <div class="stat"><label>Fires</label><span class="v neu" id="s-total">0</span></div>
+      <div class="stat"><label>Open</label><span class="v muted" id="s-open">0</span></div>
+      <div class="stat"><label>Wins</label><span class="v pos" id="s-wins">0</span></div>
+      <div class="stat"><label>Losses</label><span class="v neg" id="s-losses">0</span></div>
+      <div class="stat"><label>Win Rate</label><span class="v neu" id="s-wr">0.0%</span></div>
+      <div class="stat"><label>ROI</label><span class="v neu" id="s-roi">0.0%</span></div>
+      <div class="stat"><label>PnL</label><span class="v neu" id="s-pnl">$0.00</span></div>
+      <div class="stat"><label>Wagered</label><span class="v neu" id="s-wagered">$0.00</span></div>
+      <div class="stat"><label>No Fills</label><span class="v muted" id="s-nofills">0</span></div>
+      <div class="stat"><label>First Fire</label><span class="v muted" id="s-first" style="font-size:12px;">—</span></div>
+      <div class="stat"><label>Last Fire</label><span class="v muted" id="s-last" style="font-size:12px;">—</span></div>
+    </div>
+  </div>
+
+  <div>
+    <div class="section-title">Open Positions (Simulated)</div>
+    <table>
+      <thead><tr><th>Ticker</th><th>Side</th><th>Price</th><th>Count</th><th>Dollars</th><th>Age</th></tr></thead>
+      <tbody id="open-body"><tr><td class="empty-row" colspan="6">No open positions.</td></tr></tbody>
+    </table>
+  </div>
+
+  <div>
+    <div class="section-title">Trade History (last 100)</div>
+    <table>
+      <thead><tr>
+        <th>Time</th><th>Ticker</th><th>Side</th><th>Price</th>
+        <th>Count</th><th>Dollars</th><th>Result</th><th>PnL</th>
+      </tr></thead>
+      <tbody id="history-body"><tr><td class="empty-row" colspan="8">No resolved trades yet.</td></tr></tbody>
+    </table>
+  </div>
+
+</main>
+
+<script>
+const MODEL_ID = {{ model_id | tojson }};
+const $ = (sel) => document.querySelector(sel);
+
+function fmtDollars(n) {
+  if (n === null || n === undefined) return "$0.00";
+  const sign = n < 0 ? "-" : "";
+  return sign + "$" + Math.abs(n).toFixed(2);
+}
+function fmtPct(n) {
+  if (n === null || n === undefined) return "0.0%";
+  return n.toFixed(1) + "%";
+}
+function classifyPnL(n) {
+  if (n > 0)  return "pos";
+  if (n < 0)  return "neg";
+  return "muted";
+}
+function fmtDate(s) {
+  if (!s) return "—";
+  try {
+    const d = new Date(s);
+    if (isNaN(d)) return s;
+    return d.toLocaleString([], {
+      month: "short", day: "numeric",
+      hour: "2-digit", minute: "2-digit",
+    });
+  } catch {
+    return s;
+  }
+}
+
+function renderSummary(m) {
+  $("#strategy-name").textContent = m.strategy || "—";
+  const pill = $("#status-pill");
+  pill.textContent = m.registered ? "Active" : "Retired";
+  pill.className = "status-pill " + (m.registered ? "active" : "retired");
+
+  $("#s-total").textContent   = m.total;
+  $("#s-open").textContent    = m.open;
+  $("#s-wins").textContent    = m.wins;
+  $("#s-losses").textContent  = m.losses;
+  $("#s-wr").textContent      = fmtPct(m.wr);
+  $("#s-nofills").textContent = m.no_fills;
+  $("#s-wagered").textContent = fmtDollars(m.wagered);
+
+  const roiEl = $("#s-roi");
+  roiEl.textContent = fmtPct(m.roi);
+  roiEl.className = "v " + classifyPnL(m.roi);
+  const pnlEl = $("#s-pnl");
+  pnlEl.textContent = fmtDollars(m.pnl);
+  pnlEl.className = "v " + classifyPnL(m.pnl);
+
+  $("#s-first").textContent = fmtDate(m.first_fire_at);
+  $("#s-last").textContent  = fmtDate(m.last_fire_at);
+}
+
+function renderOpen(rows) {
+  const body = $("#open-body");
+  if (!rows || rows.length === 0) {
+    body.innerHTML = `<tr><td class="empty-row" colspan="6">No open positions.</td></tr>`;
+    return;
+  }
+  body.innerHTML = rows.map(r => `
+    <tr>
+      <td class="mono">${r.ticker || "—"}</td>
+      <td>${(r.side || "").toUpperCase()}</td>
+      <td>${r.price != null ? r.price + "¢" : "—"}</td>
+      <td>${r.count ?? "—"}</td>
+      <td>${fmtDollars(r.dollars)}</td>
+      <td class="muted">${r.age || "—"}</td>
+    </tr>
+  `).join("");
+}
+
+function renderHistory(rows) {
+  const body = $("#history-body");
+  if (!rows || rows.length === 0) {
+    body.innerHTML = `<tr><td class="empty-row" colspan="8">No resolved trades yet.</td></tr>`;
+    return;
+  }
+  body.innerHTML = rows.map(r => {
+    const pnlCls  = classifyPnL(r.pnl);
+    const resultCls = r.result === "WIN"  ? "pos"
+                    : r.result === "LOSS" ? "neg"
+                    : "muted";
+    return `
+      <tr>
+        <td class="mono muted">${r.ts_short || r.timestamp || "—"}</td>
+        <td class="mono">${r.ticker || "—"}</td>
+        <td>${(r.side || "").toUpperCase()}</td>
+        <td>${r.price != null ? r.price + "¢" : "—"}</td>
+        <td>${r.count ?? "—"}</td>
+        <td>${fmtDollars(r.dollars)}</td>
+        <td class="${resultCls}">${r.result || "—"}</td>
+        <td class="${pnlCls}">${fmtDollars(r.pnl)}</td>
+      </tr>
+    `;
+  }).join("");
+}
+
+async function refresh() {
+  try {
+    const r = await fetch(`/api/beta/${encodeURIComponent(MODEL_ID)}`);
+    if (r.status === 404) {
+      document.body.innerHTML = `<main><div class="banner-note">Unknown beta model: <code>${MODEL_ID}</code>. <a href="/beta">Back to all beta models</a>.</div></main>`;
+      return;
+    }
+    if (!r.ok) throw new Error(r.status);
+    const data = await r.json();
+    renderSummary(data.model);
+    renderOpen(data.open_trades);
+    renderHistory(data.history);
+  } catch (e) {
+    console.error("beta detail refresh failed:", e);
+  }
+}
+
+refresh();
+setInterval(refresh, 10000);
+</script>
+
+</body>
+</html>

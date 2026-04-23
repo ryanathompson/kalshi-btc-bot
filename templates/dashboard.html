@@ -737,6 +737,7 @@
   <h1>🤖 Kalshi BTC Bot</h1>
   <span id="mode-badge" class="badge badge-offline"><span class="dot"></span> Loading</span>
   <a href="/analysis" class="nav-link" title="Replay Consensus over real history to check for edge">🔬 Analysis</a>
+  <a href="/beta" class="nav-link" title="Beta models — isolated dry-run sandbox">🧪 Beta<span id="beta-count" style="margin-left:4px;padding:1px 6px;border-radius:8px;background:rgba(210,153,34,.15);color:var(--yellow);font-size:10px;display:none;"></span></a>
   <div id="halt-controls" class="halt-controls">
     <span id="halt-countdown" title="Time until automatic halt reset at 00:00 ET">--:--:--</span>
     <button id="reset-halt-btn" type="button" title="Force-clear the halt right now">Reset Now</button>
@@ -1970,6 +1971,27 @@
 
   refresh();
   setInterval(refresh, 5000);
+
+  // Beta model count badge in the header. Independent of the main /api/status
+  // refresh loop since /api/beta has a different shape and we don't want to
+  // couple the two — if /api/beta errors, the dashboard keeps working.
+  async function refreshBetaCount() {
+    try {
+      const r = await fetch('/api/beta');
+      if (!r.ok) return;
+      const data = await r.json();
+      const el = document.getElementById('beta-count');
+      const count = data.count || 0;
+      if (count > 0) {
+        el.textContent = String(count);
+        el.style.display = 'inline-block';
+      } else {
+        el.style.display = 'none';
+      }
+    } catch { /* non-fatal */ }
+  }
+  refreshBetaCount();
+  setInterval(refreshBetaCount, 30000);
 </script>
 
 <!-- RESET CONFIRM MODAL -->

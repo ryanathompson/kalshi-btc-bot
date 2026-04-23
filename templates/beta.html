@@ -1,0 +1,309 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Beta Models — Kalshi BTC Bot</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🧪</text></svg>">
+  <style>
+    :root {
+      --bg:      #0d1117;
+      --panel:   #161b22;
+      --border:  #30363d;
+      --text:    #e6edf3;
+      --muted:   #8b949e;
+      --green:   #3fb950;
+      --red:     #f85149;
+      --yellow:  #d29922;
+      --blue:    #58a6ff;
+      --cyan:    #79c0ff;
+      --purple:  #bc8cff;
+      --orange:  #ffa657;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 14px;
+      line-height: 1.5;
+    }
+    a { color: var(--blue); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+
+    header {
+      background: var(--panel);
+      border-bottom: 1px solid var(--border);
+      padding: 12px 24px;
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      position: sticky;
+      top: 0;
+      z-index: 100;
+    }
+    header h1 {
+      font-size: 16px;
+      font-weight: 600;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .beta-chip {
+      background: rgba(210, 153, 34, 0.15);
+      color: var(--yellow);
+      border: 1px solid rgba(210, 153, 34, 0.4);
+      padding: 2px 10px;
+      border-radius: 12px;
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: .04em;
+      text-transform: uppercase;
+    }
+    .nav-link {
+      color: var(--muted);
+      font-size: 13px;
+      padding: 4px 10px;
+      border-radius: 6px;
+      border: 1px solid transparent;
+    }
+    .nav-link:hover {
+      color: var(--text);
+      border-color: var(--border);
+      text-decoration: none;
+    }
+
+    main {
+      max-width: 1280px;
+      margin: 0 auto;
+      padding: 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+    }
+
+    .intro {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 16px 20px;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.6;
+    }
+    .intro strong { color: var(--text); }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+      gap: 16px;
+    }
+    .model-card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 18px 20px;
+      transition: border-color 0.15s;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+    .model-card:hover {
+      border-color: var(--blue);
+    }
+    .model-card a { color: inherit; text-decoration: none; display: block; }
+    .model-card a:hover { text-decoration: none; }
+
+    .model-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+    }
+    .model-id {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 14px;
+      font-weight: 700;
+      color: var(--text);
+    }
+    .status-pill {
+      font-size: 10px;
+      font-weight: 600;
+      letter-spacing: .06em;
+      text-transform: uppercase;
+      padding: 2px 8px;
+      border-radius: 10px;
+    }
+    .status-pill.active {
+      color: var(--green);
+      background: rgba(63, 185, 80, 0.1);
+      border: 1px solid rgba(63, 185, 80, 0.3);
+    }
+    .status-pill.retired {
+      color: var(--muted);
+      background: rgba(139, 148, 158, 0.08);
+      border: 1px solid var(--border);
+    }
+    .model-strategy {
+      font-size: 11px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: .06em;
+    }
+
+    .stats {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 8px 16px;
+    }
+    .stat label {
+      display: block;
+      font-size: 10px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: .06em;
+      margin-bottom: 2px;
+    }
+    .stat .v {
+      font-size: 16px;
+      font-weight: 700;
+    }
+    .stat .v.pos { color: var(--green); }
+    .stat .v.neg { color: var(--red); }
+    .stat .v.neu { color: var(--text); }
+    .stat .v.muted { color: var(--muted); }
+
+    .last-fire {
+      font-size: 11px;
+      color: var(--muted);
+    }
+
+    .empty-state {
+      text-align: center;
+      padding: 60px 20px;
+      color: var(--muted);
+      background: var(--panel);
+      border: 1px dashed var(--border);
+      border-radius: 8px;
+    }
+    .empty-state strong { color: var(--text); display: block; margin-bottom: 6px; }
+
+    .footer-note {
+      font-size: 11px;
+      color: var(--muted);
+      text-align: center;
+      padding: 8px 0;
+    }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>🧪 Beta Models</h1>
+  <span class="beta-chip">sandbox · dry-run only</span>
+  <a href="/" class="nav-link">← Live Dashboard</a>
+</header>
+
+<main>
+  <div class="intro">
+    <strong>Beta models are isolated.</strong> They run alongside the live bot but never place real orders and never contribute to live stats. Each model's performance is reported in isolation — there is no combined "beta book" number because these are independent experiments. Promote a beta model to live only after it clears the criteria documented in <a href="#">docs/beta_promotion.md</a>.
+  </div>
+
+  <div id="grid" class="grid"></div>
+
+  <div class="footer-note" id="footer-note"></div>
+</main>
+
+<script>
+const $ = (sel, parent=document) => parent.querySelector(sel);
+
+function fmtDollars(n) {
+  if (n === null || n === undefined) return "$0.00";
+  const sign = n < 0 ? "-" : "";
+  return sign + "$" + Math.abs(n).toFixed(2);
+}
+function fmtPct(n) {
+  if (n === null || n === undefined) return "0.0%";
+  return n.toFixed(1) + "%";
+}
+function classifyPnL(n) {
+  if (n > 0)  return "pos";
+  if (n < 0)  return "neg";
+  return "muted";
+}
+function fmtDate(s) {
+  if (!s) return "—";
+  try {
+    const d = new Date(s);
+    if (isNaN(d)) return s;
+    return d.toLocaleString([], {
+      month: "short", day: "numeric",
+      hour: "2-digit", minute: "2-digit",
+    });
+  } catch {
+    return s;
+  }
+}
+
+function renderModelCard(m) {
+  const pnlClass = classifyPnL(m.pnl);
+  const roiClass = classifyPnL(m.roi);
+  const status   = m.registered
+    ? `<span class="status-pill active">Active</span>`
+    : `<span class="status-pill retired">Retired</span>`;
+  return `
+    <div class="model-card">
+      <a href="/beta/${encodeURIComponent(m.model_id)}">
+        <div class="model-header">
+          <span class="model-id">${m.model_id}</span>
+          ${status}
+        </div>
+        <div class="model-strategy">${m.strategy || "—"}</div>
+        <div class="stats">
+          <div class="stat"><label>Fires</label><span class="v neu">${m.total}</span></div>
+          <div class="stat"><label>WR</label><span class="v neu">${fmtPct(m.wr)}</span></div>
+          <div class="stat"><label>ROI</label><span class="v ${roiClass}">${fmtPct(m.roi)}</span></div>
+          <div class="stat"><label>PnL</label><span class="v ${pnlClass}">${fmtDollars(m.pnl)}</span></div>
+        </div>
+        <div class="last-fire">
+          Last fire: <strong>${fmtDate(m.last_fire_at)}</strong>
+          ${m.open ? ` · ${m.open} open` : ""}
+        </div>
+      </a>
+    </div>
+  `;
+}
+
+async function refresh() {
+  try {
+    const r = await fetch("/api/beta");
+    if (!r.ok) throw new Error(r.status);
+    const data = await r.json();
+    const grid = $("#grid");
+    const note = $("#footer-note");
+    if (!data.models || data.models.length === 0) {
+      grid.innerHTML = `
+        <div class="empty-state" style="grid-column: 1 / -1;">
+          <strong>No beta models yet.</strong>
+          The framework is in place and ready to accept registered models via
+          <code>KalshiBot.beta_strategies</code>. Phase 3 adds CONSENSUS_V1.
+        </div>`;
+      note.textContent = "";
+      return;
+    }
+    grid.innerHTML = data.models.map(renderModelCard).join("");
+    const active = data.registered || 0;
+    const total  = data.count || 0;
+    const retired = total - active;
+    note.innerHTML = `${total} model${total===1?"":"s"} — ${active} active, ${retired} retired`;
+  } catch (e) {
+    $("#grid").innerHTML = `<div class="empty-state" style="grid-column: 1 / -1; color: var(--red);">Failed to load beta models: ${e.message || e}</div>`;
+  }
+}
+
+refresh();
+setInterval(refresh, 10000);  // refresh every 10s
+</script>
+
+</body>
+</html>

@@ -1260,6 +1260,175 @@ def api_analysis_run():
 
 
 
+# ─────────────────────────────────────────────────────────────
+# BETA MODELS — isolated dry-run sandbox
+# ─────────────────────────────────────────────────────────────
+# Beta strategies run alongside live strategies but produce trade records
+# tagged is_beta=True + beta_model_id=<id>. Each model has its own isolated
+# view at /beta/<model_id>. There is deliberately no combined "beta portfolio"
+# number — models are independent experiments, not a coordinated book.
+
+def _empty_model_summary(model_id, strategy_name):
+    return {
+        "model_id":      model_id,
+        "strategy":      strategy_name,
+        "total":         0,
+        "wins":          0,
+        "losses":        0,
+        "no_fills":      0,
+        "open":          0,
+        "pnl":           0.0,
+        "wagered":       0.0,
+        "wr":            0.0,
+        "roi":           0.0,
+        "first_fire_at": None,
+        "last_fire_at":  None,
+    }
+
+
+def _aggregate_beta_by_model(trades):
+    """Group beta trades by beta_model_id and compute per-model stats.
+
+    Expects trades already filtered to is_beta=True (defensive filter inside).
+    """
+    by_model = {}
+    for t in trades:
+        if not t.get("is_beta"):
+            continue
+        mid = t.get("beta_model_id") or "UNKNOWN"
+        m = by_model.setdefault(
+            mid, _empty_model_summary(mid, t.get("strategy") or "")
+        )
+        m["total"] += 1
+        ts = t.get("timestamp")
+        if ts:
+            if m["first_fire_at"] is None or str(ts) < str(m["first_fire_at"]):
+                m["first_fire_at"] = ts
+            if m["last_fire_at"] is None or str(ts) > str(m["last_fire_at"]):
+                m["last_fire_at"] = ts
+        res = t.get("result")
+        if   res == "WIN":     m["wins"]     += 1
+        elif res == "LOSS":    m["losses"]   += 1
+        elif res == "NO_FILL": m["no_fills"] += 1
+        elif res is None:      m["open"]     += 1
+        m["wagered"] += float(t.get("dollars") or 0)
+        m["pnl"]     += float(t.get("pnl")     or 0)
+
+    for m in by_model.values():
+        resolved = m["wins"] + m["losses"]
+        m["wr"]      = round(m["wins"] / resolved * 100, 1) if resolved else 0.0
+        m["roi"]     = round(m["pnl"]  / m["wagered"] * 100, 1) if m["wagered"] else 0.0
+        m["pnl"]     = round(m["pnl"],     2)
+        m["wagered"] = round(m["wagered"], 2)
+    return by_model
+
+
+def _registered_beta_ids():
+    """Return (dict model_id -> strategy name, set of registered ids)."""
+    registered = {}
+    if _bot is None:
+        return registered, set()
+    for bs in getattr(_bot, "beta_strategies", []) or []:
+        mid = getattr(bs, "beta_model_id", None) or getattr(bs, "name", None)
+        if mid:
+            registered[mid] = getattr(bs, "name", mid)
+    return registered, set(registered.keys())
+
+
+@app.route("/beta")
+def beta_page():
+    return render_template("beta.html")
+
+
+@app.route("/beta/<model_id>")
+def beta_detail_page(model_id):
+    return render_template("beta_detail.html", model_id=model_id)
+
+
+@app.route("/api/beta")
+def api_beta():
+    """Summary of all beta models. Merges historical (trade log) with
+    registered-but-silent (bot.beta_strategies) so Phase 0 "waiting for
+    first fire" models still appear on the grid.
+    """
+    beta_trades = [t for t in load_trades() if t.get("is_beta")]
+    by_model = _aggregate_beta_by_model(beta_trades)
+
+    registered, active_ids = _registered_beta_ids()
+    for mid, strat_name in registered.items():
+        if mid not in by_model:
+            by_model[mid] = _empty_model_summary(mid, strat_name)
+
+    for mid, m in by_model.items():
+        m["registered"] = mid in active_ids
+
+    def _sort_key(m):
+        return (
+            0 if m["registered"] else 1,
+            -1 if m.get("last_fire_at") else 0,
+            str(m.get("last_fire_at") or "") or m["model_id"],
+        )
+    models = sorted(by_model.values(), key=_sort_key)
+
+    return jsonify({
+        "models":     models,
+        "count":      len(models),
+        "registered": len(active_ids),
+    })
+
+
+@app.route("/api/beta/<model_id>")
+def api_beta_detail(model_id):
+    """Isolated view for a single beta model. Never reveals other models."""
+    beta_trades = [
+        t for t in load_trades()
+        if t.get("is_beta") and t.get("beta_model_id") == model_id
+    ]
+
+    summary = _aggregate_beta_by_model(beta_trades).get(model_id)
+
+    registered, active_ids = _registered_beta_ids()
+    if summary is None and model_id in registered:
+        summary = _empty_model_summary(model_id, registered[model_id])
+    if summary is None:
+        return jsonify({"error": f"Unknown beta model: {model_id}"}), 404
+    summary["registered"] = model_id in active_ids
+
+    def _sort_key(t):
+        ms = _to_epoch_ms(t.get("timestamp"))
+        return ms if ms is not None else -1
+
+    history = sorted(
+        [t for t in beta_trades if t.get("result")],
+        key=_sort_key, reverse=True,
+    )[:100]
+
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+
+    def fmt_open(t):
+        dt = parse_trade_ts(t.get("timestamp"))
+        if dt is None:
+            age = "—"
+        else:
+            age_s = (now_utc - dt).total_seconds()
+            if age_s < 0:       age = "just now"
+            elif age_s < 3600:  age = f"{int(age_s // 60)}m ago"
+            else:               age = f"{int(age_s // 3600)}h ago"
+        return {**t, "age": age, "ts_et": _fmt_et(t.get("timestamp"))}
+
+    def fmt_hist(t):
+        return {**t, "ts_short": _fmt_et(t.get("timestamp"))}
+
+    open_trades = [fmt_open(t) for t in beta_trades if not t.get("result")]
+    history_out = [fmt_hist(t) for t in history]
+
+    return jsonify({
+        "model":       summary,
+        "open_trades": open_trades,
+        "history":     history_out,
+    })
+
+
 # âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 # BOT BACKGROUND THREAD
 # âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
