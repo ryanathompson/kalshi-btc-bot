@@ -40,6 +40,11 @@ from backtest_consensus import (
     DEFAULT_SWEEP_DEAD_ZONES, DEFAULT_BASE_PRICE, DEFAULT_MAX_PRICE,
 )
 
+from reconcile_snapshot import (
+    run_snapshot_once as _run_snapshot_once,
+    start_snapshot_scheduler as _start_snapshot_scheduler,
+)
+
 load_dotenv()
 
 app = Flask(__name__)
@@ -646,6 +651,44 @@ def api_reconcile():
     payload = dict(payload)
     payload["_cached"] = False
     return jsonify(payload)
+
+
+@app.route("/api/reconcile/snapshot", methods=["POST"])
+def api_reconcile_snapshot():
+    """Manually trigger a reconcile snapshot commit.
+
+    Used for backfilling specific dates or for on-demand snapshots outside
+    the daily cadence. Gated by the `X-Snapshot-Token` header, which must
+    match the `SNAPSHOT_TRIGGER_TOKEN` env var.
+
+    Query / body params:
+      date=YYYY-MM-DD   — override the snapshot filename (default: today UTC)
+
+    Returns the GitHub API response on success.
+    """
+    expected = os.getenv("SNAPSHOT_TRIGGER_TOKEN") or ""
+    provided = request.headers.get("X-Snapshot-Token", "")
+    if not expected:
+        return jsonify({"error": "SNAPSHOT_TRIGGER_TOKEN not configured"}), 503
+    if provided != expected:
+        return jsonify({"error": "unauthorized"}), 401
+
+    date_str = request.args.get("date")
+    if not date_str and request.is_json:
+        date_str = (request.get_json(silent=True) or {}).get("date")
+
+    try:
+        result = _run_snapshot_once(_build_reconcile_payload, date_str=date_str)
+    except Exception as e:
+        app.logger.exception("snapshot trigger failed")
+        return jsonify({"error": str(e)}), 500
+
+    return jsonify({
+        "ok":         True,
+        "path":       (result.get("content") or {}).get("path"),
+        "commit_sha": (result.get("commit")  or {}).get("sha"),
+        "html_url":   (result.get("content") or {}).get("html_url"),
+    })
 
 
 # ────────────────────────────────────────────────────────────
@@ -1273,6 +1316,14 @@ def _bot_thread():
             if i < 2:
                 time.sleep(5)
         print("[bot] Warmup done â entering main loop", flush=True)
+
+        # Daily reconcile snapshot -> GitHub (replaces Chrome-routed scheduled task).
+        # No-op if GITHUB_PAT is not set or RECONCILE_SNAPSHOT_ENABLED=false.
+        try:
+            _start_snapshot_scheduler(_build_reconcile_payload)
+        except Exception as e:
+            print(f"[bot] reconcile snapshot scheduler failed to start: {e}",
+                  flush=True)
 
         _last_resolve = 0
 
