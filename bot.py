@@ -265,6 +265,29 @@ KELLY_FRACTION      = float(os.getenv("KELLY_FRACTION", "0.25"))   # quarter-Kel
 KELLY_MAX_BET_PCT   = float(os.getenv("KELLY_MAX_BET_PCT", "0.10"))  # never bet >10% of bankroll
 KELLY_MIN_TRADES    = int(os.getenv("KELLY_MIN_TRADES", "10"))     # need N trades before trusting rolling stats
 
+# Kelly correlation adjustment — phase-1 log-only instrumentation.
+# ──────────────────────────────────────────────────────────────────
+# Kelly in bot.py is currently sized per-trade with no awareness of
+# other open positions, so stacked correlated bets (e.g. back-to-back
+# 15-min markets same side) effectively oversize the portfolio. This
+# block computes a correlation shrinkage factor and decorates every
+# signal record with both raw and adjusted Kelly stakes — but does
+# NOT mutate the actual order in phase 1. Flip to apply-mode later by
+# setting CORR_ADJ_ENABLED=true and CORR_ADJ_LOG_ONLY=false (phase 2
+# wiring lives in annotate_correlation; search "phase 2").
+#
+# Buckets (against open same-side positions, by close-time delta):
+#   ≤15 min → OVERLAP   (back-to-back window, highest correlation)
+#   15–60   → CLOSE     (same hour)
+#   >60 same ET-day → SAME_DAY
+# Factors compose multiplicatively; floored at CORR_ADJ_MIN_FLOOR.
+CORR_ADJ_ENABLED         = os.getenv("CORR_ADJ_ENABLED",  "false").lower() == "true"
+CORR_ADJ_LOG_ONLY        = os.getenv("CORR_ADJ_LOG_ONLY", "true").lower()  == "true"
+CORR_ADJ_OVERLAP_FACTOR  = float(os.getenv("CORR_ADJ_OVERLAP_FACTOR",  "0.5"))
+CORR_ADJ_CLOSE_FACTOR    = float(os.getenv("CORR_ADJ_CLOSE_FACTOR",    "0.7"))
+CORR_ADJ_SAME_DAY_FACTOR = float(os.getenv("CORR_ADJ_SAME_DAY_FACTOR", "0.9"))
+CORR_ADJ_MIN_FLOOR       = float(os.getenv("CORR_ADJ_MIN_FLOOR",       "0.25"))
+
 # Known edge parameters (from analyze_edge.py ground-truth data).
 # These are used as priors until enough live trades accumulate for
 # rolling stats to take over via StrategyScorer.
@@ -2056,6 +2079,147 @@ class SniperStrategy:
 
 
 # ──────────────────────────────────────────────────────────────
+# KELLY CORRELATION INSTRUMENTATION (phase-1: log-only)
+# ──────────────────────────────────────────────────────────────
+
+_MONTH_ABBREV = {
+    "JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
+    "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12,
+}
+
+
+def _parse_ticker_close_time(ticker):
+    """Parse Kalshi KXBTC15M ticker → market close datetime (UTC), or None.
+
+    Format observed in reconcile_archive/*.json and live fills:
+        KXBTC15M-<YY><MMM><DD><HH><MM>-<close_min>
+    e.g. 'KXBTC15M-26APR151945-45' → 2026-04-15 19:45 UTC.
+
+    The trailing '-MM' duplicates the closing minute and isn't used here —
+    we parse the full close timestamp from the YYMMMDDHHMM block.
+
+    Returns None on parse failure so callers can fall back to "uncorrelated"
+    instead of raising (this function is called on every logged signal).
+    """
+    if not ticker or not isinstance(ticker, str):
+        return None
+    parts = ticker.split("-")
+    if len(parts) < 2:
+        return None
+    mid = parts[1]
+    if len(mid) != 11:
+        return None
+    try:
+        yy  = int(mid[0:2])
+        mon = _MONTH_ABBREV.get(mid[2:5].upper())
+        if mon is None:
+            return None
+        dd  = int(mid[5:7])
+        hh  = int(mid[7:9])
+        mm  = int(mid[9:11])
+        return datetime.datetime(2000 + yy, mon, dd, hh, mm,
+                                 tzinfo=datetime.timezone.utc)
+    except (ValueError, IndexError):
+        return None
+
+
+def correlation_factor(proposed_signal, open_trades):
+    """Compute correlation shrinkage factor ∈ [CORR_ADJ_MIN_FLOOR, 1.0].
+
+    Compares the proposed signal against each open same-side position and
+    composes a multiplicative factor based on how close their close times
+    are. Ignores settled trades, early-exited trades, and same-ticker
+    trades (the latter are already blocked by traded_this_market).
+
+    Returns (factor, diag) where diag is a dict suitable for JSON logging.
+
+    Pure function — no I/O, no global state except the CORR_ADJ_* config.
+    """
+    ticker = proposed_signal.get("ticker", "")
+    side   = proposed_signal.get("side")
+    prop_close = _parse_ticker_close_time(ticker)
+    if prop_close is None or not side:
+        return 1.0, {"skipped": "no_close_time_or_side", "overlap_n": 0,
+                     "close_n": 0, "sameday_n": 0, "matched": []}
+
+    overlap_n = close_n = sameday_n = 0
+    matched = []
+    for t in open_trades or []:
+        if t.get("result"):              # settled
+            continue
+        if t.get("closed_by_exit"):      # already exited early
+            continue
+        if t.get("side") != side:        # opposite-direction → treated as uncorrelated v1
+            continue
+        t_ticker = t.get("ticker", "")
+        if t_ticker == ticker:           # same market — handled by traded_this_market
+            continue
+        t_close = _parse_ticker_close_time(t_ticker)
+        if t_close is None:
+            continue
+        delta_min = abs((prop_close - t_close).total_seconds()) / 60.0
+        if delta_min <= 15:
+            overlap_n += 1
+            bucket = "OVERLAP"
+        elif delta_min <= 60:
+            close_n += 1
+            bucket = "CLOSE"
+        elif prop_close.date() == t_close.date():
+            sameday_n += 1
+            bucket = "SAME_DAY"
+        else:
+            continue  # cross-day → treat as uncorrelated
+        matched.append({"ticker": t_ticker, "bucket": bucket,
+                        "delta_min": round(delta_min, 1)})
+
+    factor = 1.0
+    factor *= CORR_ADJ_OVERLAP_FACTOR  ** overlap_n
+    factor *= CORR_ADJ_CLOSE_FACTOR    ** close_n
+    factor *= CORR_ADJ_SAME_DAY_FACTOR ** sameday_n
+    factor = max(factor, CORR_ADJ_MIN_FLOOR)
+
+    return factor, {
+        "overlap_n": overlap_n,
+        "close_n":   close_n,
+        "sameday_n": sameday_n,
+        "matched":   matched,
+    }
+
+
+def annotate_correlation(signal, open_trades):
+    """Decorate a signal with correlation diagnostics before it's logged.
+
+    Phase 1 (current default — CORR_ADJ_LOG_ONLY=True):
+      Adds kelly_stake_raw / corr_factor / corr_diag / kelly_stake_adjusted.
+      Does NOT mutate kelly_stake / count / dollars. Zero behavior change.
+
+    Phase 2 (reserved — set CORR_ADJ_ENABLED=True and
+    CORR_ADJ_LOG_ONLY=False): will additionally rewrite kelly_stake, count,
+    and dollars. Kept stubbed here so the flip is a config change only.
+
+    No-ops on signals without a Kelly stake (e.g. LAG, which uses flat
+    sizing) — we only have a meaningful "adjusted" to report when Kelly
+    produced a number.
+    """
+    if not signal:
+        return signal
+    raw = signal.get("kelly_stake")
+    if raw is None:
+        return signal
+    factor, diag = correlation_factor(signal, open_trades)
+    signal["kelly_stake_raw"]      = raw
+    signal["corr_factor"]          = round(factor, 4)
+    signal["corr_diag"]            = diag
+    signal["kelly_stake_adjusted"] = round(raw * factor, 2)
+    # Phase 2 apply-mode (gated so this stays inert until we opt in):
+    if CORR_ADJ_ENABLED and not CORR_ADJ_LOG_ONLY:
+        # Intentionally left unimplemented in phase 1. See
+        # docs/correlation_instrumentation.md when it's time to enable.
+        pass
+    return signal
+
+
+# ──────────────────────────────────────────────────────────────
 # STRATEGY 4: EXPIRY DECAY (beta)
 # ──────────────────────────────────────────────────────────────
 
@@ -2483,6 +2647,39 @@ class KalshiBot:
         self._last_markets = []          # exposed for dashboard
         self._market_sample_logged = False  # one-shot diagnostic flag
 
+    def _select_open_book_for_correlation(self, is_beta, beta_model_id):
+        """Pick the right "book" of open trades for correlation scoring.
+
+        Live signals correlate against live open positions only; beta
+        signals correlate against their own beta model's open positions
+        (each beta is a self-contained counterfactual, so cross-book
+        correlation would be noise).
+
+        Filters out settled trades (`result` set) and early-exited trades
+        (`closed_by_exit`). Called from _log_signal on every logged
+        signal, so kept O(n) with no API hits.
+        """
+        try:
+            trades = load_trades()
+        except Exception:
+            return []
+        book = []
+        for t in trades:
+            if t.get("result"):
+                continue
+            if t.get("closed_by_exit"):
+                continue
+            if is_beta:
+                if not t.get("is_beta"):
+                    continue
+                if t.get("beta_model_id") != beta_model_id:
+                    continue
+            else:
+                if t.get("is_beta"):
+                    continue
+            book.append(t)
+        return book
+
     def _log_signal(self, signal, order_result):
         # Extract order_id from Kalshi's response so update_fill_times()
         # can later join this trade against /portfolio/fills by order_id.
@@ -2500,6 +2697,20 @@ class KalshiBot:
         # caller can accidentally log a beta trade as live.
         is_beta_signal = bool(signal.get("is_beta"))
         record_dry_run = True if is_beta_signal else self.dry
+
+        # Phase-1 correlation instrumentation: annotate the signal with
+        # kelly_stake_raw / corr_factor / corr_diag / kelly_stake_adjusted
+        # fields before the record is persisted. Log-only in phase 1 — does
+        # not mutate kelly_stake / count / dollars. Wrapped so a parse or
+        # I/O hiccup never takes down the live log path.
+        try:
+            open_book = self._select_open_book_for_correlation(
+                is_beta_signal, signal.get("beta_model_id"),
+            )
+            annotate_correlation(signal, open_book)
+        except Exception as _corr_err:
+            print(Fore.YELLOW + f"  [corr] annotate skipped: {_corr_err}",
+                  flush=True)
 
         record = {
             **signal,
