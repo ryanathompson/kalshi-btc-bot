@@ -1,0 +1,22 @@
+reconcile: move daily snapshots onto Render, commit via GitHub API
+
+Replaces the external scheduled task that reached /api/reconcile through
+the Claude-in-Chrome extension. That pipeline failed for 7 consecutive
+days (2026-04-16 through 2026-04-22) whenever Chrome or the extension was
+offline — single point of failure, no fallback, silent until reviewed.
+
+The bot now owns its own record-keeping:
+- reconcile_snapshot.py: daily scheduler thread + GitHub Contents API
+  commit logic. No new dependencies (requests already present). No-op
+  if GITHUB_PAT is missing or RECONCILE_SNAPSHOT_ENABLED=false.
+- app.py: start scheduler in _bot_thread after warmup; token-gated
+  POST /api/reconcile/snapshot for manual triggers and backfills.
+
+Removes the Chrome dependency, the onrender.com egress-proxy dependency,
+and the laptop-must-be-awake assumption.
+
+Requires two new Render env vars before the scheduler is active:
+  GITHUB_PAT             fine-grained, contents:read/write on this repo
+  SNAPSHOT_TRIGGER_TOKEN any random string (gates the manual endpoint)
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>

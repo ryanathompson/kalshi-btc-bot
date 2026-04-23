@@ -1,0 +1,53 @@
+beta: framework for isolated dry-run model sandbox (Phase 1)
+
+Foundation for the /beta models dashboard. Beta strategies run alongside
+live ones but are forced dry-run, tagged separately in trade records, and
+excluded from all live aggregations. No beta strategies are registered
+yet — that comes in Phase 3 (CONSENSUS_V1) and Phase 4 (EXPIRY_DECAY_V1).
+
+What changed:
+
+- LagStrategy / ConsensusStrategy / SniperStrategy constructors take
+  optional `is_beta` and `beta_model_id` kwargs. Defaults (False / None)
+  preserve existing behavior verbatim.
+
+- KalshiBot.__init__ adds `self.beta_strategies = []` registry and a
+  `self.beta_traded_by_model` per-model per-cycle dedup dict.
+
+- KalshiBot.run_once adds a second pass after the live loop: iterates
+  beta_strategies, evaluates each per-market, stamps
+  `signal["is_beta"] = True` + `beta_model_id`, forces a dry-run
+  order_result, logs via _log_signal. No disagreement gating, no
+  auto-scoring, no position-monitor tracking, no shared
+  traded_this_market. One bad beta cannot halt the live loop.
+
+- _log_signal enforces the invariant `record_dry_run = True if
+  is_beta_signal else self.dry` — beta records are always dry-run
+  regardless of global DRY_RUN.
+
+- _print_signal distinguishes [BETA:<model_id>] from [DRY] / [LIVE] in
+  console output.
+
+- rebuild_trades_from_api sets `is_beta: False, beta_model_id: None`
+  explicitly on recovered records (Kalshi fills are always live).
+
+- KalshiBot traded_this_market seeding filters out beta trades so beta
+  open positions cannot block live strategies.
+
+- app.py /api/status, /api/pnl_windows, and _build_report default-filter
+  `is_beta=True` out. Opt-in via `?include_beta=1` (for the future
+  /beta page).
+
+- bot.py resolve_trades / reconcile_trades already handle beta correctly
+  via the existing `dry_run=True` guards — no changes needed.
+
+- reconcile_pnl.py also handles beta correctly via the same `dry_run`
+  guard — daily reconcile snapshots remain live-only.
+
+Local verification: AST parse passes on bot.py + app.py; constructor
+kwargs work; default behavior preserved for existing records without the
+`is_beta` field; filter semantics correct across include_dry /
+include_beta combinations; legacy trades (no is_beta field) are treated
+as live.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
