@@ -2117,9 +2117,12 @@ class ConsensusStrategy:
             prior = KELLY_PRIORS["CONSENSUS"]
             ks = kelly_size(balance, prior["win_rate"], price_dollars,
                            fallback_stake=base_stake)
-            effective_stake = ks if ks > 0 else base_stake
             if ks > 0:
+                effective_stake = ks
                 kelly_stake = round(ks, 2)
+            else:
+                # [v3.1] Same fix as SNIPER: small exploratory stake when Kelly says no edge
+                effective_stake = float(os.getenv("KELLY_ZERO_EDGE_STAKE", "1.0"))
         else:
             effective_stake = base_stake
         # [v2.0] Auto-score throttle multiplier
@@ -2274,6 +2277,15 @@ class SniperStrategy:
             return None  # kill zone -- no edge here
 
         # [v2.0] Kelly sizing per entry mode
+        # [v3.1] CRITICAL FIX: when Kelly returns 0 (no edge at this price),
+        # use a small exploratory stake ($1) instead of falling back to the
+        # full SNIPER_CONVICTION_STAKE ($25).  The v3.0 prior of 0.52 causes
+        # Kelly to return 0 for all trades above 51¢ (breakeven = win_rate),
+        # and the old fallback engaged the MAXIMUM flat stake — producing
+        # $20 bets on a $36 bankroll (70% per trade).  This caused -$71 PnL
+        # on a 60% WR day: losses at $20 dwarfed wins.
+        # Override exploratory stake via env: KELLY_ZERO_EDGE_STAKE=1.0
+        KELLY_ZERO_EDGE_STAKE = float(os.getenv("KELLY_ZERO_EDGE_STAKE", "1.0"))
         kelly_stake = None
         if KELLY_ENABLED and balance:
             kelly_key = f"SNIPER_{mode}"
@@ -2281,9 +2293,12 @@ class SniperStrategy:
             if prior:
                 ks = kelly_size(balance, prior["win_rate"], price_dollars,
                                fallback_stake=stake)
-                effective_stake = ks if ks > 0 else stake
                 if ks > 0:
+                    effective_stake = ks
                     kelly_stake = round(ks, 2)
+                else:
+                    # Kelly says no edge — use small exploratory stake, NOT full flat stake
+                    effective_stake = KELLY_ZERO_EDGE_STAKE
             else:
                 effective_stake = stake
         else:
