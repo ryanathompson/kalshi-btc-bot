@@ -784,9 +784,14 @@ def _build_report(hours: int = 24) -> dict:
             "timestamp": t.get("timestamp"),
             "reason":    t.get("reason"),
         }
-    top_winners = sorted(settled_with_pnl, key=lambda t: t.get("pnl") or 0,
+    # Filter by sign before sorting so a small-volume window with only
+    # winners doesn't list winners as "losers" (and vice versa). Zero-PnL
+    # trades are excluded from both lists — they're neither.
+    winners_only = [t for t in settled_with_pnl if (t.get("pnl") or 0) > 0]
+    losers_only  = [t for t in settled_with_pnl if (t.get("pnl") or 0) < 0]
+    top_winners = sorted(winners_only, key=lambda t: t.get("pnl") or 0,
                          reverse=True)[:5]
-    top_losers  = sorted(settled_with_pnl, key=lambda t: t.get("pnl") or 0)[:5]
+    top_losers  = sorted(losers_only,  key=lambda t: t.get("pnl") or 0)[:5]
 
     # Last 10 trades chronologically (most recent first)
     def _sort_key(t):
