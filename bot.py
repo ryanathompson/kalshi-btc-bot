@@ -2787,13 +2787,29 @@ class RiskManager:
             return False, self._halt_reason
 
         trades = load_trades()
+        # CRITICAL: live trades only. Beta and dry-run records carry
+        # synthetic pnl set by resolve_trades (the "best we can do is treat
+        # logged size as filled size" path), and beta strategies multiply
+        # the rate of synthetic losses every cycle. Counting them toward
+        # halt thresholds means imaginary losses can shut off real trading
+        # — which is exactly what was happening on 2026-04-23/24/25 when
+        # the bot halted at -$80/-$251/-$89 while the dashboard's live-only
+        # view showed -$18/-$10/$0. The dashboard's /api/pnl_windows already
+        # filters these the same way; this brings RiskManager into
+        # agreement so halt logic and displayed P/L can't disagree.
         today_settled = [
             t for t in trades
-            if t.get("result") and trade_date_et(t.get("timestamp")) == today
+            if t.get("result")
+            and not t.get("is_beta")
+            and not t.get("dry_run")
+            and trade_date_et(t.get("timestamp")) == today
         ]
         today_open = [
             t for t in trades
-            if not t.get("result") and trade_date_et(t.get("timestamp")) == today
+            if not t.get("result")
+            and not t.get("is_beta")
+            and not t.get("dry_run")
+            and trade_date_et(t.get("timestamp")) == today
         ]
 
         # ── Gross loss + net loss limits ─────────────────────────────────
@@ -2834,8 +2850,13 @@ class RiskManager:
                     f"would breach gross limit ${self.gross_daily_limit:.2f}"
                 )
 
-        # Open trade count
-        open_trades = [t for t in trades if not t.get("result")]
+        # Open trade count — live only, same reason as today_settled above.
+        open_trades = [
+            t for t in trades
+            if not t.get("result")
+            and not t.get("is_beta")
+            and not t.get("dry_run")
+        ]
         if len(open_trades) >= self.max_open:
             return False, f"Max open trades ({self.max_open}) reached"
 
