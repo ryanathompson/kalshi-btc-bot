@@ -190,6 +190,82 @@
       border: 1px solid rgba(210, 153, 34, 0.2);
       border-radius: 6px;
     }
+
+    /* Promotion-progress card */
+    .promo-card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 20px;
+    }
+    .promo-card.eligible { border-color: var(--green); }
+    .promo-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 14px;
+    }
+    .promo-header .title {
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: .08em;
+      color: var(--muted);
+      font-weight: 600;
+    }
+    .promo-header .eligibility {
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: .06em;
+      padding: 3px 10px;
+      border-radius: 999px;
+    }
+    .promo-header .eligibility.no  { background: rgba(255,255,255,0.05); color: var(--muted); }
+    .promo-header .eligibility.yes { background: rgba(46, 160, 67, 0.15); color: var(--green); }
+
+    .promo-progress-row {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      margin-bottom: 10px;
+    }
+    .promo-bar {
+      flex: 1;
+      height: 8px;
+      background: rgba(255,255,255,0.06);
+      border-radius: 4px;
+      overflow: hidden;
+    }
+    .promo-bar > .fill {
+      height: 100%;
+      background: var(--green);
+      transition: width .3s ease;
+    }
+    .promo-counts {
+      font-size: 13px;
+      color: var(--text);
+      font-variant-numeric: tabular-nums;
+      min-width: 80px;
+      text-align: right;
+    }
+    .promo-pace {
+      font-size: 12px;
+      color: var(--muted);
+      margin-bottom: 14px;
+    }
+
+    .promo-criteria { display: flex; flex-direction: column; gap: 6px; }
+    .promo-criterion {
+      display: grid;
+      grid-template-columns: 18px 1fr auto;
+      align-items: center;
+      gap: 10px;
+      font-size: 12px;
+    }
+    .promo-criterion .check { font-size: 14px; line-height: 1; }
+    .promo-criterion.met     .check { color: var(--green); }
+    .promo-criterion.not-met .check { color: var(--muted); }
+    .promo-criterion .label { color: var(--text); }
+    .promo-criterion .value { color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
   </style>
 </head>
 <body>
@@ -225,6 +301,19 @@
       <div class="stat"><label>First Fire</label><span class="v muted" id="s-first" style="font-size:12px;">—</span></div>
       <div class="stat"><label>Last Fire</label><span class="v muted" id="s-last" style="font-size:12px;">—</span></div>
     </div>
+  </div>
+
+  <div class="promo-card" id="promo-card">
+    <div class="promo-header">
+      <span class="title">Promotion Progress</span>
+      <span id="promo-eligibility" class="eligibility no">Not eligible</span>
+    </div>
+    <div class="promo-progress-row">
+      <div class="promo-bar"><div class="fill" id="promo-fill" style="width:0%"></div></div>
+      <span class="promo-counts" id="promo-counts">0 / 100</span>
+    </div>
+    <div class="promo-pace" id="promo-pace">No pace data yet — needs ≥2 resolved fires.</div>
+    <div class="promo-criteria" id="promo-criteria"></div>
   </div>
 
   <div>
@@ -349,6 +438,39 @@ function renderHistory(rows) {
   }).join("");
 }
 
+function renderPromotion(p) {
+  if (!p) return;
+  const card = $("#promo-card");
+  card.classList.toggle("eligible", !!p.eligible);
+
+  const elig = $("#promo-eligibility");
+  elig.textContent = p.eligible ? "Promotion-eligible" : "Not eligible";
+  elig.className = "eligibility " + (p.eligible ? "yes" : "no");
+
+  const pct = Math.max(0, Math.min(100, p.progress_pct || 0));
+  $("#promo-fill").style.width = pct + "%";
+  $("#promo-counts").textContent = `${p.fires_resolved} / ${p.fires_target}`;
+
+  const pace = $("#promo-pace");
+  if (p.pace_per_day && p.eta_days_to_bar !== null && p.eta_days_to_bar !== undefined) {
+    pace.textContent =
+      `Pace ${p.pace_per_day.toFixed(1)} fires/day · ETA to ${p.fires_target}: ~${p.eta_days_to_bar.toFixed(1)} days at current rate.`;
+  } else if (p.pace_per_day) {
+    pace.textContent = `Pace ${p.pace_per_day.toFixed(1)} fires/day · target reached.`;
+  } else {
+    pace.textContent = "No pace data yet — needs ≥2 resolved fires.";
+  }
+
+  const list = $("#promo-criteria");
+  list.innerHTML = (p.criteria || []).map(c => `
+    <div class="promo-criterion ${c.met ? 'met' : 'not-met'}">
+      <span class="check">${c.met ? '✓' : '○'}</span>
+      <span class="label">${c.label}</span>
+      <span class="value">${c.value || ''}</span>
+    </div>
+  `).join("");
+}
+
 async function refresh() {
   try {
     const r = await fetch(`/api/beta/${encodeURIComponent(MODEL_ID)}`);
@@ -359,6 +481,7 @@ async function refresh() {
     if (!r.ok) throw new Error(r.status);
     const data = await r.json();
     renderSummary(data.model);
+    renderPromotion(data.promotion);
     renderOpen(data.open_trades);
     renderHistory(data.history);
   } catch (e) {

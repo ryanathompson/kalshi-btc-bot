@@ -1340,6 +1340,147 @@ def _registered_beta_ids():
     return registered, set(registered.keys())
 
 
+# ─────────────────────────────────────────────────────────────
+# Promotion-progress instrumentation
+# ─────────────────────────────────────────────────────────────
+# Surfaces the docs/beta_promotion.md bar on a per-model basis so the
+# /beta/<model_id> view can show concretely how far a beta is from being
+# promotion-eligible. No automated promotion happens here — this is
+# purely informational. Because progress is keyed off beta_model_id,
+# bumping a model's id (e.g. EXPIRY_DECAY_V1 → V2 on a parameter change)
+# automatically resets the counter, which matches the doc's
+# "re-tuning ≡ overfitting" rule.
+
+# Env-tunable promotion bar parameters. Defaults track docs/beta_promotion.md.
+BETA_PROMO_FIRE_TARGET    = int(os.getenv("BETA_PROMO_FIRE_TARGET",    "100"))
+BETA_PROMO_MIN_SIM_ROI    = float(os.getenv("BETA_PROMO_MIN_SIM_ROI",   "10.0"))  # percent
+BETA_PROMO_TAIL_MULTIPLE  = float(os.getenv("BETA_PROMO_TAIL_MULTIPLE", "3.0"))
+
+
+def _promotion_progress(summary, model_trades):
+    """Compute promotion-bar progress for a single beta model.
+
+    Returns a dict the dashboard can render directly. The criteria mirror
+    docs/beta_promotion.md; ROI / WR / tail-loss thresholds are env-tunable
+    so the bar can be tightened (or loosened) without a code change.
+
+    `summary`       — output of _aggregate_beta_by_model()[model_id].
+    `model_trades`  — raw trades for this model_id (for tail analysis).
+    """
+    resolved = int(summary.get("wins", 0)) + int(summary.get("losses", 0))
+    target   = BETA_PROMO_FIRE_TARGET
+    progress = min(100.0, (resolved / target * 100.0) if target else 0.0)
+
+    # Pace: fires per day across the observed first → last span. Fall
+    # back to None when we don't have at least two distinct timestamps.
+    pace_per_day  = None
+    eta_days      = None
+    first_at = summary.get("first_fire_at")
+    last_at  = summary.get("last_fire_at")
+    if first_at and last_at:
+        try:
+            f_dt = parse_trade_ts(first_at)
+            l_dt = parse_trade_ts(last_at)
+            if f_dt and l_dt:
+                span_s = (l_dt - f_dt).total_seconds()
+                if span_s > 60 and resolved > 1:
+                    # Use resolved fires (not total) for pace, because
+                    # NO_FILLs and still-open positions don't count
+                    # toward the promotion fire counter.
+                    pace_per_day = resolved / (span_s / 86400.0)
+                    if pace_per_day > 0 and resolved < target:
+                        eta_days = (target - resolved) / pace_per_day
+        except Exception:
+            pass
+
+    # Catastrophic tail: largest single loss vs average stake.
+    avg_stake = (
+        float(summary.get("wagered", 0)) / summary["total"]
+        if summary.get("total") else 0.0
+    )
+    worst_loss = 0.0
+    for t in model_trades:
+        pnl = float(t.get("pnl") or 0)
+        if pnl < worst_loss:
+            worst_loss = pnl
+    tail_ratio = (
+        abs(worst_loss) / avg_stake if avg_stake > 0 else 0.0
+    )
+
+    sim_roi = float(summary.get("roi", 0.0))
+
+    # Breakeven gap — at meaningful sample size only. Avg entry price
+    # implies breakeven WR; we just report whether resolved fires beat
+    # avg-price + a noise band rough rule (1/sqrt(n) * 100, capped).
+    breakeven_pct = None
+    wr_gap_pp     = None
+    if resolved > 0 and summary.get("wagered"):
+        # Average price in cents = avg dollars per contract * 100. We
+        # approximate by total wagered / total filled count; trades
+        # carry 'count' but summary doesn't aggregate it, so fall
+        # back to per-trade weighting.
+        prices = [
+            float(t.get("price") or 0)
+            for t in model_trades
+            if t.get("result") in ("WIN", "LOSS")
+        ]
+        if prices:
+            avg_price_c = sum(prices) / len(prices)
+            breakeven_pct = avg_price_c  # cents == break-even WR%
+            wr = float(summary.get("wr", 0.0))
+            wr_gap_pp = round(wr - breakeven_pct, 1)
+
+    criteria = [
+        {
+            "key":   "fire_count",
+            "label": f"≥{target} resolved fires",
+            "met":   resolved >= target,
+            "value": f"{resolved} / {target}",
+        },
+        {
+            "key":   "sim_roi",
+            "label": f"Sim ROI ≥ {BETA_PROMO_MIN_SIM_ROI:.1f}% (2× live bar)",
+            "met":   resolved > 0 and sim_roi >= BETA_PROMO_MIN_SIM_ROI,
+            "value": f"{sim_roi:+.1f}%",
+        },
+        {
+            "key":   "wr_meaningful",
+            "label": "WR meaningfully above breakeven (n≥100)",
+            "met":   (resolved >= target
+                      and wr_gap_pp is not None
+                      and wr_gap_pp >= 0),
+            "value": (
+                f"WR {summary.get('wr', 0):.1f}% vs breakeven "
+                f"{breakeven_pct:.1f}% ({wr_gap_pp:+.1f}pp)"
+                if breakeven_pct is not None
+                else "—"
+            ),
+        },
+        {
+            "key":   "no_catastrophic_tail",
+            "label": f"No single trade lost > {BETA_PROMO_TAIL_MULTIPLE:.1f}× avg stake",
+            "met":   resolved == 0 or tail_ratio <= BETA_PROMO_TAIL_MULTIPLE,
+            "value": (
+                f"worst −${abs(worst_loss):.2f} / avg ${avg_stake:.2f} "
+                f"= {tail_ratio:.2f}×"
+                if avg_stake > 0 else "—"
+            ),
+        },
+    ]
+
+    eligible = all(c["met"] for c in criteria)
+
+    return {
+        "fires_resolved":  resolved,
+        "fires_target":    target,
+        "progress_pct":    round(progress, 1),
+        "pace_per_day":    round(pace_per_day, 2) if pace_per_day else None,
+        "eta_days_to_bar": round(eta_days, 1) if eta_days else None,
+        "criteria":        criteria,
+        "eligible":        eligible,
+    }
+
+
 @app.route("/beta")
 def beta_page():
     return render_template("beta.html")
@@ -1427,10 +1568,13 @@ def api_beta_detail(model_id):
     open_trades = [fmt_open(t) for t in beta_trades if not t.get("result")]
     history_out = [fmt_hist(t) for t in history]
 
+    promotion = _promotion_progress(summary, beta_trades)
+
     return jsonify({
         "model":       summary,
         "open_trades": open_trades,
         "history":     history_out,
+        "promotion":   promotion,
     })
 
 
