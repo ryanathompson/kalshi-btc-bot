@@ -196,7 +196,14 @@ SNIPER_ENABLED    = os.getenv("SNIPER_ENABLED",    "true").lower()  == "true"
 # beta_model_id for isolated reporting. See /beta on the dashboard.
 # Enable each independently via its own env var.
 CONSENSUS_V1_BETA_ENABLED = os.getenv("CONSENSUS_V1_BETA_ENABLED", "false").lower() == "true"
-EXPIRY_DECAY_V1_BETA_ENABLED = os.getenv("EXPIRY_DECAY_V1_BETA_ENABLED", "false").lower() == "true"
+# EXPIRY_DECAY_V2 is the active version (v1 + sub-5c contrarian-lottery
+# filter; see docs/expiry_decay_v2.md). The legacy V1 env name is honored
+# as a fallback so a Render deploy doesn't silently turn the strategy
+# off — the canonical name going forward is EXPIRY_DECAY_V2_BETA_ENABLED.
+EXPIRY_DECAY_BETA_ENABLED = (
+    os.getenv("EXPIRY_DECAY_V2_BETA_ENABLED",
+              os.getenv("EXPIRY_DECAY_V1_BETA_ENABLED", "false")).lower() == "true"
+)
 
 # One-shot diagnostic: dump the first Kalshi market JSON to stdout so we can
 # see exactly what fields are available (reference price, subtitle, etc.).
@@ -212,6 +219,14 @@ EXPIRY_DECAY_MIN_DIST_SIGMAS = float(os.getenv("EXPIRY_DECAY_MIN_DIST_SIGMAS", "
 EXPIRY_DECAY_MIN_EDGE_CENTS  = int(os.getenv("EXPIRY_DECAY_MIN_EDGE_CENTS",     "3"))
 EXPIRY_DECAY_VOL_WINDOW_S    = int(os.getenv("EXPIRY_DECAY_VOL_WINDOW_S",     "900"))
 EXPIRY_DECAY_COOLDOWN_S      = int(os.getenv("EXPIRY_DECAY_COOLDOWN_S",        "60"))
+# v2: contrarian-lottery filter. Sub-5c entries in v1 dry-run sample
+# (n=76, 2026-04-23 → 2026-04-25) were 24-for-24 losers — the GBM model
+# under-estimates pinning at the extremes and consistently fights a
+# near-certain market in the final minutes. Floor at 5c is the cleanest
+# cut: there were zero trades priced 5–10c in the sample, and floors of
+# 11c+ start dropping real winners (+$161 at 11c, +$85 at 19c). See
+# docs/expiry_decay_v2.md for the full breakdown.
+EXPIRY_DECAY_MIN_PRICE_CENTS = int(os.getenv("EXPIRY_DECAY_MIN_PRICE_CENTS",     "5"))
 
 # Diagnostic: when true, ExpiryDecayStrategy.evaluate() prints a single line
 # per market evaluation showing which gate blocked (or "FIRE") with the
@@ -2554,7 +2569,7 @@ def _realized_vol_per_sqrt_s(btc_feed, lookback_s=900, min_samples=30):
 
 class ExpiryDecayStrategy:
     """
-    Expiry-decay beta model (Phase 4 v1). Beta-only — forced dry-run.
+    Expiry-decay beta model (Phase 4 v2). Beta-only — forced dry-run.
 
     THESIS:
       In the final N seconds of a 15-min market, probability converges
@@ -2571,6 +2586,7 @@ class ExpiryDecayStrategy:
          >= MIN_DIST_SIGMAS
       3. Model fair value - Kalshi ask >= MIN_EDGE_CENTS (after fees proxy)
       4. Book sum (yes_ask + no_ask) >= MIN_BOOK_SUM
+      5. [v2] Chosen-side ask >= EXPIRY_DECAY_MIN_PRICE_CENTS (default 5c)
 
     FAIR VALUE:
       Simple GBM with zero drift over the remaining window. BTC realized
@@ -2586,10 +2602,26 @@ class ExpiryDecayStrategy:
     PROMOTION:
       See docs/beta_promotion.md. Expect optimistic-sim inflation; require
       ~2x the edge you'd demand from a live strategy before promoting.
+
+    CHANGELOG:
+      v2 (2026-04-25): Added EXPIRY_DECAY_MIN_PRICE_CENTS price floor.
+        v1 dry-run sample (n=76, 2026-04-23 → 04-25): sub-5c entries
+        were 24-for-24 losers (-$480) while >=5c entries were 41W/11L
+        for +$461 (+45% sim ROI). Failure mode: GBM vol-distance gate
+        treats "BTC 2σ above strike, buy NO at 1c" the same as "BTC 2σ
+        above strike, buy NO at 80c" — but the contrarian-lottery side
+        fights near-certain pinning that the realized-vol model can't
+        see in the final minutes. Floor at 5c is the cleanest cut: zero
+        v1 trades priced 5–10c, and 11c+ floors start dropping real
+        winners. See docs/expiry_decay_v2.md for the full breakdown.
+        Records re-tagged beta_model_id=EXPIRY_DECAY_V2 so the v1
+        history stays a clean baseline; promotion-bar fire count resets
+        per docs/beta_promotion.md ("re-tuning ≡ overfitting" rule).
+      v1 (2026-04-23): Initial Phase 4 launch.
     """
 
     def __init__(self, stake_dollars, *,
-                 is_beta=True, beta_model_id="EXPIRY_DECAY_V1"):
+                 is_beta=True, beta_model_id="EXPIRY_DECAY_V2"):
         self.stake           = stake_dollars
         self.name            = "EXPIRY_DECAY"
         self.is_beta         = is_beta
@@ -2705,6 +2737,18 @@ class ExpiryDecayStrategy:
             return None
         count = max(1, int(self.stake / price_dollars))
         price_cents = int(round(price_dollars * 100))
+
+        # [v2] Contrarian-lottery filter. v1 dry-run showed sub-5c
+        # entries 24-for-24 losers; the GBM dist_sigmas gate doesn't
+        # distinguish "buy consensus side at 80c" from "buy contrarian
+        # side at 1c" even though they're opposite trades.
+        if price_cents < EXPIRY_DECAY_MIN_PRICE_CENTS:
+            self._vlog(
+                ticker,
+                f"BLOCK price floor: {side.upper()} @ {price_cents}c "
+                f"< min={EXPIRY_DECAY_MIN_PRICE_CENTS}c (v2 contrarian-lottery filter)"
+            )
+            return None
 
         self.last_fire_time = now_s
 
@@ -2914,17 +2958,20 @@ class KalshiBot:
                 is_beta=True,
                 beta_model_id="CONSENSUS_V1",
             ))
-        # ── EXPIRY_DECAY_V1 beta (Phase 4) ──────────────────────────────
+        # ── EXPIRY_DECAY_V2 beta (Phase 4) ──────────────────────────────
         # Fires in the final window of a 15-min market when BTC is deeply
         # into the YES/NO region vs short-window realized vol. Fully
         # isolated from live strategies; no interaction with SNIPER despite
         # both caring about 15-min markets (SNIPER needs >=5 min runway;
         # expiry decay needs <=3 min).
-        if EXPIRY_DECAY_V1_BETA_ENABLED:
+        # v2 (2026-04-25): adds EXPIRY_DECAY_MIN_PRICE_CENTS=5 floor to
+        # cut the 24-for-24-loser sub-5c contrarian-lottery tail. See
+        # docs/expiry_decay_v2.md.
+        if EXPIRY_DECAY_BETA_ENABLED:
             self.beta_strategies.append(ExpiryDecayStrategy(
                 max_stake,
                 is_beta=True,
-                beta_model_id="EXPIRY_DECAY_V1",
+                beta_model_id="EXPIRY_DECAY_V2",
             ))
         # ── CONSENSUS_V1_WITH_EXIT beta ─────────────────────────────────
         # Mirrors CONSENSUS_V1's entry logic but adds the edge-gone exit
