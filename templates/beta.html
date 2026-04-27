@@ -111,8 +111,28 @@
     .model-card:hover {
       border-color: var(--blue);
     }
-    .model-card a { color: inherit; text-decoration: none; display: block; }
-    .model-card a:hover { text-decoration: none; }
+    .model-card .card-main { color: inherit; text-decoration: none; display: flex; flex-direction: column; gap: 14px; }
+    .model-card .card-main:hover { text-decoration: none; }
+
+    .card-footer {
+      border-top: 1px solid var(--border);
+      padding-top: 10px;
+      margin-top: 2px;
+      font-size: 12px;
+    }
+    .explainer-link {
+      color: var(--cyan);
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+    }
+    .explainer-link:hover { color: var(--blue); text-decoration: underline; }
+    .explainer-link .arrow {
+      font-size: 11px;
+      opacity: 0.8;
+      transition: transform 0.15s;
+    }
+    .explainer-link:hover .arrow { transform: translateX(2px); }
 
     .model-header {
       display: flex;
@@ -245,6 +265,14 @@ function fmtDate(s) {
   }
 }
 
+const EXPLAINER_BASE = "https://github.com/ryanathompson/kalshi-btc-bot/blob/main/docs/models/";
+
+function explainerUrl(modelId) {
+  // Layman's-logic doc per model_id. Filenames live in docs/models/.
+  // Falls back to the models/ index folder if the specific file doesn't exist.
+  return EXPLAINER_BASE + encodeURIComponent(modelId.toLowerCase()) + ".md";
+}
+
 function renderModelCard(m) {
   const pnlClass = classifyPnL(m.pnl);
   const roiClass = classifyPnL(m.roi);
@@ -253,7 +281,7 @@ function renderModelCard(m) {
     : `<span class="status-pill retired">Retired</span>`;
   return `
     <div class="model-card">
-      <a href="/beta/${encodeURIComponent(m.model_id)}">
+      <a class="card-main" href="/beta/${encodeURIComponent(m.model_id)}">
         <div class="model-header">
           <span class="model-id">${m.model_id}</span>
           ${status}
@@ -270,6 +298,15 @@ function renderModelCard(m) {
           ${m.open ? ` · ${m.open} open` : ""}
         </div>
       </a>
+      <div class="card-footer">
+        <a class="explainer-link"
+           href="${explainerUrl(m.model_id)}"
+           target="_blank"
+           rel="noopener"
+           title="Plain-English explanation of how ${m.model_id} works">
+          How does this model work?<span class="arrow">→</span>
+        </a>
+      </div>
     </div>
   `;
 }
