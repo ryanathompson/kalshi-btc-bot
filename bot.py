@@ -239,7 +239,17 @@ EXPIRY_DECAY_VERBOSE_EVERY_S  = int(os.getenv("EXPIRY_DECAY_VERBOSE_EVERY_S", "3
 # Hybrid model covering the 3-5 min gap between SNIPER (5-14m) and
 # EXPIRY_DECAY (0-3m). Requires BOTH momentum confirmation (SNIPER thesis)
 # AND vol-normalized mispricing (EXPIRY_DECAY thesis) to fire.
-BRIDGE_V1_BETA_ENABLED      = os.getenv("BRIDGE_V1_BETA_ENABLED", "false").lower() == "true"
+# Strategy on/off switch. Renamed to BRIDGE_BETA_ENABLED for V2 since the
+# V1/V2 distinction is a beta_model_id tag, not a separate strategy class.
+# Legacy BRIDGE_V1_BETA_ENABLED still honored for backward compat — you can
+# leave it set on Render until you swap to the new name.
+BRIDGE_BETA_ENABLED         = (
+    os.getenv("BRIDGE_BETA_ENABLED")
+    or os.getenv("BRIDGE_V1_BETA_ENABLED", "false")
+).lower() == "true"
+# Keep the old constant name as an alias so any other modules / scripts
+# that import it still work without a code change.
+BRIDGE_V1_BETA_ENABLED      = BRIDGE_BETA_ENABLED
 BRIDGE_MIN_SECS_LEFT        = int(os.getenv("BRIDGE_MIN_SECS_LEFT",        "180"))  # 3 min
 BRIDGE_MAX_SECS_LEFT        = int(os.getenv("BRIDGE_MAX_SECS_LEFT",        "300"))  # 5 min
 BRIDGE_5M_MIN_MOMENTUM      = float(os.getenv("BRIDGE_5M_MIN_MOMENTUM",  "0.0006"))  # same as SNIPER v3
@@ -3331,12 +3341,15 @@ class KalshiBot:
                 is_beta=True,
                 beta_model_id=ConsensusExitTracker.BETA_MODEL_ID,
             ))
-        # ── BRIDGE_V1 beta (gap filler: 3-5 min window) ─────────────────
-        if BRIDGE_V1_BETA_ENABLED:
+        # ── BRIDGE_V2 beta (gap filler: 3-5 min window) ─────────────────
+        # NOTE: model_id bumped V1 -> V2 (Kelly + cheap-cap sizing fix —
+        # see commit log). This call-site tag takes precedence over the
+        # __init__ default, so it must be updated when the model_id rolls.
+        if BRIDGE_BETA_ENABLED:
             self.beta_strategies.append(BridgeStrategy(
                 max_stake,
                 is_beta=True,
-                beta_model_id="BRIDGE_V1",
+                beta_model_id="BRIDGE_V2",
             ))
         # ── FADE_V1 beta (mean-reversion contrarian) ────────────────────
         if FADE_V1_BETA_ENABLED:
