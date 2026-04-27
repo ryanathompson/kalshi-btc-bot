@@ -214,6 +214,55 @@
       text-align: center;
       padding: 8px 0;
     }
+
+    /* ── Coverage graphic ─────────────────────────────────── */
+    .coverage-panel {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 18px 20px;
+    }
+    .coverage-panel h2 {
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: .06em;
+      margin-bottom: 12px;
+    }
+    .coverage-svg { width: 100%; height: auto; display: block; }
+
+    /* ── Filter bar ───────────────────────────────────────── */
+    .filter-bar {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .filter-bar .label {
+      font-size: 12px;
+      color: var(--muted);
+      margin-right: 4px;
+    }
+    .filter-btn {
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 500;
+      padding: 4px 12px;
+      border-radius: 6px;
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+    .filter-btn:hover {
+      color: var(--text);
+      border-color: var(--blue);
+    }
+    .filter-btn.selected {
+      background: rgba(88, 166, 255, 0.1);
+      color: var(--blue);
+      border-color: var(--blue);
+    }
   </style>
 </head>
 <body>
@@ -229,6 +278,58 @@
     <strong>Beta models are isolated.</strong> They run alongside the live bot but never place real orders and never contribute to live stats. Each model's performance is reported in isolation — there is no combined "beta book" number because these are independent experiments. Promote a beta model to live only after it clears the criteria documented in <a href="https://github.com/ryanathompson/kalshi-btc-bot/blob/main/docs/beta_promotion.md" target="_blank" rel="noopener">docs/beta_promotion.md</a>.
   </div>
 
+  <!-- Strategy coverage timeline -->
+  <div class="coverage-panel">
+    <h2>Strategy Coverage Timeline</h2>
+    <svg class="coverage-svg" viewBox="0 0 800 210" xmlns="http://www.w3.org/2000/svg">
+      <!-- Background -->
+      <rect x="0" y="0" width="800" height="210" rx="6" fill="none"/>
+
+      <!-- Timeline axis -->
+      <line x1="60" y1="180" x2="740" y2="180" stroke="#30363d" stroke-width="1.5"/>
+
+      <!-- Time markers (15-min market: 0 to 15 min) -->
+      <text x="60" y="200" fill="#8b949e" font-size="11" text-anchor="middle" font-family="ui-monospace, monospace">0m</text>
+      <line x1="60" y1="178" x2="60" y2="184" stroke="#8b949e" stroke-width="1"/>
+      <text x="196" y="200" fill="#8b949e" font-size="11" text-anchor="middle" font-family="ui-monospace, monospace">3m</text>
+      <line x1="196" y1="178" x2="196" y2="184" stroke="#8b949e" stroke-width="1"/>
+      <text x="286" y="200" fill="#8b949e" font-size="11" text-anchor="middle" font-family="ui-monospace, monospace">5m</text>
+      <line x1="286" y1="178" x2="286" y2="184" stroke="#8b949e" stroke-width="1"/>
+      <text x="512" y="200" fill="#8b949e" font-size="11" text-anchor="middle" font-family="ui-monospace, monospace">10m</text>
+      <line x1="512" y1="178" x2="512" y2="184" stroke="#8b949e" stroke-width="1"/>
+      <text x="740" y="200" fill="#8b949e" font-size="11" text-anchor="middle" font-family="ui-monospace, monospace">15m</text>
+      <line x1="740" y1="178" x2="740" y2="184" stroke="#8b949e" stroke-width="1"/>
+
+      <!-- Arrow label -->
+      <text x="400" y="210" fill="#484f58" font-size="10" text-anchor="middle" font-family="sans-serif">← time remaining in market →</text>
+
+      <!-- EXPIRY_DECAY: 0-3 min (leftmost) -->
+      <rect x="60" y="20" width="136" height="32" rx="4" fill="rgba(188, 140, 255, 0.15)" stroke="#bc8cff" stroke-width="1.5"/>
+      <text x="128" y="41" fill="#bc8cff" font-size="12" font-weight="600" text-anchor="middle" font-family="ui-monospace, monospace">EXPIRY_DECAY</text>
+
+      <!-- BRIDGE: 3-5 min -->
+      <rect x="196" y="60" width="90" height="32" rx="4" fill="rgba(255, 166, 87, 0.15)" stroke="#ffa657" stroke-width="1.5"/>
+      <text x="241" y="81" fill="#ffa657" font-size="12" font-weight="600" text-anchor="middle" font-family="ui-monospace, monospace">BRIDGE</text>
+
+      <!-- SNIPER: 5-14 min -->
+      <rect x="286" y="100" width="418" height="32" rx="4" fill="rgba(63, 185, 80, 0.15)" stroke="#3fb950" stroke-width="1.5"/>
+      <text x="495" y="121" fill="#3fb950" font-size="12" font-weight="600" text-anchor="middle" font-family="ui-monospace, monospace">SNIPER</text>
+
+      <!-- FADE: 5-12 min (overlaps with SNIPER, different row) -->
+      <rect x="286" y="140" width="316" height="32" rx="4" fill="rgba(248, 81, 73, 0.15)" stroke="#f85149" stroke-width="1.5" stroke-dasharray="4 3"/>
+      <text x="444" y="161" fill="#f85149" font-size="12" font-weight="600" text-anchor="middle" font-family="ui-monospace, monospace">FADE</text>
+      <text x="614" y="161" fill="#484f58" font-size="10" text-anchor="start" font-family="sans-serif">(contrarian)</text>
+    </svg>
+  </div>
+
+  <!-- Filter bar -->
+  <div class="filter-bar">
+    <span class="label">Show:</span>
+    <button class="filter-btn" data-filter="active" onclick="setFilter('active')">Active</button>
+    <button class="filter-btn" data-filter="all" onclick="setFilter('all')">All</button>
+    <button class="filter-btn" data-filter="retired" onclick="setFilter('retired')">Retired</button>
+  </div>
+
   <div id="grid" class="grid"></div>
 
   <div class="footer-note" id="footer-note"></div>
@@ -237,6 +338,11 @@
 <script>
 const $ = (sel, parent=document) => parent.querySelector(sel);
 
+/* ── State ──────────────────────────────────────────── */
+let currentFilter = "active";     // default: Active only
+let allModels     = [];           // cached from last fetch
+
+/* ── Formatters ─────────────────────────────────────── */
 function fmtDollars(n) {
   if (n === null || n === undefined) return "$0.00";
   const sign = n < 0 ? "-" : "";
@@ -268,11 +374,26 @@ function fmtDate(s) {
 const EXPLAINER_BASE = "https://github.com/ryanathompson/kalshi-btc-bot/blob/main/docs/models/";
 
 function explainerUrl(modelId) {
-  // Layman's-logic doc per model_id. Filenames live in docs/models/.
-  // Falls back to the models/ index folder if the specific file doesn't exist.
   return EXPLAINER_BASE + encodeURIComponent(modelId.toLowerCase()) + ".md";
 }
 
+/* ── Filter logic ───────────────────────────────────── */
+function setFilter(f) {
+  currentFilter = f;
+  document.querySelectorAll(".filter-btn").forEach(btn => {
+    btn.classList.toggle("selected", btn.dataset.filter === f);
+  });
+  renderGrid();
+}
+
+function applyFilter(models) {
+  if (currentFilter === "all")     return models;
+  if (currentFilter === "active")  return models.filter(m => m.registered);
+  if (currentFilter === "retired") return models.filter(m => !m.registered);
+  return models;
+}
+
+/* ── Rendering ──────────────────────────────────────── */
 function renderModelCard(m) {
   const pnlClass = classifyPnL(m.pnl);
   const roiClass = classifyPnL(m.roi);
@@ -311,35 +432,53 @@ function renderModelCard(m) {
   `;
 }
 
+function renderGrid() {
+  const grid = $("#grid");
+  const note = $("#footer-note");
+  if (!allModels || allModels.length === 0) {
+    grid.innerHTML = `
+      <div class="empty-state" style="grid-column: 1 / -1;">
+        <strong>No beta models yet.</strong>
+        The framework is in place and ready to accept registered models via
+        <code>KalshiBot.beta_strategies</code>.
+      </div>`;
+    note.textContent = "";
+    return;
+  }
+  const filtered = applyFilter(allModels);
+  if (filtered.length === 0) {
+    const label = currentFilter === "retired" ? "retired" : "active";
+    grid.innerHTML = `
+      <div class="empty-state" style="grid-column: 1 / -1;">
+        <strong>No ${label} models.</strong>
+        Switch the filter to see other models.
+      </div>`;
+  } else {
+    grid.innerHTML = filtered.map(renderModelCard).join("");
+  }
+  const active  = allModels.filter(m => m.registered).length;
+  const total   = allModels.length;
+  const retired = total - active;
+  note.innerHTML = `${total} model${total===1?"":"s"} — ${active} active, ${retired} retired`;
+}
+
+/* ── Data fetch ─────────────────────────────────────── */
 async function refresh() {
   try {
     const r = await fetch("/api/beta");
     if (!r.ok) throw new Error(r.status);
     const data = await r.json();
-    const grid = $("#grid");
-    const note = $("#footer-note");
-    if (!data.models || data.models.length === 0) {
-      grid.innerHTML = `
-        <div class="empty-state" style="grid-column: 1 / -1;">
-          <strong>No beta models yet.</strong>
-          The framework is in place and ready to accept registered models via
-          <code>KalshiBot.beta_strategies</code>. Phase 3 adds CONSENSUS_V1.
-        </div>`;
-      note.textContent = "";
-      return;
-    }
-    grid.innerHTML = data.models.map(renderModelCard).join("");
-    const active = data.registered || 0;
-    const total  = data.count || 0;
-    const retired = total - active;
-    note.innerHTML = `${total} model${total===1?"":"s"} — ${active} active, ${retired} retired`;
+    allModels = data.models || [];
+    renderGrid();
   } catch (e) {
     $("#grid").innerHTML = `<div class="empty-state" style="grid-column: 1 / -1; color: var(--red);">Failed to load beta models: ${e.message || e}</div>`;
   }
 }
 
+/* ── Init ───────────────────────────────────────────── */
+setFilter("active");   // set default + highlight button
 refresh();
-setInterval(refresh, 10000);  // refresh every 10s
+setInterval(refresh, 10000);
 </script>
 
 </body>

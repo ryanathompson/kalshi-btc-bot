@@ -235,6 +235,33 @@ EXPIRY_DECAY_MIN_PRICE_CENTS = int(os.getenv("EXPIRY_DECAY_MIN_PRICE_CENTS",    
 EXPIRY_DECAY_VERBOSE          = os.getenv("EXPIRY_DECAY_VERBOSE", "false").lower() == "true"
 EXPIRY_DECAY_VERBOSE_EVERY_S  = int(os.getenv("EXPIRY_DECAY_VERBOSE_EVERY_S", "30"))
 
+# ── BRIDGE beta tunables ────────────────────────────────────────────
+# Hybrid model covering the 3-5 min gap between SNIPER (5-14m) and
+# EXPIRY_DECAY (0-3m). Requires BOTH momentum confirmation (SNIPER thesis)
+# AND vol-normalized mispricing (EXPIRY_DECAY thesis) to fire.
+BRIDGE_V1_BETA_ENABLED      = os.getenv("BRIDGE_V1_BETA_ENABLED", "false").lower() == "true"
+BRIDGE_MIN_SECS_LEFT        = int(os.getenv("BRIDGE_MIN_SECS_LEFT",        "180"))  # 3 min
+BRIDGE_MAX_SECS_LEFT        = int(os.getenv("BRIDGE_MAX_SECS_LEFT",        "300"))  # 5 min
+BRIDGE_5M_MIN_MOMENTUM      = float(os.getenv("BRIDGE_5M_MIN_MOMENTUM",  "0.0006"))  # same as SNIPER v3
+BRIDGE_60S_CONFIRM_MIN      = float(os.getenv("BRIDGE_60S_CONFIRM_MIN",  "0.0001"))  # same as SNIPER v3
+BRIDGE_MIN_DIST_SIGMAS      = float(os.getenv("BRIDGE_MIN_DIST_SIGMAS",    "1.5"))   # lighter than ED's 2.0
+BRIDGE_MIN_EDGE_CENTS       = int(os.getenv("BRIDGE_MIN_EDGE_CENTS",         "2"))   # lighter than ED's 3
+BRIDGE_VOL_WINDOW_S         = int(os.getenv("BRIDGE_VOL_WINDOW_S",         "900"))
+BRIDGE_COOLDOWN_S           = int(os.getenv("BRIDGE_COOLDOWN_S",           "120"))
+
+# ── FADE beta tunables ──────────────────────────────────────────────
+# Mean-reversion model that fades overextended BTC moves. Contrarian to
+# SNIPER — trades AGAINST strong 5m momentum when 60s shows weakening.
+FADE_V1_BETA_ENABLED        = os.getenv("FADE_V1_BETA_ENABLED", "false").lower() == "true"
+FADE_MIN_SECS_LEFT          = int(os.getenv("FADE_MIN_SECS_LEFT",          "300"))  # 5 min
+FADE_MAX_SECS_LEFT          = int(os.getenv("FADE_MAX_SECS_LEFT",          "720"))  # 12 min
+FADE_5M_MIN_MOMENTUM        = float(os.getenv("FADE_5M_MIN_MOMENTUM",    "0.0010"))  # 0.10% — strong move required
+FADE_60S_DECAY_THRESHOLD    = float(os.getenv("FADE_60S_DECAY_THRESHOLD", "0.0003"))  # 60s must be below this (weakening)
+FADE_MIN_PRICE_CENTS        = int(os.getenv("FADE_MIN_PRICE_CENTS",         "40"))
+FADE_MAX_PRICE_CENTS        = int(os.getenv("FADE_MAX_PRICE_CENTS",         "50"))
+FADE_VOL_PERCENTILE_MIN     = float(os.getenv("FADE_VOL_PERCENTILE_MIN",  "0.50"))   # only in elevated vol
+FADE_COOLDOWN_S             = int(os.getenv("FADE_COOLDOWN_S",             "300"))
+
 # ── v2.0 Unified stake ───────────────────────────────────────────────
 # Single max-stake-per-trade replaces the old per-strategy LAG_STAKE /
 # CONSENSUS_STAKE split.  Every strategy draws from the same budget;
@@ -2772,7 +2799,265 @@ class ExpiryDecayStrategy:
         }
 
 
-# âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+# ═══════════════════════════════════════════════════════════
+# STRATEGY 5: BRIDGE (beta)
+# ═══════════════════════════════════════════════════════════
+
+class BridgeStrategy:
+    """
+    Bridge beta model — fills the 3-5 minute gap between SNIPER and EXPIRY_DECAY.
+
+    THESIS:
+      In the 3-5 minute window, pure momentum (SNIPER) is getting stale and
+      pure vol-distance (EXPIRY_DECAY) isn't decisive yet. Requiring BOTH
+      signals simultaneously — meaningful momentum that's also vol-confirmed
+      to be far from strike — should produce higher WR than either alone.
+
+    ENTRY GATES (all must pass):
+      1. Time remaining in [BRIDGE_MIN_SECS_LEFT, BRIDGE_MAX_SECS_LEFT]
+      2. 5-min BTC momentum >= BRIDGE_5M_MIN_MOMENTUM (same as SNIPER v3)
+      3. 60s momentum confirms same direction (same as SNIPER v3)
+      4. Vol-normalized distance >= BRIDGE_MIN_DIST_SIGMAS (1.5σ, lighter
+         than EXPIRY_DECAY's 2.0σ since more time remains)
+      5. GBM model edge >= BRIDGE_MIN_EDGE_CENTS (2¢)
+      6. Momentum direction and model direction must AGREE
+
+    SIZING:
+      Fixed stake / price_dollars for v1. No Kelly priors yet.
+    """
+
+    def __init__(self, stake_dollars, *,
+                 is_beta=True, beta_model_id="BRIDGE_V1"):
+        self.stake           = stake_dollars
+        self.name            = "BRIDGE"
+        self.is_beta         = is_beta
+        self.beta_model_id   = beta_model_id
+        self.last_fire_time  = 0.0
+
+    def evaluate(self, market, btc_feed, mins_left=None,
+                 balance=None, score_mult=1.0):
+        ticker = market.get("ticker", "?")
+
+        # ---- Time gate (3-5 min window) -----------------------------------
+        if mins_left is None:
+            return None
+        secs_left = mins_left * 60.0
+        if secs_left < BRIDGE_MIN_SECS_LEFT or secs_left > BRIDGE_MAX_SECS_LEFT:
+            return None
+
+        # ---- Cooldown -----------------------------------------------------
+        now_s = time.time()
+        if now_s - self.last_fire_time < BRIDGE_COOLDOWN_S:
+            return None
+
+        # ---- Liquidity ----------------------------------------------------
+        yes_ask = float(market.get("yes_ask_dollars", 0) or 0)
+        no_ask  = float(market.get("no_ask_dollars",  0) or 0)
+        if yes_ask <= 0 or no_ask <= 0:
+            return None
+        if yes_ask + no_ask < MIN_BOOK_SUM:
+            return None
+
+        # ---- 5-min momentum gate (SNIPER v3 thesis) ----------------------
+        mom_5m = btc_feed.pct_change(300)
+        if mom_5m is None or abs(mom_5m) < BRIDGE_5M_MIN_MOMENTUM:
+            return None
+
+        # ---- 60s confirmation (SNIPER v3 thesis) -------------------------
+        mom_60s = btc_feed.pct_change(60)
+        if mom_60s is None:
+            return None
+        same_dir = (mom_5m > 0 and mom_60s > BRIDGE_60S_CONFIRM_MIN) or \
+                   (mom_5m < 0 and mom_60s < -BRIDGE_60S_CONFIRM_MIN)
+        if not same_dir:
+            return None
+
+        momentum_side = "yes" if mom_5m > 0 else "no"
+
+        # ---- Strike + vol (EXPIRY_DECAY thesis) --------------------------
+        strike, strike_type = _get_market_strike(market)
+        if strike is None or strike_type != "greater_or_equal":
+            return None
+
+        btc = btc_feed.current()
+        if btc is None or btc <= 0:
+            return None
+        sigma_s = _realized_vol_per_sqrt_s(btc_feed, lookback_s=BRIDGE_VOL_WINDOW_S)
+        if sigma_s is None or sigma_s <= 0:
+            return None
+        sigma_T = sigma_s * math.sqrt(secs_left)
+        if sigma_T <= 0:
+            return None
+
+        # ---- Vol-normalized distance gate --------------------------------
+        dist_sigmas = abs(math.log(btc / strike)) / sigma_T
+        if dist_sigmas < BRIDGE_MIN_DIST_SIGMAS:
+            return None
+
+        # ---- GBM fair value + edge check ---------------------------------
+        z = math.log(strike / btc) / sigma_T
+        p_yes = max(0.0, min(1.0, 1.0 - _phi(z)))
+
+        yes_edge_cents = int(round((p_yes - yes_ask) * 100))
+        no_edge_cents  = int(round(((1.0 - p_yes) - no_ask) * 100))
+
+        if yes_edge_cents >= no_edge_cents and yes_edge_cents >= BRIDGE_MIN_EDGE_CENTS:
+            model_side, price_dollars, edge_cents, p_side = "yes", yes_ask, yes_edge_cents, p_yes
+        elif no_edge_cents >= BRIDGE_MIN_EDGE_CENTS:
+            model_side, price_dollars, edge_cents, p_side = "no", no_ask, no_edge_cents, 1.0 - p_yes
+        else:
+            return None
+
+        # ---- KEY GATE: momentum and model must AGREE on direction --------
+        if momentum_side != model_side:
+            return None
+
+        if price_dollars <= 0:
+            return None
+        price_cents = int(round(price_dollars * 100))
+        count = max(1, int(self.stake / price_dollars))
+
+        self.last_fire_time = now_s
+
+        return {
+            "strategy": self.name,
+            "ticker":   ticker,
+            "side":     model_side,
+            "price":    price_cents,
+            "count":    count,
+            "dollars":  round(count * price_dollars, 2),
+            "reason":   (f"5m {mom_5m*100:+.3f}% + {dist_sigmas:.2f}σ | "
+                         f"{secs_left:.0f}s left | fair {p_side*100:.1f}%, "
+                         f"ask {price_cents}c, edge +{edge_cents}c"),
+        }
+
+
+# ═══════════════════════════════════════════════════════════
+# STRATEGY 6: FADE (beta)
+# ═══════════════════════════════════════════════════════════
+
+class FadeStrategy:
+    """
+    Fade beta model — mean-reversion after BTC overextension.
+
+    THESIS:
+      SNIPER rides momentum. But momentum overshoots — BTC spikes 0.10%+
+      in 5 minutes, the contract reprices, then BTC mean-reverts and the
+      contract settles near the original level. FADE sells into these
+      overextensions by trading AGAINST the 5m direction when 60s momentum
+      shows the move is weakening or reversing.
+
+    ENTRY GATES (all must pass):
+      1. Time remaining in [FADE_MIN_SECS_LEFT, FADE_MAX_SECS_LEFT]
+      2. 5-min BTC momentum >= FADE_5M_MIN_MOMENTUM (0.10% — strong move)
+      3. 60s momentum must be WEAKENING: |mom_60s| < FADE_60S_DECAY_THRESHOLD
+         (the spike happened but the last minute shows it's stalling)
+      4. Entry price in [FADE_MIN_PRICE_CENTS, FADE_MAX_PRICE_CENTS] range
+      5. Realized vol must be elevated (above FADE_VOL_PERCENTILE_MIN of
+         recent history) — mean-reversion works in high-vol, not trending
+
+    DIRECTION:
+      OPPOSITE to 5-min momentum. If BTC spiked up -> buy NO (fade the spike).
+      If BTC dropped -> buy YES (fade the drop).
+
+    SIZING:
+      Fixed stake / price_dollars for v1. No Kelly priors yet.
+    """
+
+    def __init__(self, stake_dollars, *,
+                 is_beta=True, beta_model_id="FADE_V1"):
+        self.stake           = stake_dollars
+        self.name            = "FADE"
+        self.is_beta         = is_beta
+        self.beta_model_id   = beta_model_id
+        self.last_fire_time  = 0.0
+        # Rolling vol samples for percentile gating
+        self._vol_history    = deque(maxlen=200)
+
+    def evaluate(self, market, btc_feed, mins_left=None,
+                 balance=None, score_mult=1.0):
+        ticker = market.get("ticker", "?")
+
+        # ---- Time gate (5-12 min window) ----------------------------------
+        if mins_left is None:
+            return None
+        secs_left = mins_left * 60.0
+        if secs_left < FADE_MIN_SECS_LEFT or secs_left > FADE_MAX_SECS_LEFT:
+            return None
+
+        # ---- Cooldown -----------------------------------------------------
+        now_s = time.time()
+        if now_s - self.last_fire_time < FADE_COOLDOWN_S:
+            return None
+
+        # ---- Liquidity ----------------------------------------------------
+        yes_ask = float(market.get("yes_ask_dollars", 0) or 0)
+        no_ask  = float(market.get("no_ask_dollars",  0) or 0)
+        if yes_ask <= 0 or no_ask <= 0:
+            return None
+        if yes_ask + no_ask < MIN_BOOK_SUM:
+            return None
+
+        # ---- 5-min momentum: require STRONG move --------------------------
+        mom_5m = btc_feed.pct_change(300)
+        if mom_5m is None or abs(mom_5m) < FADE_5M_MIN_MOMENTUM:
+            return None
+
+        # ---- 60s decay: move must be WEAKENING ----------------------------
+        # The spike happened in the 5m window but the last 60s shows it's
+        # stalling or reversing. This is the mean-reversion signal.
+        mom_60s = btc_feed.pct_change(60)
+        if mom_60s is None:
+            return None
+        # 60s momentum must be weak (near zero or opposing 5m direction)
+        if abs(mom_60s) >= FADE_60S_DECAY_THRESHOLD:
+            # If 60s is still strong AND in the same direction as 5m,
+            # the move is continuing — don't fade it
+            if (mom_5m > 0 and mom_60s > 0) or (mom_5m < 0 and mom_60s < 0):
+                return None
+
+        # ---- Vol regime gate: only fade in elevated vol -------------------
+        sigma_s = _realized_vol_per_sqrt_s(btc_feed, lookback_s=900)
+        if sigma_s is not None and sigma_s > 0:
+            self._vol_history.append(sigma_s)
+        if len(self._vol_history) < 20:
+            return None  # not enough vol history to judge regime
+        sorted_vols = sorted(self._vol_history)
+        vol_percentile_idx = int(FADE_VOL_PERCENTILE_MIN * len(sorted_vols))
+        vol_threshold = sorted_vols[min(vol_percentile_idx, len(sorted_vols) - 1)]
+        if sigma_s is None or sigma_s < vol_threshold:
+            return None  # low-vol regime — momentum may persist, don't fade
+
+        # ---- Direction: OPPOSITE to 5m momentum ---------------------------
+        fade_side = "no" if mom_5m > 0 else "yes"
+        price_dollars = yes_ask if fade_side == "yes" else no_ask
+        price_cents = int(round(price_dollars * 100))
+
+        # ---- Price band filter (40-50c range) -----------------------------
+        if price_cents < FADE_MIN_PRICE_CENTS or price_cents > FADE_MAX_PRICE_CENTS:
+            return None
+
+        if price_dollars <= 0:
+            return None
+        count = max(1, int(self.stake / price_dollars))
+
+        self.last_fire_time = now_s
+
+        return {
+            "strategy": self.name,
+            "ticker":   ticker,
+            "side":     fade_side,
+            "price":    price_cents,
+            "count":    count,
+            "dollars":  round(count * price_dollars, 2),
+            "reason":   (f"FADE 5m {mom_5m*100:+.3f}% -> {fade_side.upper()} @ {price_cents}c "
+                         f"| 60s: {mom_60s*100:+.3f}% (decaying) "
+                         f"| vol {sigma_s:.2e} (p{FADE_VOL_PERCENTILE_MIN:.0%}) "
+                         f"| {secs_left:.0f}s left"),
+        }
+
+
+#âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 # RISK MANAGEMENT
 # âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 
@@ -2984,6 +3269,20 @@ class KalshiBot:
                 max_stake,
                 is_beta=True,
                 beta_model_id=ConsensusExitTracker.BETA_MODEL_ID,
+            ))
+        # ── BRIDGE_V1 beta (gap filler: 3-5 min window) ─────────────────
+        if BRIDGE_V1_BETA_ENABLED:
+            self.beta_strategies.append(BridgeStrategy(
+                max_stake,
+                is_beta=True,
+                beta_model_id="BRIDGE_V1",
+            ))
+        # ── FADE_V1 beta (mean-reversion contrarian) ────────────────────
+        if FADE_V1_BETA_ENABLED:
+            self.beta_strategies.append(FadeStrategy(
+                max_stake,
+                is_beta=True,
+                beta_model_id="FADE_V1",
             ))
         # [v2.0] New components
         self.scorer    = StrategyScorer()
