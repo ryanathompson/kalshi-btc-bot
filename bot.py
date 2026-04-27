@@ -248,6 +248,11 @@ BRIDGE_MIN_DIST_SIGMAS      = float(os.getenv("BRIDGE_MIN_DIST_SIGMAS",    "1.5"
 BRIDGE_MIN_EDGE_CENTS       = int(os.getenv("BRIDGE_MIN_EDGE_CENTS",         "2"))   # lighter than ED's 3
 BRIDGE_VOL_WINDOW_S         = int(os.getenv("BRIDGE_VOL_WINDOW_S",         "900"))
 BRIDGE_COOLDOWN_S           = int(os.getenv("BRIDGE_COOLDOWN_S",           "120"))
+# v2 sizing toggle: route through kelly_size() with the GBM model probability
+# (p_side) and apply CHEAP_CONTRACT_MAX_STAKE the same way Consensus/Sniper do.
+# v1 used `count = stake / price`, which made a 2c NO and a 90c YES carry the
+# same downside but ~400x different upside — equal-cost / unequal-variance.
+BRIDGE_KELLY_ENABLED        = os.getenv("BRIDGE_KELLY_ENABLED", "true").lower() == "true"
 
 # ── FADE beta tunables ──────────────────────────────────────────────
 # Mean-reversion model that fades overextended BTC moves. Contrarian to
@@ -2823,11 +2828,15 @@ class BridgeStrategy:
       6. Momentum direction and model direction must AGREE
 
     SIZING:
-      Fixed stake / price_dollars for v1. No Kelly priors yet.
+      v2: Kelly-fractional sizing using the GBM model probability `p_side`,
+      gated by CHEAP_CONTRACT_MAX_STAKE on lottery-priced entries (matches
+      the v2.1 Consensus fix). Counters reset to zero by bumping the
+      beta_model_id from BRIDGE_V1 -> BRIDGE_V2 (per docs/beta_promotion.md
+      "re-tuning ≡ overfitting" rule — sizing change is a model change).
     """
 
     def __init__(self, stake_dollars, *,
-                 is_beta=True, beta_model_id="BRIDGE_V1"):
+                 is_beta=True, beta_model_id="BRIDGE_V2"):
         self.stake           = stake_dollars
         self.name            = "BRIDGE"
         self.is_beta         = is_beta
@@ -2915,11 +2924,42 @@ class BridgeStrategy:
         if price_dollars <= 0:
             return None
         price_cents = int(round(price_dollars * 100))
-        count = max(1, int(self.stake / price_dollars))
+
+        # ---- Sizing (v2) --------------------------------------------------
+        # v1 used `count = stake / price`, which produced equal $ downside
+        # but wildly different upside / variance per fire (a 2c NO @ $20
+        # stake = ~1000 contracts = ~$980 max payout, vs. a 90c YES @ $20
+        # stake = ~$2.20 max payout). v2 routes through kelly_size() using
+        # the GBM model probability p_side, then applies the same cheap-
+        # contract cap as Consensus/Sniper to limit lottery-priced bleed.
+        base_stake = self.stake
+        kelly_stake = None
+        if BRIDGE_KELLY_ENABLED and balance is not None and balance > 0:
+            ks = kelly_size(balance, p_side, price_dollars,
+                            fallback_stake=base_stake)
+            if ks > 0:
+                effective_stake = ks
+                kelly_stake = round(ks, 2)
+            else:
+                # Kelly says no edge despite passing entry gates — take a
+                # small exploratory stake (matches Consensus/Sniper pattern).
+                effective_stake = float(os.getenv("KELLY_ZERO_EDGE_STAKE", "1.0"))
+        else:
+            effective_stake = base_stake
+
+        # Cheap-contract cap (matches Consensus v2.1 / Sniper): limit dollar
+        # exposure on lottery-priced entries — the structural fix for the
+        # 2c NO / 800-contract case from BRIDGE_V1.
+        cheap_capped = False
+        if price_cents < CHEAP_CONTRACT_PRICE and effective_stake > CHEAP_CONTRACT_MAX_STAKE:
+            effective_stake = CHEAP_CONTRACT_MAX_STAKE
+            cheap_capped = True
+
+        count = max(1, int(effective_stake / price_dollars))
 
         self.last_fire_time = now_s
 
-        return {
+        signal = {
             "strategy": self.name,
             "ticker":   ticker,
             "side":     model_side,
@@ -2928,8 +2968,12 @@ class BridgeStrategy:
             "dollars":  round(count * price_dollars, 2),
             "reason":   (f"5m {mom_5m*100:+.3f}% + {dist_sigmas:.2f}σ | "
                          f"{secs_left:.0f}s left | fair {p_side*100:.1f}%, "
-                         f"ask {price_cents}c, edge +{edge_cents}c"),
+                         f"ask {price_cents}c, edge +{edge_cents}c"
+                         f"{' [CHEAP_CAP $' + str(CHEAP_CONTRACT_MAX_STAKE) + ']' if cheap_capped else ''}"),
         }
+        if kelly_stake is not None:
+            signal["kelly_stake"] = kelly_stake
+        return signal
 
 
 # ═══════════════════════════════════════════════════════════
@@ -2961,7 +3005,10 @@ class FadeStrategy:
       If BTC dropped -> buy YES (fade the drop).
 
     SIZING:
-      Fixed stake / price_dollars for v1. No Kelly priors yet.
+      Fixed stake / price_dollars, with CHEAP_CONTRACT_MAX_STAKE applied
+      to the 40-44c slice of the entry band (matches Consensus v2.1).
+      No Kelly priors yet — FADE has no explicit win-probability model;
+      Kelly would require a calibrated mean-reversion p estimate first.
     """
 
     def __init__(self, stake_dollars, *,
@@ -3039,7 +3086,20 @@ class FadeStrategy:
 
         if price_dollars <= 0:
             return None
-        count = max(1, int(self.stake / price_dollars))
+
+        # ---- Sizing -------------------------------------------------------
+        # Apply the cheap-contract cap consistently with Consensus v2.1 /
+        # Sniper. With FADE_MIN_PRICE_CENTS=40 and CHEAP_CONTRACT_PRICE=45
+        # this only bites on the 40-44c slice, but it costs nothing to keep
+        # the rule uniform across strategies (and protects us if either
+        # threshold moves later).
+        effective_stake = self.stake
+        cheap_capped = False
+        if price_cents < CHEAP_CONTRACT_PRICE and effective_stake > CHEAP_CONTRACT_MAX_STAKE:
+            effective_stake = CHEAP_CONTRACT_MAX_STAKE
+            cheap_capped = True
+
+        count = max(1, int(effective_stake / price_dollars))
 
         self.last_fire_time = now_s
 
@@ -3053,7 +3113,8 @@ class FadeStrategy:
             "reason":   (f"FADE 5m {mom_5m*100:+.3f}% -> {fade_side.upper()} @ {price_cents}c "
                          f"| 60s: {mom_60s*100:+.3f}% (decaying) "
                          f"| vol {sigma_s:.2e} (p{FADE_VOL_PERCENTILE_MIN:.0%}) "
-                         f"| {secs_left:.0f}s left"),
+                         f"| {secs_left:.0f}s left"
+                         f"{' [CHEAP_CAP $' + str(CHEAP_CONTRACT_MAX_STAKE) + ']' if cheap_capped else ''}"),
         }
 
 
