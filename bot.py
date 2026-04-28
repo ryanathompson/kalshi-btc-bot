@@ -50,7 +50,7 @@ Runs multiple strategies in parallel on Kalshi's KXBTC15M markets:
     3. SIGNAL DISAGREEMENT GATING — When multiple strategies fire on the
        same market but disagree on direction, the market is skipped entirely.
     4. DYNAMIC EARLY EXIT — Sniper Conviction trades (50-55c) are monitored
-       for BTC reversals >0.3%. Sells at small loss vs riding to $0 settlement.
+       for BTC reversals >0.15%. Sells at small loss vs riding to $0 settlement.
 
 SETUP:
     pip install requests cryptography colorama tabulate python-dotenv
@@ -252,7 +252,7 @@ BRIDGE_BETA_ENABLED         = (
 BRIDGE_V1_BETA_ENABLED      = BRIDGE_BETA_ENABLED
 BRIDGE_MIN_SECS_LEFT        = int(os.getenv("BRIDGE_MIN_SECS_LEFT",        "180"))  # 3 min
 BRIDGE_MAX_SECS_LEFT        = int(os.getenv("BRIDGE_MAX_SECS_LEFT",        "300"))  # 5 min
-BRIDGE_5M_MIN_MOMENTUM      = float(os.getenv("BRIDGE_5M_MIN_MOMENTUM",  "0.0006"))  # same as SNIPER v3
+BRIDGE_5M_MIN_MOMENTUM      = float(os.getenv("BRIDGE_5M_MIN_MOMENTUM",  "0.0006"))  # was same as SNIPER v3; SNIPER raised to 0.07% in v3.2
 BRIDGE_60S_CONFIRM_MIN      = float(os.getenv("BRIDGE_60S_CONFIRM_MIN",  "0.0001"))  # same as SNIPER v3
 BRIDGE_MIN_DIST_SIGMAS      = float(os.getenv("BRIDGE_MIN_DIST_SIGMAS",    "1.5"))   # lighter than ED's 2.0
 BRIDGE_MIN_EDGE_CENTS       = int(os.getenv("BRIDGE_MIN_EDGE_CENTS",         "2"))   # lighter than ED's 3
@@ -314,7 +314,13 @@ PREV_CHECK_INTERVAL = 60     # only poll settled markets every 60s (not every cy
 # that diluted the edge.  Top-5 winners consistently had 5m moves ≥ 0.04%;
 # losers clustered at the 0.03-0.05% floor.  Doubling the threshold filters
 # the weakest signals.  Override via env: SNIPER_5M_MIN_MOMENTUM=0.0003.
-SNIPER_5M_MIN_MOMENTUM = float(os.getenv("SNIPER_5M_MIN_MOMENTUM", "0.0006"))  # 0.06%
+# [v3.2] Raised from 0.0006 (0.06%) → 0.0007 (0.07%).  Two days of live
+# data (43 fills) showed both $1.00 max-losses had 5m signals at exactly
+# ±0.060% — right at the old floor.  All top-5 winners had |5m| ≥ 0.075%.
+# The 0.01% bump filters the weakest conviction entries while preserving
+# every observed winner.  Also creates real separation from
+# STRONG_MOMENTUM_THRESHOLD (0.065%).
+SNIPER_5M_MIN_MOMENTUM = float(os.getenv("SNIPER_5M_MIN_MOMENTUM", "0.0007"))  # 0.07%
 SNIPER_COOLDOWN        = int(os.getenv("SNIPER_COOLDOWN",   "180"))   # seconds between sniper trades
 # Sniper stake defaults — fall back to MAX_STAKE_PER_TRADE when not explicitly set.
 SNIPER_LOTTERY_STAKE    = float(os.getenv("SNIPER_LOTTERY_STAKE")    or MAX_STAKE_PER_TRADE)
@@ -383,7 +389,13 @@ DISAGREEMENT_GATING = os.getenv("DISAGREEMENT_GATING", "true").lower() == "true"
 # Dynamic early exit: sell Conviction-zone positions if BTC reverses
 # hard after entry, instead of riding to settlement at $0.
 EARLY_EXIT_ENABLED       = os.getenv("EARLY_EXIT_ENABLED", "true").lower() == "true"
-EARLY_EXIT_REVERSAL_PCT  = float(os.getenv("EARLY_EXIT_REVERSAL_PCT", "0.003"))  # 0.3% BTC reversal
+# [v3.2] Lowered from 0.003 (0.3%) → 0.0015 (0.15%).  The old 0.3%
+# threshold almost never triggered in 15-min BTC markets — early_exits
+# counter was 0 across 43+ fills over two days.  Most losing Conviction
+# trades bleed from momentum stalling/drifting, not violent reversals.
+# 0.15% is reachable in 13 min (15m contract minus 2m min hold) and
+# catches moderate reversals before they ride to zero settlement.
+EARLY_EXIT_REVERSAL_PCT  = float(os.getenv("EARLY_EXIT_REVERSAL_PCT", "0.0015"))  # 0.15% BTC reversal
 EARLY_EXIT_MIN_HOLD_S    = int(os.getenv("EARLY_EXIT_MIN_HOLD_S", "120"))        # 2 min minimum hold
 EARLY_EXIT_MAX_LOSS_PCT  = float(os.getenv("EARLY_EXIT_MAX_LOSS_PCT", "0.40"))   # [v2.5] widened from 0.10 — see docs/v2_feature_audit_2026-04-15.md
 
@@ -1668,7 +1680,7 @@ class PositionMonitor:
     """Tracks open Conviction-zone positions for early exit on BTC reversal.
 
     Only Sniper Conviction trades (50-55c) are tracked — they have enough
-    liquidity to sell back. If BTC reverses > 0.3%, selling at small loss
+    liquidity to sell back. If BTC reverses > 0.15%, selling at small loss
     beats riding to $0 settlement (~50% loss).
     """
     def __init__(self):
@@ -2233,7 +2245,7 @@ class SniperStrategy:
       KILL ZONE  (11-49c): NEVER.   All sub-bands show -13pp to -15pp edge.
 
     FILTERS:
-      1. 5-min BTC momentum must exceed SNIPER_5M_MIN_MOMENTUM (0.03%).
+      1. 5-min BTC momentum must exceed SNIPER_5M_MIN_MOMENTUM (0.07%).
          Aligned trades:  n=48, WR=35.4%, edge=+2.5pp, +22% ROI.
          Counter trades:  n=88, WR=15.9%, edge=-15.9pp, -27% ROI.
       2. 60-second momentum must not contradict 5-min direction.
