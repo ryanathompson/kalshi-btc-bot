@@ -188,7 +188,7 @@ MIN_BOOK_SUM        = 0.97   # yes+no must sum >= 0.97 (liquid market check)
 # was |momentum| 0.030-0.043% with entry prices below 40c, both of which
 # v1.2 filters out. Kill-switch via env: CONSENSUS_ENABLED=false (no redeploy).
 LAG_ENABLED       = os.getenv("LAG_ENABLED",       "true").lower() == "true"
-CONSENSUS_ENABLED = os.getenv("CONSENSUS_ENABLED", "true").lower() == "true"   # re-enabled v2.0 for dry-run validation
+CONSENSUS_ENABLED = os.getenv("CONSENSUS_ENABLED", "false").lower() == "true"  # [v3.2] retired — replaced by CONSENSUS_V2 beta
 SNIPER_ENABLED    = os.getenv("SNIPER_ENABLED",    "true").lower()  == "true"
 
 # ── Beta models (Phase 3+) ──────────────────────────────────────────
@@ -276,6 +276,18 @@ FADE_MIN_PRICE_CENTS        = int(os.getenv("FADE_MIN_PRICE_CENTS",         "40"
 FADE_MAX_PRICE_CENTS        = int(os.getenv("FADE_MAX_PRICE_CENTS",         "50"))
 FADE_VOL_PERCENTILE_MIN     = float(os.getenv("FADE_VOL_PERCENTILE_MIN",  "0.50"))   # only in elevated vol
 FADE_COOLDOWN_S             = int(os.getenv("FADE_COOLDOWN_S",             "300"))
+
+# ── CONSENSUS_V2 beta (momentum-regime hybrid for 36-45c zone) ───────
+# Uses SNIPER-grade 5m momentum + previous-result regime agreement to
+# trade the 36-45c OTM band that SNIPER's kill-zone filter rejects.
+# V1 data showed this band at 63.6% WR / 71.3% ROI across 33 trades.
+CONSENSUS_V2_BETA_ENABLED   = os.getenv("CONSENSUS_V2_BETA_ENABLED", "true").lower() == "true"
+CONSENSUS_V2_5M_MIN_MOMENTUM = float(os.getenv("CONSENSUS_V2_5M_MIN_MOMENTUM", "0.0007"))  # same floor as SNIPER v3.2
+CONSENSUS_V2_60S_CONFIRM_MIN = float(os.getenv("CONSENSUS_V2_60S_CONFIRM_MIN", "0.0001"))  # same as SNIPER v3
+CONSENSUS_V2_MIN_PRICE_CENTS = int(os.getenv("CONSENSUS_V2_MIN_PRICE_CENTS",     "36"))
+CONSENSUS_V2_MAX_PRICE_CENTS = int(os.getenv("CONSENSUS_V2_MAX_PRICE_CENTS",     "45"))
+CONSENSUS_V2_COOLDOWN_S      = int(os.getenv("CONSENSUS_V2_COOLDOWN_S",         "300"))  # 5 min
+CONSENSUS_V2_MIN_MINS_LEFT   = float(os.getenv("CONSENSUS_V2_MIN_MINS_LEFT",      "5"))
 
 # ── v2.0 Unified stake ───────────────────────────────────────────────
 # Single max-stake-per-trade replaces the old per-strategy LAG_STAKE /
@@ -370,7 +382,8 @@ KELLY_PRIORS = {
     # we don't want Kelly oversizing before we prove it).  Rolling stats via
     # StrategyScorer will override this prior once KELLY_MIN_TRADES fills.
     "SNIPER_CONVICTION": {"win_rate": 0.52,  "avg_price": 0.525},  # conservative live-adjusted
-    "CONSENSUS":         {"win_rate": 0.55,  "avg_price": 0.40},   # conservative prior
+    "CONSENSUS":         {"win_rate": 0.55,  "avg_price": 0.40},   # conservative prior (V1, retired)
+    "CONSENSUS_V2":      {"win_rate": 0.60,  "avg_price": 0.41},   # from V1 36-45c band: 63.6% WR, conservative at 60%
     "LAG":               {"win_rate": 0.50,  "avg_price": 0.50},   # structural edge, flat sizing
 }
 
@@ -2223,6 +2236,197 @@ class ConsensusStrategy:
         return signal
 
 
+
+# ═══════════════════════════════════════════════════════════
+# STRATEGY 2b: CONSENSUS V2 (momentum-regime hybrid, 36-45c)
+# ═══════════════════════════════════════════════════════════
+
+class ConsensusV2Strategy:
+    """
+    Consensus V2 — momentum-regime hybrid for the 36-45c zone
+    ==========================================================
+    Evolved from V1 after 100-trade beta showed the 36-45c band at 63.6% WR
+    / 71.3% ROI while other bands bled. V2 strips down to just that zone and
+    upgrades the signal pipeline.
+
+    THESIS:
+      The 36-45c OTM band is underserved — SNIPER's kill-zone rejects it, but
+      when strong 5-minute momentum aligns with regime continuation (previous
+      market settled the same way), contracts in this band are mispriced.
+
+    SIGNAL PIPELINE (all must pass):
+      1. 5-minute BTC momentum >= CONSENSUS_V2_5M_MIN_MOMENTUM (0.07%).
+         Upgraded from V1's weak 60-second window to SNIPER-grade 5m signal.
+      2. 60-second confirmation: recent price action must confirm 5m direction
+         (same gate as SNIPER v3.0 — filters stale/decaying momentum).
+      3. Previous-result agreement: the last settled 15-min market must have
+         resolved in the same direction as current momentum. This is regime
+         awareness — continuation is more likely than reversal.
+      4. Price must be in the 36-45c band (hard floor and cap).
+      5. Market must have >= 5 minutes remaining.
+      6. Cooldown of 300s between fires.
+
+    SIZING:
+      Kelly with corrected priors (60% WR, 0.41 avg price) — conservative
+      estimate below the raw 63.6% observed in V1's 36-45c band.
+      Hard-capped at $3/trade while sample accumulates.
+
+    DIFFERENCES FROM V1:
+      - 5m momentum replaces 60s momentum (much stronger signal)
+      - 60s confirmation added (filters decaying momentum)
+      - Hard 36-45c zone (no dynamic cap, no 25-35c or 46-55c)
+      - Kelly priors based on actual band performance, not whole-strategy avg
+      - No STRONG-only gate needed (0.07% floor is already above STRONG)
+    """
+
+    def __init__(self, stake_dollars, *, is_beta=False, beta_model_id=None):
+        self.stake          = stake_dollars
+        self.name           = "CONSENSUS_V2"
+        self.is_beta        = is_beta
+        self.beta_model_id  = beta_model_id
+        self.last_result    = None   # "yes" or "no"
+        self.last_result_time = 0
+        self.last_ticker    = None
+        self.last_trade_time = 0
+        self._last_prev_check = 0
+
+    def update_previous(self, markets, client):
+        """Check recently closed markets for previous result.
+        Throttled: only hits the API every PREV_CHECK_INTERVAL seconds.
+        """
+        now = time.time()
+        if now - self._last_prev_check < PREV_CHECK_INTERVAL:
+            return
+        self._last_prev_check = now
+
+        closed = client.get_markets_by_series(BTC_TICKER, status="settled")
+        if closed:
+            latest = sorted(closed, key=lambda m: m.get("close_time", ""), reverse=True)[0]
+            result = latest.get("result")
+            if result and latest["ticker"] != self.last_ticker:
+                self.last_result      = result
+                self.last_result_time = now
+                self.last_ticker      = latest["ticker"]
+
+    def evaluate(self, market, btc_feed, mins_left=None, balance=None, score_mult=1.0):
+        """
+        Evaluate Consensus V2 signal for a single market.
+
+        Returns signal dict or None.
+        """
+        ticker  = market["ticker"]
+        yes_px  = float(market.get("yes_ask_dollars", market.get("yes_bid_dollars", 0)))
+        no_px   = float(market.get("no_ask_dollars",  market.get("no_bid_dollars",  0)))
+        book_sum = yes_px + no_px
+
+        if book_sum < MIN_BOOK_SUM:
+            return None
+
+        # -- Time filter: need enough runway ---------------------------------
+        if mins_left is not None and mins_left < CONSENSUS_V2_MIN_MINS_LEFT:
+            return None
+
+        # -- Cooldown --------------------------------------------------------
+        now = time.time()
+        if now - self.last_trade_time < CONSENSUS_V2_COOLDOWN_S:
+            return None
+
+        # -- 5-minute momentum (primary signal) ------------------------------
+        mom_5m = btc_feed.pct_change(300)
+        if mom_5m is None:
+            return None
+
+        if abs(mom_5m) < CONSENSUS_V2_5M_MIN_MOMENTUM:
+            return None
+
+        # -- 60-second contradiction check -----------------------------------
+        mom_60s = btc_feed.pct_change(60)
+        if mom_60s is not None and abs(mom_60s) > 0.0003:
+            if (mom_5m > 0 and mom_60s < -0.0003) or \
+               (mom_5m < 0 and mom_60s > 0.0003):
+                return None
+
+        # -- 60-second confirmation ------------------------------------------
+        if mom_60s is None:
+            return None
+        same_direction = (mom_5m > 0 and mom_60s > CONSENSUS_V2_60S_CONFIRM_MIN) or \
+                         (mom_5m < 0 and mom_60s < -CONSENSUS_V2_60S_CONFIRM_MIN)
+        if not same_direction:
+            return None
+
+        # -- Previous-result agreement (regime signal) -----------------------
+        if not self.last_result:
+            return None
+
+        if self.last_result_time and (now - self.last_result_time > PREV_RESULT_MAX_AGE):
+            return None
+
+        momentum_side = "yes" if mom_5m > 0 else "no"
+        previous_side = self.last_result
+
+        if momentum_side != previous_side:
+            return None
+
+        # -- Price zone filter: 36-45c only ----------------------------------
+        side          = momentum_side
+        price_dollars = yes_px if side == "yes" else no_px
+        price_cents   = int(price_dollars * 100)
+
+        if price_cents < CONSENSUS_V2_MIN_PRICE_CENTS:
+            return None
+        if price_cents > CONSENSUS_V2_MAX_PRICE_CENTS:
+            return None
+
+        # -- Kelly sizing with corrected priors ------------------------------
+        kelly_stake = None
+        KELLY_ZERO_EDGE_STAKE = float(os.getenv("KELLY_ZERO_EDGE_STAKE", "1.0"))
+        if KELLY_ENABLED and balance:
+            prior = KELLY_PRIORS.get("CONSENSUS_V2", {})
+            if prior:
+                ks = kelly_size(balance, prior["win_rate"], price_dollars,
+                               fallback_stake=self.stake)
+                if ks > 0:
+                    effective_stake = ks
+                    kelly_stake = round(ks, 2)
+                else:
+                    effective_stake = KELLY_ZERO_EDGE_STAKE
+            else:
+                effective_stake = self.stake
+        else:
+            effective_stake = self.stake
+
+        # Auto-score throttle
+        effective_stake *= score_mult
+
+        # Hard cap at $3 — Kelly priors are from a small sample (33 trades),
+        # so limit downside while the beta accumulates more data.
+        CONSENSUS_V2_MAX_STAKE = float(os.getenv("CONSENSUS_V2_MAX_STAKE", "3.0"))
+        effective_stake = min(effective_stake, CONSENSUS_V2_MAX_STAKE)
+
+        count = max(1, int(effective_stake / price_dollars))
+
+        # Record trade time for cooldown
+        self.last_trade_time = now
+
+        signal = {
+            "strategy": self.name,
+            "ticker":   ticker,
+            "side":     side,
+            "price":    price_cents,
+            "count":    count,
+            "dollars":  round(count * price_dollars, 2),
+            "reason":   (f"CONVICTION / 5m {mom_5m*100:+.4f}% -> {side.upper()} @ {price_cents}c "
+                         f"/ 60s: {mom_60s*100:+.4f}% / prev={previous_side} "
+                         f"/ {mins_left:.0f}m left" if mins_left else
+                         f"CONVICTION / 5m {mom_5m*100:+.4f}% -> {side.upper()} @ {price_cents}c "
+                         f"/ 60s: {mom_60s*100:+.4f}% / prev={previous_side}"),
+        }
+        if kelly_stake is not None:
+            signal["kelly_stake"] = kelly_stake
+        return signal
+
+
+
 # âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 # STRATEGY 3: SNIPER (data-driven directional)
 # âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
@@ -3370,6 +3574,19 @@ class KalshiBot:
                 is_beta=True,
                 beta_model_id="FADE_V1",
             ))
+        # ── CONSENSUS_V2 beta (momentum-regime hybrid, 36-45c) ──────────
+        # Replaces V1. Uses SNIPER-grade 5m momentum + previous-result
+        # regime agreement to trade the 36-45c OTM band. V1 data showed
+        # this band at 63.6% WR / 71.3% ROI. Capped at $3/trade while
+        # accumulating sample.
+        self.consensus_v2 = None
+        if CONSENSUS_V2_BETA_ENABLED:
+            self.consensus_v2 = ConsensusV2Strategy(
+                max_stake,
+                is_beta=True,
+                beta_model_id="CONSENSUS_V2",
+            )
+            self.beta_strategies.append(self.consensus_v2)
         # [v2.0] New components
         self.scorer    = StrategyScorer()
         self.monitor   = PositionMonitor()
@@ -3570,7 +3787,7 @@ class KalshiBot:
         # ground truth — there's no experimental value in each beta
         # instance querying it independently.
         for _bs in self.beta_strategies:
-            if isinstance(_bs, ConsensusStrategy):
+            if isinstance(_bs, (ConsensusStrategy, ConsensusV2Strategy)):
                 _bs.last_result      = self.consensus.last_result
                 _bs.last_result_time = self.consensus.last_result_time
 
