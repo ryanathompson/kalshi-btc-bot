@@ -195,7 +195,9 @@ SNIPER_ENABLED    = os.getenv("SNIPER_ENABLED",    "true").lower()  == "true"
 # Beta strategies run alongside live, always dry-run, tagged with
 # beta_model_id for isolated reporting. See /beta on the dashboard.
 # Enable each independently via its own env var.
-CONSENSUS_V1_BETA_ENABLED = os.getenv("CONSENSUS_V1_BETA_ENABLED", "false").lower() == "true"
+# CONSENSUS_V1_BETA_ENABLED retired 2026-04-29. Only one consensus model is
+# ever active; the canonical switch is CONSENSUS_BETA_ENABLED below, which
+# currently drives CONSENSUS_V2.
 # EXPIRY_DECAY_V2 is the active version (v1 + sub-5c contrarian-lottery
 # filter; see docs/expiry_decay_v2.md). The legacy V1 env name is honored
 # as a fallback so a Render deploy doesn't silently turn the strategy
@@ -281,7 +283,13 @@ FADE_COOLDOWN_S             = int(os.getenv("FADE_COOLDOWN_S",             "300"
 # Uses SNIPER-grade 5m momentum + previous-result regime agreement to
 # trade the 36-45c OTM band that SNIPER's kill-zone filter rejects.
 # V1 data showed this band at 63.6% WR / 71.3% ROI across 33 trades.
-CONSENSUS_V2_BETA_ENABLED   = os.getenv("CONSENSUS_V2_BETA_ENABLED", "true").lower() == "true"
+# Switch is CONSENSUS_BETA_ENABLED (canonical, version-agnostic — only one
+# consensus model is ever active). Legacy CONSENSUS_V2_BETA_ENABLED is
+# honored as a fallback so a Render env rename isn't required immediately.
+CONSENSUS_BETA_ENABLED      = (
+    os.getenv("CONSENSUS_BETA_ENABLED",
+              os.getenv("CONSENSUS_V2_BETA_ENABLED", "true")).lower() == "true"
+)
 CONSENSUS_V2_5M_MIN_MOMENTUM = float(os.getenv("CONSENSUS_V2_5M_MIN_MOMENTUM", "0.0007"))  # same floor as SNIPER v3.2
 CONSENSUS_V2_60S_CONFIRM_MIN = float(os.getenv("CONSENSUS_V2_60S_CONFIRM_MIN", "0.0001"))  # same as SNIPER v3
 CONSENSUS_V2_MIN_PRICE_CENTS = int(os.getenv("CONSENSUS_V2_MIN_PRICE_CENTS",     "36"))
@@ -3517,19 +3525,10 @@ class KalshiBot:
         # Per-beta-model per-cycle dedup. Separate from self.traded_this_market
         # so beta open positions don't block live strategies and vice versa.
         self.beta_traded_by_model = {}  # model_id -> set of tickers
-        # ── CONSENSUS_V1 beta (Phase 3) ───────────────────────────
-        # Re-runs the same ConsensusStrategy logic as a shadow model, fully
-        # isolated from the live self.consensus instance (which Ryan turned
-        # off). Uses the same max_stake so simulated P&L is apples-to-apples
-        # with what the live version would have done. State (last_result,
-        # cooldowns, etc.) is fresh on this instance — no cross-talk with
-        # self.consensus beyond the shared previous-result sync in run_once.
-        if CONSENSUS_V1_BETA_ENABLED:
-            self.beta_strategies.append(ConsensusStrategy(
-                max_stake,
-                is_beta=True,
-                beta_model_id="CONSENSUS_V1",
-            ))
+        # ── CONSENSUS_V1 beta (Phase 3) — RETIRED 2026-04-29 ──────
+        # Replaced by CONSENSUS_V2 (momentum-regime hybrid, 36-45c band).
+        # V1's existing trade-log entries continue to render under the
+        # /beta dashboard's "Retired" tab; no new fires are emitted.
         # ── EXPIRY_DECAY_V2 beta (Phase 4) ──────────────────────────────
         # Fires in the final window of a 15-min market when BTC is deeply
         # into the YES/NO region vs short-window realized vol. Fully
@@ -3580,7 +3579,7 @@ class KalshiBot:
         # this band at 63.6% WR / 71.3% ROI. Capped at $3/trade while
         # accumulating sample.
         self.consensus_v2 = None
-        if CONSENSUS_V2_BETA_ENABLED:
+        if CONSENSUS_BETA_ENABLED:
             self.consensus_v2 = ConsensusV2Strategy(
                 max_stake,
                 is_beta=True,

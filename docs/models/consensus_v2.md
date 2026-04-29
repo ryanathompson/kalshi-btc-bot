@@ -125,7 +125,7 @@ All env vars, defaults shown:
 
 | Var | Default | What it controls |
 |---|---|---|
-| `CONSENSUS_V2_BETA_ENABLED` | `true` | Whole strategy on/off |
+| `CONSENSUS_BETA_ENABLED` | `true` | Whole strategy on/off — single canonical switch (only one consensus model is ever active). Legacy `CONSENSUS_V2_BETA_ENABLED` is still honored as a fallback so a Render env rename isn't required immediately. |
 | `CONSENSUS_V2_5M_MIN_MOMENTUM` | `0.0007` | Min 5-min BTC move (0.07%) |
 | `CONSENSUS_V2_60S_CONFIRM_MIN` | `0.0001` | Min 60s confirmation (0.01%) |
 | `CONSENSUS_V2_MIN_PRICE_CENTS` | `36` | Price floor (cents) |
