@@ -483,6 +483,17 @@ CONSENSUS_STRONG_ONLY = os.getenv("CONSENSUS_STRONG_ONLY", "true").lower() == "t
 SNIPER_REQUIRE_60S_CONFIRM = os.getenv("SNIPER_REQUIRE_60S_CONFIRM", "true").lower() == "true"
 SNIPER_60S_CONFIRM_MIN     = float(os.getenv("SNIPER_60S_CONFIRM_MIN", "0.0001"))  # 0.01% — same direction required
 
+# [v3.2] Momentum divergence filter — block trades where the 5m momentum is
+# strong but 60s has largely faded, indicating the move already exhausted.
+# Gap = |5m| - |60s|.  When gap > threshold, the 5m signal is stale — the
+# bulk of the move happened > 60s ago and isn't continuing.
+# Three days of live data (30 SNIPER fills with both 5m and 60s):
+#   gap > 0.08%: blocks 4 trades (1W/3L, net PnL saved $1.06)
+#   gap > 0.06%: blocks 5 trades (1W/4L, net PnL saved $1.60) — tighter but costs one $1 winner
+# Default 0.08% is conservative — catches the worst exhausted-momentum trades
+# while minimizing false positives. Set to 999 via env to effectively disable.
+MOMENTUM_DIVERGENCE_MAX = float(os.getenv("MOMENTUM_DIVERGENCE_MAX", "0.0008"))  # 0.08%
+
 
 # ═══════════════════════════════════════════════════════════
 # KEEP-ALIVE (prevents Render free-tier spin-down)
@@ -2362,6 +2373,11 @@ class ConsensusV2Strategy:
         if not same_direction:
             return None
 
+        # [v3.2] Momentum divergence filter (shared with SNIPER)
+        divergence = abs(mom_5m) - abs(mom_60s)
+        if divergence > MOMENTUM_DIVERGENCE_MAX:
+            return None
+
         # -- Previous-result agreement (regime signal) -----------------------
         if not self.last_result:
             return None
@@ -2532,6 +2548,15 @@ class SniperStrategy:
             same_direction = (mom_5m > 0 and mom_60s > SNIPER_60S_CONFIRM_MIN) or \
                              (mom_5m < 0 and mom_60s < -SNIPER_60S_CONFIRM_MIN)
             if not same_direction:
+                return None
+
+        # [v3.2] Momentum divergence filter — exhausted-momentum detection.
+        # If the gap between |5m| and |60s| exceeds the threshold, the bulk
+        # of the move happened > 60s ago and is fading. Three days of data:
+        # trades with gap > 0.08% were 1W/3L (net -$1.06 saved by blocking).
+        if mom_60s is not None:
+            divergence = abs(mom_5m) - abs(mom_60s)
+            if divergence > MOMENTUM_DIVERGENCE_MAX:
                 return None
 
         # -- Direction from 5-min momentum ----------------------------------
@@ -4109,6 +4134,7 @@ class KalshiBot:
               f"conviction=${self.sniper.conviction_stake}")
         print(f"   Sniper 5m momentum floor: {SNIPER_5M_MIN_MOMENTUM*100:.3f}%  "
               f"cooldown: {SNIPER_COOLDOWN}s  min time: {SNIPER_MIN_MINS_LEFT:.0f}m")
+        print(f"   Momentum divergence max: {MOMENTUM_DIVERGENCE_MAX*100:.3f}%")
         print(f"   Momentum dead zone: {MOMENTUM_DEAD_ZONE*100:.3f}%")
         print(f"   Strong-momentum threshold: {STRONG_MOMENTUM_THRESHOLD*100:.3f}% "
               f"(stake x{CONSENSUS_STRONG_STAKE_MULT}, cap +{CONSENSUS_STRONG_PRICE_BONUS:.2f})")

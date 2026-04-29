@@ -50,6 +50,14 @@ Every cycle (~30 seconds), for each open 15-minute market:
      to the 25c price floor, but the code path is preserved.
    - **Everything else (11–49c, 56c+):** Kill zone. No signal, no trade.
 
+8. **Momentum divergence filter (v3.2).** The gap between |5m| and |60s|
+   must be ≤ 0.08% (`MOMENTUM_DIVERGENCE_MAX`). If 5m moved 0.14% but 60s
+   is only 0.02%, the gap is 0.12% — the move happened more than a minute
+   ago and is fading. Three days of data showed trades with gap > 0.08%
+   were 1W/3L. This catches the "exhausted momentum" pattern that the 60s
+   confirmation alone misses (because 60s can be technically positive but
+   tiny relative to 5m).
+
 If all gates pass, SNIPER fires in the direction of the 5-minute momentum
 (BTC up → buy YES, BTC down → buy NO).
 

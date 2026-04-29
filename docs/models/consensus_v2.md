@@ -55,12 +55,18 @@ Every cycle, for each open 15-minute market:
    SNIPER v3's key innovation — it filters stale/decaying momentum where
    the 5m number looks good but the move has already exhausted itself.
 
-6. **Previous-result agreement.** The last settled 15-minute BTC market
+6. **Momentum divergence filter.** The gap between |5m| and |60s| must be
+   ≤ 0.08% (`MOMENTUM_DIVERGENCE_MAX`). If 5m moved big but 60s is barely
+   positive, the move happened more than a minute ago and is fading. Shared
+   with SNIPER v3.2 — three days of SNIPER data showed trades with gap
+   > 0.08% were 1W/3L.
+
+7. **Previous-result agreement.** The last settled 15-minute BTC market
    must have resolved in the same direction as current momentum. This is
    the regime signal — it's the one piece of information V2 has that SNIPER
    does not. Without it, this would just be SNIPER with a wider price zone.
 
-7. **Price zone filter.** The contract must be priced between 36c and 45c
+8. **Price zone filter.** The contract must be priced between 36c and 45c
    (inclusive). Below 36c the V1 data showed disastrous WR. Above 45c
    overlaps with SNIPER's domain.
 
