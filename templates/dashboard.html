@@ -97,8 +97,11 @@
     /* ── STAT CARDS ── */
     .cards {
       display: grid;
-      grid-template-columns: repeat(4, 1fr);
+      grid-template-columns: repeat(5, 1fr);
       gap: 14px;
+    }
+    @media (max-width: 1400px) {
+      .cards { grid-template-columns: repeat(3, 1fr); }
     }
     @media (max-width: 1100px) {
       .cards { grid-template-columns: repeat(2, 1fr); }
@@ -124,6 +127,7 @@
     .card-lag    .card-title { color: var(--cyan); }
     .card-con    .card-title { color: var(--purple); }
     .card-snp    .card-title { color: var(--green); }
+    .card-exp    .card-title { color: var(--orange); }
     .card-all    .card-title { color: var(--blue); }
 
     .stat-grid {
@@ -882,6 +886,14 @@
       </div>
       <div class="empty-card" id="snp-empty">No settled trades yet</div>
       <div class="stat-grid" id="snp-stats" style="display:none"></div>
+    </div>
+    <div class="card card-exp" id="card-exp">
+      <div class="card-title" style="display:flex; align-items:center; justify-content:space-between;">
+        <span title="Late-window strategy: fires in the final 0-3 min of a 15-min market when BTC is deeply into the YES/NO region vs short-window realized vol. Promoted from beta 2026-04-30 after 110 sim fires at 92.7% WR / +60% ROI cleared the promotion bar. Quarter-Kelly sized using per-fire GBM probability, capped at MAX_STAKE_PER_TRADE.">⏳ Expiry Decay</span>
+        <span class="badge" id="score-badge-EXPIRY_DECAY" style="margin:0; font-size:10px;" title="Auto-score (0-100). FULL = 100% stake, THROTTLED = 50%, BLOCKED = paused. Based on rolling 20-trade window of ROI, win rate, and trend."></span>
+      </div>
+      <div class="empty-card" id="exp-empty">No settled trades yet</div>
+      <div class="stat-grid" id="exp-stats" style="display:none"></div>
     </div>
     <div class="card card-all">
       <div class="card-title">📊 Combined</div>
@@ -1905,10 +1917,11 @@
       renderStats('lag-stats', 'lag-empty', d.lag_stats);
       renderStats('con-stats', 'con-empty', d.con_stats);
       renderStats('snp-stats', 'snp-empty', d.snp_stats);
+      renderStats('exp-stats', 'exp-empty', d.exp_stats);
       renderStats('all-stats', 'all-empty', d.all_stats);
 
       // [v2.0] Update strategy score badges
-      for (const name of ['LAG', 'CONSENSUS', 'SNIPER']) {
+      for (const name of ['LAG', 'CONSENSUS', 'SNIPER', 'EXPIRY_DECAY']) {
         const badge = document.getElementById(`score-badge-${name}`);
         if (!badge) continue;
         const s = (d.strategy_scores || {})[name];
