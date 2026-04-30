@@ -233,6 +233,19 @@ EXPIRY_DECAY_COOLDOWN_S      = int(os.getenv("EXPIRY_DECAY_COOLDOWN_S",        "
 # docs/expiry_decay_v2.md for the full breakdown.
 EXPIRY_DECAY_MIN_PRICE_CENTS = int(os.getenv("EXPIRY_DECAY_MIN_PRICE_CENTS",     "5"))
 
+# v2.2 (2026-04-30): Fill buffer. First 3 live fires (08:57, 09:27, 09:58 ET)
+# all NO_FILL — bidding at the displayed ask in late-window markets doesn't
+# cross the spread because the ask is often stale/phantom (sellers pull
+# offers as expiry approaches; the snapshot lingers). Bidding at ask + N¢
+# crosses the buy book aggressively. Kalshi's matcher still fills at the
+# best available offer, so we only pay the buffer if we're actively
+# sweeping a level — otherwise the fill price equals the displayed ask.
+# Capped per-fire at (edge_cents - MIN_EDGE_CENTS) so we never give back
+# the strategy's edge floor. Default 2¢ chosen to absorb most one-tick
+# stale-snapshot cases without burning more than one tick of edge on
+# most fires (the GBM model's avg edge is ~5¢).
+EXPIRY_DECAY_FILL_BUFFER_C   = int(os.getenv("EXPIRY_DECAY_FILL_BUFFER_C",       "2"))
+
 # v2.1 (2026-04-30): Kelly sizing toggle. Mirrors BRIDGE_KELLY_ENABLED.
 # Uses per-fire GBM model probability `p_side` as the win-rate input — same
 # pattern as BRIDGE — rather than a static prior. Quarter-Kelly (global
@@ -2910,12 +2923,30 @@ class ExpiryDecayStrategy:
       When Kelly returns 0 (no edge at this price), falls back to a $1
       exploratory stake (same v3.1 convention as SNIPER / CONSENSUS_V2).
       EXPIRY_DECAY_KELLY_ENABLED=false reverts to flat self.stake.
+      [v2.2] Kelly sizes against the post-buffer bid price, not the
+      displayed ask — conservative (if we fill at the ask, realized
+      stake is below the Kelly target, never above).
 
     PROMOTION:
       See docs/beta_promotion.md. Expect optimistic-sim inflation; require
       ~2x the edge you'd demand from a live strategy before promoting.
 
     CHANGELOG:
+      v2.2 (2026-04-30): Fill buffer (EXPIRY_DECAY_FILL_BUFFER_C, default 2¢).
+        First 3 live fires post-promotion (08:57, 09:27, 09:58 ET) all
+        NO_FILL: 90c YES, 95c NO, 96c NO. Diagnosis: bidding at the
+        displayed ask doesn't cross the spread when the ask is
+        stale/phantom — common in late-window markets where holders of
+        the near-certain winning side don't actually want to sell, but
+        old offers linger in the snapshot. Bidding at ask + N¢ crosses
+        aggressively; Kalshi's matcher still fills at the best resting
+        offer, so we only pay the buffer when sweeping. Buffer capped
+        per-fire at (edge_cents - MIN_EDGE_CENTS) so fires with thin
+        edge get no buffer (no edge to spend) and fires with fat edge
+        get the full buffer. Validates the playbook's
+        docs/beta_promotion.md:139-141 prediction that expiry decay
+        is "especially sensitive — late-window fills often walk the
+        book."
       v2.1 (2026-04-30): Added Kelly sizing via EXPIRY_DECAY_KELLY_ENABLED
         (default ON). Uses per-fire p_side as the win-rate input — matches
         BRIDGE_V2's pattern. v2 sample of 110 fires at 92.7% WR / +60% sim
@@ -3062,19 +3093,47 @@ class ExpiryDecayStrategy:
         if price_dollars <= 0:
             self._vlog(ticker, f"BLOCK price: {price_dollars}")
             return None
-        price_cents = int(round(price_dollars * 100))
+        ask_cents = int(round(price_dollars * 100))
 
         # [v2] Contrarian-lottery filter. v1 dry-run showed sub-5c
         # entries 24-for-24 losers; the GBM dist_sigmas gate doesn't
         # distinguish "buy consensus side at 80c" from "buy contrarian
         # side at 1c" even though they're opposite trades.
-        if price_cents < EXPIRY_DECAY_MIN_PRICE_CENTS:
+        if ask_cents < EXPIRY_DECAY_MIN_PRICE_CENTS:
             self._vlog(
                 ticker,
-                f"BLOCK price floor: {side.upper()} @ {price_cents}c "
+                f"BLOCK price floor: {side.upper()} @ {ask_cents}c "
                 f"< min={EXPIRY_DECAY_MIN_PRICE_CENTS}c (v2 contrarian-lottery filter)"
             )
             return None
+
+        # ---- [v2.2] Fill buffer -----------------------------------------
+        # Bid `EXPIRY_DECAY_FILL_BUFFER_C` cents above the displayed ask
+        # to cross the spread. Capped at (edge_cents - MIN_EDGE_CENTS)
+        # so we never give back the strategy's edge floor — fires with
+        # exactly MIN_EDGE_CENTS of edge get zero buffer; fires with
+        # more edge get up to the full buffer. Kalshi matches at the
+        # best resting offer, so we only pay the full buffer when the
+        # displayed ask is stale and we're sweeping a level. See the
+        # v2.2 CHANGELOG entry on the class for the live-failure
+        # diagnostic that motivated this.
+        fill_buffer = max(0, min(EXPIRY_DECAY_FILL_BUFFER_C,
+                                 edge_cents - EXPIRY_DECAY_MIN_EDGE_CENTS))
+        bid_cents     = ask_cents + fill_buffer
+        bid_dollars   = bid_cents / 100.0
+        # Cap at 99c — Kalshi rejects buys priced >= 100c, and even 99c
+        # leaves 1c of payout if we win. Should rarely bind given the
+        # MIN_EDGE_CENTS=3 gate, but cheap belt-and-suspenders.
+        if bid_cents > 99:
+            bid_cents   = 99
+            bid_dollars = 0.99
+        # Re-export the canonical "price" we'll show on the trade record:
+        # this is the price Kalshi will see on our order. If they fill us
+        # at the displayed ask (the common case when the snapshot is
+        # fresh), the rebuild_trades_from_api path will overwrite this
+        # with the actual fill price during the next reconcile.
+        price_cents   = bid_cents
+        price_dollars = bid_dollars
 
         # ---- [v2.1] Kelly sizing -----------------------------------------
         # Use per-fire GBM probability `p_side` as the win-rate input
@@ -3084,6 +3143,9 @@ class ExpiryDecayStrategy:
         # back to a small exploratory stake — matches the SNIPER /
         # CONSENSUS_V2 / BRIDGE convention so we still log the fire and
         # learn from the outcome without exposing the full stake.
+        # NOTE: Kelly is sized against `bid_dollars`, not the displayed
+        # ask. This is conservative: if we fill at the lower displayed
+        # ask, the realized stake is below the Kelly cap, which is fine.
         kelly_stake = None
         if EXPIRY_DECAY_KELLY_ENABLED and balance is not None and balance > 0:
             ks = kelly_size(balance, p_side, price_dollars,
@@ -3102,9 +3164,10 @@ class ExpiryDecayStrategy:
 
         strike_repr = f"{strike:,.0f}"
         kelly_log = f" | kelly ${kelly_stake:.2f}" if kelly_stake is not None else " | flat"
+        buffer_log = f" (ask {ask_cents}c +{fill_buffer}c)" if fill_buffer > 0 else ""
         self._vlog(
             ticker,
-            f"FIRE {side.upper()} @ {price_cents}c | {dist_sigmas:.2f}σ | "
+            f"FIRE {side.upper()} @ {price_cents}c{buffer_log} | {dist_sigmas:.2f}σ | "
             f"fair {p_side*100:.1f}% | edge +{edge_cents}c | secs_left={secs_left:.0f}"
             f"{kelly_log}"
         )
@@ -3117,7 +3180,8 @@ class ExpiryDecayStrategy:
             "dollars":  round(count * price_dollars, 2),
             "reason":   (f"BTC ${btc:,.0f} vs {strike_repr} "
                          f"| {dist_sigmas:.2f}σ | {secs_left:.0f}s left "
-                         f"| fair {p_side*100:.1f}%, ask {price_cents}c, "
+                         f"| fair {p_side*100:.1f}%, ask {ask_cents}c"
+                         f"{f' +{fill_buffer}c buffer' if fill_buffer > 0 else ''}, "
                          f"edge +{edge_cents}c"
                          f"{f' | kelly ${kelly_stake:.2f}' if kelly_stake is not None else ''}"),
         }
