@@ -233,6 +233,17 @@ EXPIRY_DECAY_COOLDOWN_S      = int(os.getenv("EXPIRY_DECAY_COOLDOWN_S",        "
 # docs/expiry_decay_v2.md for the full breakdown.
 EXPIRY_DECAY_MIN_PRICE_CENTS = int(os.getenv("EXPIRY_DECAY_MIN_PRICE_CENTS",     "5"))
 
+# v2.3 (2026-04-30): Upper price cap. v2.2 buffer fix lifted fill rate from
+# 0/3 to 1/5 post-deploy, but the no-fills clustered at 95-97¢ — the ask
+# side of the book is structurally empty above ~85¢ in late-window
+# markets. Holders of near-certain $1 contracts don't offer them at 95¢;
+# whatever shows in the snapshot is stale. Skipping these fires entirely
+# beats logging them as NO_FILL — the model's "fair value 99%" thesis
+# remains correct, just unreachable via the order book. The 1/1 fill at
+# 84¢ supports a cap somewhere just above. SNIPER and CONSENSUS_V2 keep
+# operating in the deeper 5+ min book where higher prices still fill.
+EXPIRY_DECAY_MAX_PRICE_CENTS = int(os.getenv("EXPIRY_DECAY_MAX_PRICE_CENTS",    "88"))
+
 # v2.2 (2026-04-30): Fill buffer. First 3 live fires (08:57, 09:27, 09:58 ET)
 # all NO_FILL — bidding at the displayed ask in late-window markets doesn't
 # cross the spread because the ask is often stale/phantom (sellers pull
@@ -241,10 +252,10 @@ EXPIRY_DECAY_MIN_PRICE_CENTS = int(os.getenv("EXPIRY_DECAY_MIN_PRICE_CENTS",    
 # best available offer, so we only pay the buffer if we're actively
 # sweeping a level — otherwise the fill price equals the displayed ask.
 # Capped per-fire at (edge_cents - MIN_EDGE_CENTS) so we never give back
-# the strategy's edge floor. Default 2¢ chosen to absorb most one-tick
-# stale-snapshot cases without burning more than one tick of edge on
-# most fires (the GBM model's avg edge is ~5¢).
-EXPIRY_DECAY_FILL_BUFFER_C   = int(os.getenv("EXPIRY_DECAY_FILL_BUFFER_C",       "2"))
+# the strategy's edge floor. Default bumped from 2¢ → 3¢ on 2026-04-30
+# alongside the v2.3 max-price cap — fewer fires now firing, so we can
+# spend a touch more edge on each remaining one to push fill rate.
+EXPIRY_DECAY_FILL_BUFFER_C   = int(os.getenv("EXPIRY_DECAY_FILL_BUFFER_C",       "3"))
 
 # v2.1 (2026-04-30): Kelly sizing toggle. Mirrors BRIDGE_KELLY_ENABLED.
 # Uses per-fire GBM model probability `p_side` as the win-rate input — same
@@ -2932,6 +2943,21 @@ class ExpiryDecayStrategy:
       ~2x the edge you'd demand from a live strategy before promoting.
 
     CHANGELOG:
+      v2.3 (2026-04-30): Upper price cap (EXPIRY_DECAY_MAX_PRICE_CENTS=88)
+        + buffer bump (2¢ → 3¢). Post-v2.2 deploy at 10:36 ET, the next
+        5 fires resolved 1 WIN / 4 NO_FILL — fills concentrated in the
+        moderate-price band (84¢ filled), no-fills concentrated in the
+        90+¢ zone (95¢, 95¢, 97¢ all NO_FILL). Diagnosis: at high prices
+        the ask side of the book is structurally empty in the final
+        0-3 min — holders of near-certain $1 contracts don't sell at
+        95¢, so the snapshot ask is stale or phantom and there's no
+        liquidity to cross to even with the buffer. Cutting these fires
+        improves both observability (NO_FILL rows had been cluttering
+        the dashboard with zero-value entries) and avoids any future
+        confusion from "what if" P&L on unreachable trades. The buffer
+        bump from 2¢ → 3¢ lets us spend a touch more edge on the
+        remaining fires to push fill rate, since the cap reduces fire
+        volume.
       v2.2 (2026-04-30): Fill buffer (EXPIRY_DECAY_FILL_BUFFER_C, default 2¢).
         First 3 live fires post-promotion (08:57, 09:27, 09:58 ET) all
         NO_FILL: 90c YES, 95c NO, 96c NO. Diagnosis: bidding at the
@@ -3104,6 +3130,19 @@ class ExpiryDecayStrategy:
                 ticker,
                 f"BLOCK price floor: {side.upper()} @ {ask_cents}c "
                 f"< min={EXPIRY_DECAY_MIN_PRICE_CENTS}c (v2 contrarian-lottery filter)"
+            )
+            return None
+
+        # [v2.3] Upper price cap. The 90+¢ zone is structurally adverse:
+        # the snapshot shows asks that don't actually exist (holders of
+        # near-certain $1 contracts don't sell at 95¢). Even with the
+        # v2.2 buffer crossing the spread, there's no offered liquidity
+        # to cross to. Skip rather than log a guaranteed NO_FILL.
+        if ask_cents > EXPIRY_DECAY_MAX_PRICE_CENTS:
+            self._vlog(
+                ticker,
+                f"BLOCK price ceiling: {side.upper()} @ {ask_cents}c "
+                f"> max={EXPIRY_DECAY_MAX_PRICE_CENTS}c (v2.3 thin-book filter)"
             )
             return None
 
