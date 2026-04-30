@@ -362,11 +362,7 @@ def api_status():
     strategy_scores = {}
     try:
         scorer = StrategyScorer()
-        # EXPIRY_DECAY added 2026-04-30 on promotion from beta. Auto-scoring
-        # works on rolling settled-trade history, so the score will be empty
-        # until the first live fire resolves (matches LAG/CONSENSUS/SNIPER
-        # behavior at zero-history).
-        for name in ["LAG", "CONSENSUS", "SNIPER", "EXPIRY_DECAY"]:
+        for name in ["LAG", "CONSENSUS", "SNIPER"]:
             score_val, mult = scorer.score(name)
             status = "BLOCKED" if mult <= 0 else "THROTTLED" if mult < 1.0 else "FULL"
             strategy_scores[name] = {"score": round(score_val, 1), "mult": mult, "status": status}
@@ -406,7 +402,6 @@ def api_status():
         "lag_stats":    _strat_stats(scoped, "LAG"),
         "con_stats":    _strat_stats(scoped, "CONSENSUS"),
         "snp_stats":    _strat_stats(scoped, "SNIPER"),
-        "exp_stats":    _strat_stats(scoped, "EXPIRY_DECAY"),
         "all_stats":    _strat_stats(scoped),
         # pnl_points is intentionally NOT scoped — the sparkline uses the
         # full chronological series and computes the "window start" offset

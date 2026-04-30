@@ -24,11 +24,13 @@ Every cycle (~30 seconds), for each open 15-minute market:
 2. **Cooldown.** Won't re-fire within `SNIPER_COOLDOWN` (180s) of the last
    SNIPER trade. Prevents overtrading the same signal.
 
-3. **5-minute momentum gate.** BTC must have moved ≥ 0.07% in the last
+3. **5-minute momentum gate.** BTC must have moved ≥ 0.08% in the last
    5 minutes (`SNIPER_5M_MIN_MOMENTUM`). Below that, the move is
-   indistinguishable from noise. This threshold was raised twice — from
-   0.03% (v1) to 0.06% (v3.0) to 0.07% (v3.2) — each time after data
-   showed the weakest signals were coin flips that bled money.
+   indistinguishable from noise. This threshold was raised three times —
+   from 0.03% (v1) to 0.06% (v3.0) to 0.07% (v3.2) to 0.08% (v3.3) —
+   each time after data showed the weakest signals were coin flips that
+   bled money. The 0.070–0.079% band went 2W/5L (29% WR) across two
+   days while ≥0.080% went 5W/2L (71% WR).
 
 4. **60-second contradiction check.** If the last 60 seconds moved against
    the 5-minute direction by more than 0.03%, the trade is killed. In live
@@ -126,7 +128,7 @@ All env vars, defaults shown:
 
 | Var | Default | What it controls |
 |---|---|---|
-| `SNIPER_5M_MIN_MOMENTUM` | `0.0007` | Min 5-min BTC move to fire (0.07%) |
+| `SNIPER_5M_MIN_MOMENTUM` | `0.0008` | Min 5-min BTC move to fire (0.08%) |
 | `SNIPER_REQUIRE_60S_CONFIRM` | `true` | Require 60s same-direction confirmation |
 | `SNIPER_60S_CONFIRM_MIN` | `0.0001` | Min 60s move for confirmation (0.01%) |
 | `SNIPER_COOLDOWN` | `180` | Seconds between SNIPER trades |
@@ -157,4 +159,8 @@ All env vars, defaults shown:
 - **v3.2** — Momentum floor raised 0.06% → 0.07% (two days of data showed
   ±0.060% signals producing both max-losses while all winners were ≥ 0.075%).
   Early exit reversal threshold lowered 0.3% → 0.15% (old threshold never
-  triggered in 43+ fills across two days).
+  triggered in 43+ fills across two days). Added momentum divergence filter
+  (|5m|-|60s| ≤ 0.08%).
+- **v3.3** — Momentum floor raised 0.07% → 0.08%. Two more days of data
+  showed 0.070–0.079% band at 2W/5L (29% WR) while ≥0.080% went 5W/2L
+  (71% WR). The lowest bin is consistently at or below breakeven.

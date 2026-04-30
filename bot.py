@@ -349,10 +349,10 @@ PREV_CHECK_INTERVAL = 60     # only poll settled markets every 60s (not every cy
 # [v3.2] Raised from 0.0006 (0.06%) → 0.0007 (0.07%).  Two days of live
 # data (43 fills) showed both $1.00 max-losses had 5m signals at exactly
 # ±0.060% — right at the old floor.  All top-5 winners had |5m| ≥ 0.075%.
-# The 0.01% bump filters the weakest conviction entries while preserving
-# every observed winner.  Also creates real separation from
-# STRONG_MOMENTUM_THRESHOLD (0.065%).
-SNIPER_5M_MIN_MOMENTUM = float(os.getenv("SNIPER_5M_MIN_MOMENTUM", "0.0007"))  # 0.07%
+# [v3.3] Raised from 0.0007 (0.07%) → 0.0008 (0.08%).  Two more days of
+# data showed 0.070-0.079% band going 2W/5L (29% WR) while ≥0.080% went
+# 5W/2L (71% WR).  The lowest bin is consistently coin-flip-or-worse.
+SNIPER_5M_MIN_MOMENTUM = float(os.getenv("SNIPER_5M_MIN_MOMENTUM", "0.0008"))  # 0.08%
 SNIPER_COOLDOWN        = int(os.getenv("SNIPER_COOLDOWN",   "180"))   # seconds between sniper trades
 # Sniper stake defaults — fall back to MAX_STAKE_PER_TRADE when not explicitly set.
 SNIPER_LOTTERY_STAKE    = float(os.getenv("SNIPER_LOTTERY_STAKE")    or MAX_STAKE_PER_TRADE)
@@ -2485,7 +2485,7 @@ class SniperStrategy:
       KILL ZONE  (11-49c): NEVER.   All sub-bands show -13pp to -15pp edge.
 
     FILTERS:
-      1. 5-min BTC momentum must exceed SNIPER_5M_MIN_MOMENTUM (0.07%).
+      1. 5-min BTC momentum must exceed SNIPER_5M_MIN_MOMENTUM (0.08%).
          Aligned trades:  n=48, WR=35.4%, edge=+2.5pp, +22% ROI.
          Counter trades:  n=88, WR=15.9%, edge=-15.9pp, -27% ROI.
       2. 60-second momentum must not contradict 5-min direction.
