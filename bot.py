@@ -198,13 +198,16 @@ SNIPER_ENABLED    = os.getenv("SNIPER_ENABLED",    "true").lower()  == "true"
 # CONSENSUS_V1_BETA_ENABLED retired 2026-04-29. Only one consensus model is
 # ever active; the canonical switch is CONSENSUS_BETA_ENABLED below, which
 # currently drives CONSENSUS_V2.
-# EXPIRY_DECAY_V2 is the active version (v1 + sub-5c contrarian-lottery
-# filter; see docs/expiry_decay_v2.md). The legacy V1 env name is honored
-# as a fallback so a Render deploy doesn't silently turn the strategy
-# off — the canonical name going forward is EXPIRY_DECAY_V2_BETA_ENABLED.
-EXPIRY_DECAY_BETA_ENABLED = (
-    os.getenv("EXPIRY_DECAY_V2_BETA_ENABLED",
-              os.getenv("EXPIRY_DECAY_V1_BETA_ENABLED", "false")).lower() == "true"
+# EXPIRY_DECAY_V2 PROMOTED to live 2026-04-30 (commit message has full stats
+# snapshot per docs/beta_promotion.md). Canonical env name going forward is
+# EXPIRY_DECAY_ENABLED. The two BETA_ENABLED forms are honored as fallbacks
+# so the existing Render deploy doesn't silently turn the strategy off when
+# the new code rolls out — rename `EXPIRY_DECAY_V2_BETA_ENABLED=true` to
+# `EXPIRY_DECAY_ENABLED=true` on Render at your convenience.
+EXPIRY_DECAY_ENABLED = (
+    os.getenv("EXPIRY_DECAY_ENABLED",
+              os.getenv("EXPIRY_DECAY_V2_BETA_ENABLED",
+                        os.getenv("EXPIRY_DECAY_V1_BETA_ENABLED", "false"))).lower() == "true"
 )
 
 # One-shot diagnostic: dump the first Kalshi market JSON to stdout so we can
@@ -229,6 +232,15 @@ EXPIRY_DECAY_COOLDOWN_S      = int(os.getenv("EXPIRY_DECAY_COOLDOWN_S",        "
 # 11c+ start dropping real winners (+$161 at 11c, +$85 at 19c). See
 # docs/expiry_decay_v2.md for the full breakdown.
 EXPIRY_DECAY_MIN_PRICE_CENTS = int(os.getenv("EXPIRY_DECAY_MIN_PRICE_CENTS",     "5"))
+
+# v2.1 (2026-04-30): Kelly sizing toggle. Mirrors BRIDGE_KELLY_ENABLED.
+# Uses per-fire GBM model probability `p_side` as the win-rate input — same
+# pattern as BRIDGE — rather than a static prior. Quarter-Kelly (global
+# KELLY_FRACTION=0.25) and the global KELLY_MAX_BET_PCT=10% bankroll cap
+# both apply, but ExpiryDecay additionally caps at self.stake
+# (= MAX_STAKE_PER_TRADE) to preserve the single-stake invariant the
+# dashboard advertises. When disabled, falls back to v2's flat self.stake.
+EXPIRY_DECAY_KELLY_ENABLED   = os.getenv("EXPIRY_DECAY_KELLY_ENABLED", "true").lower() == "true"
 
 # Diagnostic: when true, ExpiryDecayStrategy.evaluate() prints a single line
 # per market evaluation showing which gate blocked (or "FIRE") with the
@@ -2860,7 +2872,9 @@ def _realized_vol_per_sqrt_s(btc_feed, lookback_s=900, min_samples=30):
 
 class ExpiryDecayStrategy:
     """
-    Expiry-decay beta model (Phase 4 v2). Beta-only — forced dry-run.
+    Expiry-decay strategy (Phase 4). Promoted to live 2026-04-30 after
+    110 sim fires at 92.7% WR / +60% sim ROI cleared the docs/beta_promotion.md
+    bar. v2.1 added Kelly sizing on top of the v2 entry logic.
 
     THESIS:
       In the final N seconds of a 15-min market, probability converges
@@ -2887,14 +2901,32 @@ class ExpiryDecayStrategy:
       mispricings without falling apart in minutes-to-expiry conditions.
 
     SIZING:
-      Fixed stake / price_dollars for v1. No Kelly: we have no historical
-      WR for this strategy yet. Revisit after N>=100 simulated fires.
+      Quarter-Kelly using the per-fire GBM probability p_side as the
+      win-rate input — same pattern as BRIDGE_V2. The model's per-fire
+      conviction varies a lot (2σ scrapes vs 4σ pinned), and using a
+      static prior would either under-size the obvious fires or over-size
+      the marginal ones. Hard-capped at self.stake (= MAX_STAKE_PER_TRADE)
+      so the dashboard's "Stake $X" header remains the actual ceiling.
+      When Kelly returns 0 (no edge at this price), falls back to a $1
+      exploratory stake (same v3.1 convention as SNIPER / CONSENSUS_V2).
+      EXPIRY_DECAY_KELLY_ENABLED=false reverts to flat self.stake.
 
     PROMOTION:
       See docs/beta_promotion.md. Expect optimistic-sim inflation; require
       ~2x the edge you'd demand from a live strategy before promoting.
 
     CHANGELOG:
+      v2.1 (2026-04-30): Added Kelly sizing via EXPIRY_DECAY_KELLY_ENABLED
+        (default ON). Uses per-fire p_side as the win-rate input — matches
+        BRIDGE_V2's pattern. v2 sample of 110 fires at 92.7% WR / +60% sim
+        ROI cleared the docs/beta_promotion.md bar; flat sizing is no
+        longer justified by "no historical WR yet." Capped at self.stake
+        to preserve the single-stake invariant — high-conviction fires
+        will saturate the cap rather than scale beyond it. No beta_model_id
+        bump: this is a sizing change, not a signal change; entry gates
+        and fire pattern are identical to v2. Live-deploy guidance per
+        playbook step 3: half-stake first week to validate fills before
+        scaling.
       v2 (2026-04-25): Added EXPIRY_DECAY_MIN_PRICE_CENTS price floor.
         v1 dry-run sample (n=76, 2026-04-23 → 04-25): sub-5c entries
         were 24-for-24 losers (-$480) while >=5c entries were 41W/11L
@@ -2912,7 +2944,11 @@ class ExpiryDecayStrategy:
     """
 
     def __init__(self, stake_dollars, *,
-                 is_beta=True, beta_model_id="EXPIRY_DECAY_V2"):
+                 is_beta=False, beta_model_id=None):
+        # Promoted live 2026-04-30 — defaults flipped from is_beta=True. Call
+        # site in KalshiBot.__init__ no longer passes beta_model_id; if a
+        # future shadow-beta variant of this class is wanted, override at
+        # the call site (matches the BRIDGE_V1 → V2 retag pattern).
         self.stake           = stake_dollars
         self.name            = "EXPIRY_DECAY"
         self.is_beta         = is_beta
@@ -3026,7 +3062,6 @@ class ExpiryDecayStrategy:
         if price_dollars <= 0:
             self._vlog(ticker, f"BLOCK price: {price_dollars}")
             return None
-        count = max(1, int(self.stake / price_dollars))
         price_cents = int(round(price_dollars * 100))
 
         # [v2] Contrarian-lottery filter. v1 dry-run showed sub-5c
@@ -3041,15 +3076,39 @@ class ExpiryDecayStrategy:
             )
             return None
 
+        # ---- [v2.1] Kelly sizing -----------------------------------------
+        # Use per-fire GBM probability `p_side` as the win-rate input
+        # (same pattern as BRIDGE_V2). Cap at self.stake to keep the
+        # dashboard's "Stake $X" header truthful as the per-trade ceiling.
+        # When Kelly says no edge despite passing the entry gates, fall
+        # back to a small exploratory stake — matches the SNIPER /
+        # CONSENSUS_V2 / BRIDGE convention so we still log the fire and
+        # learn from the outcome without exposing the full stake.
+        kelly_stake = None
+        if EXPIRY_DECAY_KELLY_ENABLED and balance is not None and balance > 0:
+            ks = kelly_size(balance, p_side, price_dollars,
+                            fallback_stake=self.stake)
+            if ks > 0:
+                effective_stake = min(ks, self.stake)
+                kelly_stake = round(effective_stake, 2)
+            else:
+                effective_stake = float(os.getenv("KELLY_ZERO_EDGE_STAKE", "1.0"))
+        else:
+            effective_stake = self.stake
+
+        count = max(1, int(effective_stake / price_dollars))
+
         self.last_fire_time = now_s
 
         strike_repr = f"{strike:,.0f}"
+        kelly_log = f" | kelly ${kelly_stake:.2f}" if kelly_stake is not None else " | flat"
         self._vlog(
             ticker,
             f"FIRE {side.upper()} @ {price_cents}c | {dist_sigmas:.2f}σ | "
             f"fair {p_side*100:.1f}% | edge +{edge_cents}c | secs_left={secs_left:.0f}"
+            f"{kelly_log}"
         )
-        return {
+        signal = {
             "strategy": self.name,
             "ticker":   ticker,
             "side":     side,
@@ -3059,8 +3118,12 @@ class ExpiryDecayStrategy:
             "reason":   (f"BTC ${btc:,.0f} vs {strike_repr} "
                          f"| {dist_sigmas:.2f}σ | {secs_left:.0f}s left "
                          f"| fair {p_side*100:.1f}%, ask {price_cents}c, "
-                         f"edge +{edge_cents}c"),
+                         f"edge +{edge_cents}c"
+                         f"{f' | kelly ${kelly_stake:.2f}' if kelly_stake is not None else ''}"),
         }
+        if kelly_stake is not None:
+            signal["kelly_stake"] = kelly_stake
+        return signal
 
 
 # ═══════════════════════════════════════════════════════════
@@ -3539,6 +3602,11 @@ class KalshiBot:
             lottery_stake=sniper_lottery_stake or max_stake,
             conviction_stake=sniper_conviction_stake or max_stake,
         )
+        # ExpiryDecay promoted from beta 2026-04-30 (110 fires, 92.7% WR,
+        # +60% sim ROI). v2.1 added Kelly sizing on the same entry logic.
+        # Lives in the late-window dispatch branch (mins_left < 3) since
+        # SNIPER / LAG / CONSENSUS each enforce mins_left >= 3 internally.
+        self.expiry_decay = ExpiryDecayStrategy(max_stake)
         self.risk      = RiskManager(daily_loss_limit,
                                      gross_daily_loss_limit=gross_daily_loss_limit)
         self.dry       = dry_run
@@ -3554,21 +3622,15 @@ class KalshiBot:
         # Replaced by CONSENSUS_V2 (momentum-regime hybrid, 36-45c band).
         # V1's existing trade-log entries continue to render under the
         # /beta dashboard's "Retired" tab; no new fires are emitted.
-        # ── EXPIRY_DECAY_V2 beta (Phase 4) ──────────────────────────────
-        # Fires in the final window of a 15-min market when BTC is deeply
-        # into the YES/NO region vs short-window realized vol. Fully
-        # isolated from live strategies; no interaction with SNIPER despite
-        # both caring about 15-min markets (SNIPER needs >=5 min runway;
-        # expiry decay needs <=3 min).
-        # v2 (2026-04-25): adds EXPIRY_DECAY_MIN_PRICE_CENTS=5 floor to
-        # cut the 24-for-24-loser sub-5c contrarian-lottery tail. See
-        # docs/expiry_decay_v2.md.
-        if EXPIRY_DECAY_BETA_ENABLED:
-            self.beta_strategies.append(ExpiryDecayStrategy(
-                max_stake,
-                is_beta=True,
-                beta_model_id="EXPIRY_DECAY_V2",
-            ))
+        # ── EXPIRY_DECAY (Phase 4) — PROMOTED LIVE 2026-04-30 ───────────
+        # Was beta. Cleared docs/beta_promotion.md bar at 110 sim fires:
+        #   WR 92.7% (vs 78.4% breakeven, +14.3pp gap), +60% sim ROI,
+        #   worst trade -$19.99 (1.02x avg stake — clear of the 3x cap).
+        # Live registration is `self.expiry_decay` in __init__ above; this
+        # block intentionally left empty so the surrounding model_id
+        # numbering stays stable in commit history. The per-cycle dispatch
+        # for ExpiryDecay lives below in the active_strategies loop —
+        # gated by EXPIRY_DECAY_ENABLED + late-window time check.
         # ── CONSENSUS_V1_WITH_EXIT beta ─────────────────────────────────
         # Mirrors CONSENSUS_V1's entry logic but adds the edge-gone exit
         # rule (see ConsensusExitTracker). Both models run simultaneously
@@ -3930,18 +3992,31 @@ class KalshiBot:
                         close_time.replace("Z", "+00:00")
                     )
                     mins_left = (ct - datetime.datetime.now(datetime.timezone.utc)).total_seconds() / 60
-                    if mins_left < 3 or mins_left > 14:
+                    # [2026-04-30] Lower bound dropped from 3 → 0 to admit
+                    # EXPIRY_DECAY's 0-3 min window. Each non-late strategy
+                    # (LAG/CONSENSUS/SNIPER) re-enforces its own min-mins
+                    # below via the `is_late_window` check, so this loosen
+                    # is safe.
+                    if mins_left < 0 or mins_left > 14:
                         continue
                 except Exception:
                     pass
 
+            # Late-window flag: EXPIRY_DECAY's domain. Other live strategies
+            # all require mins_left >= 3 (SNIPER's SNIPER_MIN_MINS_LEFT=5,
+            # CONSENSUS_V2_MIN_MINS_LEFT=5, LAG is timing-agnostic but has
+            # never been validated below 3 min). Keep them out of this band.
+            is_late_window = mins_left is not None and mins_left < 3
+
             active_strategies = []
-            if LAG_ENABLED:
+            if LAG_ENABLED and not is_late_window:
                 active_strategies.append(self.lag)
-            if CONSENSUS_ENABLED:
+            if CONSENSUS_ENABLED and not is_late_window:
                 active_strategies.append(self.consensus)
-            if SNIPER_ENABLED:
+            if SNIPER_ENABLED and not is_late_window:
                 active_strategies.append(self.sniper)
+            if EXPIRY_DECAY_ENABLED and is_late_window:
+                active_strategies.append(self.expiry_decay)
 
             # [v2.0] Collect ALL signals for disagreement gating
             signals = []
@@ -3962,6 +4037,11 @@ class KalshiBot:
                                                    balance=self._balance,
                                                    score_mult=score_mult)
                     elif isinstance(strategy, SniperStrategy):
+                        signal = strategy.evaluate(market, self.btc,
+                                                   mins_left=mins_left,
+                                                   balance=self._balance,
+                                                   score_mult=score_mult)
+                    elif isinstance(strategy, ExpiryDecayStrategy):
                         signal = strategy.evaluate(market, self.btc,
                                                    mins_left=mins_left,
                                                    balance=self._balance,
@@ -4120,8 +4200,9 @@ class KalshiBot:
         lag_state = "ENABLED" if LAG_ENABLED else "DISABLED"
         con_state = "ENABLED" if CONSENSUS_ENABLED else "DISABLED"
         snp_state = "ENABLED" if SNIPER_ENABLED else "DISABLED"
+        exp_state = "ENABLED" if EXPIRY_DECAY_ENABLED else "DISABLED"
         print(f"   Max stake:       ${self.max_stake}/trade (all strategies)")
-        print(f"   LAG [{lag_state}]  CONSENSUS [{con_state}]  SNIPER [{snp_state}]")
+        print(f"   LAG [{lag_state}]  CONSENSUS [{con_state}]  SNIPER [{snp_state}]  EXPIRY_DECAY [{exp_state}]")
         if self.beta_strategies:
             beta_ids = ", ".join(
                 getattr(bs, "beta_model_id", None) or bs.name
