@@ -1,0 +1,2 @@
+# Module-local pinning. The eth strategy needs only stdlib + requests.
+requests>=2.31

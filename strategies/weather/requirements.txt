@@ -1,0 +1,4 @@
+# Module-local pinning. Master + repo root may have looser/newer pins;
+# these are the minimum versions the weather module is tested against.
+requests>=2.31
+# numpy is optional — pure-Python math is enough for v1 posterior

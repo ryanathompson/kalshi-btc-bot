@@ -38,6 +38,11 @@ data/
 # ── Backtest outputs ────────────────────────────────────────────
 *.replay.json
 backtest_output/
+backtest_*.csv
+
+# ── Strategy-local on-disk caches (per-strategy raw responses) ──
+strategies/*/.iem_cache/
+strategies/*/.coinbase_cache/
 
 # ── Editor / OS junk ────────────────────────────────────────────
 .DS_Store
