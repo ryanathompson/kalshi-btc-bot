@@ -39,7 +39,12 @@ from strategies.eth.data.coinbase import (
     candles_through,
     hourly_log_returns,
 )
-from strategies.eth.model.posterior import GBMPosterior
+from strategies.eth.model.posterior import (
+    EmpiricalReturnPosterior,
+    GBMPosterior,
+    PosteriorAny,
+    make_eth_posterior,
+)
 from strategies.eth.model.volatility import trailing_realized_vol
 
 
@@ -54,6 +59,7 @@ class BacktestRow:
     realized_close: float
     sigma_hourly: float
     n_returns_in_window: int
+    posterior_kind: str  # "gbm" or "empirical"
     strike: float
     predicted_prob: float
     realized_outcome: int
@@ -88,8 +94,14 @@ def run_backtest(
     vol_window_hours: int,
     strikes_spec: tuple[float, float, float],
     coinbase: Optional[CoinbaseClient] = None,
+    use_empirical: bool = True,
 ) -> tuple[list[BacktestRow], list[ScoredPrediction]]:
-    """Run the model backtest. Returns ``(rows, predictions)``."""
+    """Run the model backtest. Returns ``(rows, predictions)``.
+
+    When ``use_empirical=True`` (default), the posterior is built from
+    the empirical CDF of the trailing log returns. Falls back to GBM
+    automatically when there aren't enough samples.
+    """
     market = get_market(market_code)
     cb = coinbase or CoinbaseClient(cache_dir=COINBASE_CACHE_DIR)
 
@@ -128,12 +140,24 @@ def run_backtest(
         vol = trailing_realized_vol(log_rets, vol_window_hours)
         if vol.sigma_hourly <= 1e-12 or vol.n_returns < 8:
             continue
+        # Slice to trailing window so empirical CDF reflects current regime
+        windowed_returns = log_rets[-vol_window_hours:] if vol_window_hours > 0 else log_rets
 
-        post = GBMPosterior(
-            spot=spot,
-            sigma_hourly=vol.sigma_hourly,
-            hours_to_settle=1.0,
-        )
+        if use_empirical:
+            post: PosteriorAny = make_eth_posterior(
+                spot=spot,
+                sigma_hourly=vol.sigma_hourly,  # used as fallback inside helper
+                hourly_log_returns=windowed_returns,
+                hours_to_settle=1.0,
+            )
+        else:
+            post = GBMPosterior(
+                spot=spot,
+                sigma_hourly=vol.sigma_hourly,
+                hours_to_settle=1.0,
+            )
+
+        kind = "empirical" if isinstance(post, EmpiricalReturnPosterior) else "gbm"
         realized_close = settle_candle.close
         for strike in _strikes_around(spot, strikes_spec):
             pred = post.prob_greater_than(strike)
@@ -145,6 +169,7 @@ def run_backtest(
                 realized_close=round(realized_close, 4),
                 sigma_hourly=round(vol.sigma_hourly, 6),
                 n_returns_in_window=vol.n_returns,
+                posterior_kind=kind,
                 strike=round(strike, 4),
                 predicted_prob=round(pred, 6),
                 realized_outcome=outcome,
@@ -175,6 +200,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         help="Synthetic strike grid spec: 'lo,hi,step' offsets from spot in $ (default: -200,200,40)",
     )
     parser.add_argument("--out", default=None, help="Optional CSV output path")
+    parser.add_argument(
+        "--no-empirical",
+        action="store_true",
+        help="Force GBM (lognormal). Default is empirical-CDF over trailing log returns.",
+    )
     args = parser.parse_args(argv)
 
     start_utc = _parse_iso_or_date(args.start)
@@ -191,7 +221,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         end_utc=end_utc,
         vol_window_hours=args.vol_window_hours,
         strikes_spec=strikes_spec,
+        use_empirical=not args.no_empirical,
     )
+
+    if rows:
+        kinds = {r.posterior_kind for r in rows}
+        print(f"posterior used: {sorted(kinds)}")
 
     if args.out:
         out_path = Path(args.out)

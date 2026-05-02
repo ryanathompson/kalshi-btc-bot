@@ -5,7 +5,13 @@ from __future__ import annotations
 import math
 import unittest
 
-from strategies.eth.model.posterior import GBMPosterior, bracket_probability
+from strategies.eth.model.posterior import (
+    EmpiricalReturnPosterior,
+    GBMPosterior,
+    bracket_probability,
+    horizon_log_returns,
+    make_eth_posterior,
+)
 
 
 class GBMPosteriorTests(unittest.TestCase):
@@ -79,6 +85,138 @@ class GBMPosteriorTests(unittest.TestCase):
         post = GBMPosterior(spot=2300.0, sigma_hourly=0.015, hours_to_settle=2.0)
         for x in (1500.0, 2300.0, 2500.0, 3000.0):
             self.assertAlmostEqual(post.cdf(x) + post.sf(x), 1.0, places=8)
+
+
+class HorizonLogReturnsTests(unittest.TestCase):
+
+    def test_one_hour_passthrough(self):
+        rets = [0.01, -0.005, 0.002, -0.001]
+        self.assertEqual(horizon_log_returns(rets, 1), rets)
+
+    def test_two_hour_overlapping(self):
+        rets = [0.01, -0.005, 0.002, -0.001]
+        # h=2: [r0+r1, r1+r2, r2+r3]
+        out = horizon_log_returns(rets, 2)
+        self.assertEqual(len(out), 3)
+        self.assertAlmostEqual(out[0], 0.005)
+        self.assertAlmostEqual(out[1], -0.003)
+        self.assertAlmostEqual(out[2], 0.001)
+
+    def test_too_short(self):
+        self.assertEqual(horizon_log_returns([0.01], 5), [])
+
+    def test_full_horizon(self):
+        rets = [0.01, 0.02, 0.03]
+        # h=3 → 1 sample = sum of all
+        out = horizon_log_returns(rets, 3)
+        self.assertEqual(len(out), 1)
+        self.assertAlmostEqual(out[0], 0.06)
+
+
+class EmpiricalReturnPosteriorTests(unittest.TestCase):
+
+    def test_cdf_at_spot_is_one_above_neg_returns(self):
+        # All log returns are positive → P(P_T <= spot) = 0
+        post = EmpiricalReturnPosterior(spot=2300.0, sorted_log_returns=(0.01, 0.02, 0.03))
+        self.assertEqual(post.cdf(2300.0), 0.0)
+
+    def test_cdf_at_spot_is_zero_below_pos_returns(self):
+        # All log returns are negative → all realized prices < spot → P(<=spot) = 1
+        post = EmpiricalReturnPosterior(spot=2300.0, sorted_log_returns=(-0.03, -0.02, -0.01))
+        self.assertEqual(post.cdf(2300.0), 1.0)
+
+    def test_cdf_step_function(self):
+        # 4 equally-spaced log returns
+        post = EmpiricalReturnPosterior(
+            spot=100.0,
+            sorted_log_returns=(math.log(0.95), math.log(0.98), math.log(1.02), math.log(1.05)),
+        )
+        # At x=99 (log return = log(0.99)), 2 samples are below → 2/4
+        self.assertAlmostEqual(post.cdf(99.0), 0.5, places=6)
+        # At x=110 (log return = log(1.10)), all 4 samples below → 1.0
+        self.assertEqual(post.cdf(110.0), 1.0)
+        # At x=90 (log return = log(0.90)), 0 samples below → 0.0
+        self.assertEqual(post.cdf(90.0), 0.0)
+
+    def test_fat_tails_vs_gaussian(self):
+        # Construct a fat-tailed distribution: mostly small returns, occasional big
+        sigma = 0.01
+        # Samples: many at ±0.005 (within 1 σ), few at ±0.05 (5σ outliers)
+        small = [0.005, -0.005, 0.005, -0.005] * 10  # 40 small
+        big = [0.05, -0.05]  # 2 outliers at 5σ
+        empirical = EmpiricalReturnPosterior(
+            spot=100.0,
+            sorted_log_returns=tuple(sorted(small + big)),
+        )
+        # Gaussian with same variance — but variance dominated by outliers
+        # The empirical distribution puts more probability on extreme moves
+        # P(P_T > 105) — log return > log(1.05) ≈ 0.0488 → 1 sample (the +0.05)
+        empirical_p = empirical.prob_greater_than(105.0)
+        self.assertGreater(empirical_p, 0.0)
+        self.assertLess(empirical_p, 0.1)
+
+    def test_uninformative_with_no_samples(self):
+        post = EmpiricalReturnPosterior(spot=100.0, sorted_log_returns=())
+        self.assertEqual(post.cdf(50.0), 0.5)
+        self.assertEqual(post.cdf(200.0), 0.5)
+
+    def test_bracket_dispatch_works_with_empirical(self):
+        post = EmpiricalReturnPosterior(
+            spot=2300.0,
+            sorted_log_returns=tuple(sorted([-0.02, -0.01, 0.0, 0.01, 0.02] * 5)),
+        )
+        p_gt = bracket_probability(post, 2300.0, None, "greater")
+        p_lt = bracket_probability(post, None, 2300.0, "less")
+        self.assertAlmostEqual(p_gt + p_lt, 1.0, places=6)
+
+
+class MakeEthPosteriorTests(unittest.TestCase):
+
+    def test_picks_empirical_when_enough_samples(self):
+        rets = [0.001 * i for i in range(-30, 31)]  # 61 samples
+        post = make_eth_posterior(
+            spot=2300.0,
+            sigma_hourly=0.01,
+            hourly_log_returns=rets,
+            hours_to_settle=1.0,
+            min_empirical_samples=24,
+        )
+        self.assertIsInstance(post, EmpiricalReturnPosterior)
+
+    def test_falls_back_to_gbm_when_too_few(self):
+        rets = [0.001, 0.002]
+        post = make_eth_posterior(
+            spot=2300.0,
+            sigma_hourly=0.01,
+            hourly_log_returns=rets,
+            hours_to_settle=1.0,
+            min_empirical_samples=24,
+        )
+        self.assertIsInstance(post, GBMPosterior)
+
+    def test_raises_when_no_samples_no_sigma(self):
+        with self.assertRaises(ValueError):
+            make_eth_posterior(spot=2300.0, hours_to_settle=1.0)
+
+    def test_horizon_scaling_changes_samples(self):
+        # 100 hourly returns → 99 two-hour samples
+        rets = [0.001] * 100
+        post1 = make_eth_posterior(
+            spot=2300.0,
+            sigma_hourly=0.01,
+            hourly_log_returns=rets,
+            hours_to_settle=1.0,
+        )
+        post2 = make_eth_posterior(
+            spot=2300.0,
+            sigma_hourly=0.01,
+            hourly_log_returns=rets,
+            hours_to_settle=2.0,
+        )
+        assert isinstance(post1, EmpiricalReturnPosterior)
+        assert isinstance(post2, EmpiricalReturnPosterior)
+        self.assertEqual(len(post1.sorted_log_returns), 100)
+        self.assertEqual(len(post2.sorted_log_returns), 99)
 
 
 if __name__ == "__main__":
