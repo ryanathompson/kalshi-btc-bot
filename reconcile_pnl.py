@@ -89,7 +89,7 @@ def fetch_all_orders(client: KalshiClient) -> dict[str, dict]:
 
 # ---- Ground-truth P&L from fills + settlements ----
 
-PREFIX_TO_STRATEGY = {"LAG": "LAG", "CON": "CONSENSUS", "TAI": "TAIL"}
+from strategy_prefixes import PREFIX_TO_STRATEGY  # single source of truth
 
 
 def compute_true_pnl(fills: list[dict], settlements: dict[str, dict],

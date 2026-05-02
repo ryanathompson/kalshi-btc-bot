@@ -44,6 +44,10 @@ from reconcile_snapshot import (
     run_snapshot_once as _run_snapshot_once,
     start_snapshot_scheduler as _start_snapshot_scheduler,
 )
+from trades_snapshot import (
+    run_trades_snapshot_once as _run_trades_snapshot_once,
+    start_trades_snapshot_scheduler as _start_trades_snapshot_scheduler,
+)
 
 load_dotenv()
 
@@ -695,6 +699,43 @@ def api_reconcile_snapshot():
         result = _run_snapshot_once(_build_reconcile_payload, date_str=date_str)
     except Exception as e:
         app.logger.exception("snapshot trigger failed")
+        return jsonify({"error": str(e)}), 500
+
+    return jsonify({
+        "ok":         True,
+        "path":       (result.get("content") or {}).get("path"),
+        "commit_sha": (result.get("commit")  or {}).get("sha"),
+        "html_url":   (result.get("content") or {}).get("html_url"),
+    })
+
+
+@app.route("/api/trades/snapshot", methods=["POST"])
+def api_trades_snapshot():
+    """Manually trigger a trade-log snapshot commit.
+
+    Mirrors /api/reconcile/snapshot — same auth, same response shape,
+    but writes bot_trades.json to trades_archive/. Used to backfill
+    specific dates or to capture the log on demand outside the daily
+    cadence.
+
+    Query / body params:
+      date=YYYY-MM-DD   — override the snapshot filename (default: today UTC)
+    """
+    expected = os.getenv("SNAPSHOT_TRIGGER_TOKEN") or ""
+    provided = request.headers.get("X-Snapshot-Token", "")
+    if not expected:
+        return jsonify({"error": "SNAPSHOT_TRIGGER_TOKEN not configured"}), 503
+    if provided != expected:
+        return jsonify({"error": "unauthorized"}), 401
+
+    date_str = request.args.get("date")
+    if not date_str and request.is_json:
+        date_str = (request.get_json(silent=True) or {}).get("date")
+
+    try:
+        result = _run_trades_snapshot_once(load_trades, date_str=date_str)
+    except Exception as e:
+        app.logger.exception("trades snapshot trigger failed")
         return jsonify({"error": str(e)}), 500
 
     return jsonify({
@@ -1659,6 +1700,16 @@ def _bot_thread():
             _start_snapshot_scheduler(_build_reconcile_payload)
         except Exception as e:
             print(f"[bot] reconcile snapshot scheduler failed to start: {e}",
+                  flush=True)
+
+        # Daily trade-log snapshot -> GitHub. Captures bot_trades.json (with
+        # `reason` strings) so post-hoc analysis of strategy signal quality
+        # is possible at horizons longer than the in-memory history. Runs
+        # 1h after reconcile by default to avoid branch-tip races.
+        try:
+            _start_trades_snapshot_scheduler(load_trades)
+        except Exception as e:
+            print(f"[bot] trades snapshot scheduler failed to start: {e}",
                   flush=True)
 
         _last_resolve = 0

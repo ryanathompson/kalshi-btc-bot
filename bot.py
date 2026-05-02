@@ -961,8 +961,9 @@ def rebuild_trades_from_api(client):
     # This is the persistence story for strategy attribution: even after a
     # Render redeploy wipes bot_trades.json, rebuilding from Kalshi orders
     # restores the strategy field correctly instead of bucketing everything
-    # as "RECOVERED".
-    PREFIX_TO_STRATEGY = {"LAG": "LAG", "CON": "CONSENSUS", "TAI": "TAIL", "EXT": "EARLY_EXIT"}
+    # as "RECOVERED". Mapping lives in strategy_prefixes.py — single source
+    # of truth shared with reconcile_pnl and analyze_edge.
+    from strategy_prefixes import PREFIX_TO_STRATEGY
     order_id_to_strategy = {}
     cursor = None
     while True:

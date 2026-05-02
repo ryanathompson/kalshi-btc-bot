@@ -114,11 +114,16 @@ def commit_snapshot(
     owner: Optional[str]  = None,
     repo: Optional[str]   = None,
     branch: Optional[str] = None,
+    snapshot_dir: str     = SNAPSHOT_DIR,
+    commit_kind: str      = "reconcile",
 ) -> dict[str, Any]:
-    """Commit `payload` as reconcile_archive/{date_str}.json to GitHub.
+    """Commit `payload` as {snapshot_dir}/{date_str}.json to GitHub.
 
     If the file already exists, update it in place (the GitHub API requires
     the current blob SHA for updates). Returns the parsed API response.
+
+    `commit_kind` is the prefix used in the commit message (e.g. "reconcile",
+    "trades") so multiple snapshot streams stay distinguishable in `git log`.
     """
     pat    = pat    or _env("GITHUB_PAT",         "")
     owner  = owner  or _env("GITHUB_REPO_OWNER",  "ryanathompson")
@@ -128,20 +133,20 @@ def commit_snapshot(
     if not pat:
         raise RuntimeError("GITHUB_PAT not set; cannot commit snapshot")
 
-    path = f"{SNAPSHOT_DIR}/{date_str}.json"
+    path = f"{snapshot_dir}/{date_str}.json"
     content_bytes = json.dumps(payload, indent=2, default=str, sort_keys=True).encode("utf-8")
     content_b64   = base64.b64encode(content_bytes).decode("ascii")
 
     sha = _get_existing_sha(owner, repo, path, branch, pat)
 
     body: dict[str, Any] = {
-        "message": f"reconcile: daily snapshot {date_str}",
+        "message": f"{commit_kind}: daily snapshot {date_str}",
         "content": content_b64,
         "branch":  branch,
     }
     if sha:
         body["sha"]     = sha
-        body["message"] = f"reconcile: refresh snapshot {date_str}"
+        body["message"] = f"{commit_kind}: refresh snapshot {date_str}"
 
     r = requests.put(
         _contents_url(owner, repo, path),
@@ -158,21 +163,44 @@ def commit_snapshot(
 # ─────────────────────────────────────────────────────────────
 
 def run_snapshot_once(
-    build_payload: Callable[[], dict[str, Any]],
+    build_payload: Callable[[], Any],
     *,
     date_str: Optional[str] = None,
+    snapshot_dir: str       = SNAPSHOT_DIR,
+    commit_kind: str        = "reconcile",
+    wrap_list: bool         = False,
 ) -> dict[str, Any]:
-    """Build the reconcile payload and commit it. Returns the GitHub response."""
+    """Build a snapshot payload and commit it. Returns the GitHub response.
+
+    `wrap_list=True` lets the caller return a bare list (e.g. the trade log).
+    The list is wrapped in a small dict so the snapshot envelope (capture
+    timestamp, source) can still be attached. The actual data lives under
+    the "trades" key in that case.
+    """
     date_str = date_str or _today_utc_date()
-    payload  = build_payload()
-    if not isinstance(payload, dict):
-        raise RuntimeError(f"build_payload returned non-dict: {type(payload)}")
-    payload = dict(payload)  # don't mutate caller's cache entry
+    raw      = build_payload()
+
+    if wrap_list:
+        if not isinstance(raw, list):
+            raise RuntimeError(
+                f"build_payload returned non-list with wrap_list=True: {type(raw)}"
+            )
+        payload: dict[str, Any] = {"trades": raw, "count": len(raw)}
+    else:
+        if not isinstance(raw, dict):
+            raise RuntimeError(f"build_payload returned non-dict: {type(raw)}")
+        payload = dict(raw)  # don't mutate caller's cache entry
+
     payload["_snapshot_captured_at_utc"] = (
         datetime.datetime.now(datetime.timezone.utc).isoformat()
     )
     payload["_snapshot_source"] = "render-snapshot"
-    return commit_snapshot(payload, date_str)
+    return commit_snapshot(
+        payload,
+        date_str,
+        snapshot_dir=snapshot_dir,
+        commit_kind=commit_kind,
+    )
 
 
 def _scheduler_loop(build_payload: Callable[[], dict[str, Any]]) -> None:

@@ -171,7 +171,7 @@ def btc_realized_vol(idx, epoch_s, window_s=3600):
 
 # ── Position builder ────────────────────────────────────────────────
 
-PREFIX_TO_STRATEGY = {"LAG": "LAG", "CON": "CONSENSUS", "TAI": "TAIL"}
+from strategy_prefixes import PREFIX_TO_STRATEGY  # single source of truth
 
 
 def build_positions(fills, settlements, orders):
