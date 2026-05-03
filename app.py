@@ -307,11 +307,17 @@ def api_status():
     include_dry = request.args.get("include_dry_run", "0") == "1"
     if not include_dry:
         trades = [t for t in trades if not t.get("dry_run")]
-    # Beta filter: main dashboard shows live-only by default. Beta trades are
-    # isolated on /beta/<model_id>. Escape hatch: ?include_beta=1.
+    # Beta filter: main dashboard hides PAPER beta trades by default —
+    # they're isolated on /beta/<model_id>. But once a beta strategy starts
+    # placing real orders via its live-tiny override (BRIDGE_LIVE_STAKE > 0,
+    # etc.), the resulting fills represent real money and must be visible
+    # on the main dashboard regardless of the is_beta tag. The rule is
+    # therefore "hide beta AND paper" — not "hide beta". Escape hatch
+    # ?include_beta=1 still surfaces everything (paper beta included).
     include_beta = request.args.get("include_beta", "0") == "1"
     if not include_beta:
-        trades = [t for t in trades if not t.get("is_beta")]
+        trades = [t for t in trades
+                  if not (t.get("is_beta") and t.get("dry_run"))]
 
     # Global date-range filter. The dashboard's top-of-page tab bar sends
     # this on every refresh; it scopes everything that's derivable from
@@ -553,10 +559,13 @@ def api_pnl_windows():
     include_dry = request.args.get("include_dry_run", "0") == "1"
     if not include_dry:
         trades = [t for t in trades if not t.get("dry_run")]
-    # Beta filter: PnL windows are live-only by default.
+    # Beta filter: PnL windows are real-money-only by default.
+    # Mirrors /api/status: hide PAPER beta (is_beta AND dry_run) but keep
+    # live-tiny beta visible so it counts toward windowed P&L.
     include_beta = request.args.get("include_beta", "0") == "1"
     if not include_beta:
-        trades = [t for t in trades if not t.get("is_beta")]
+        trades = [t for t in trades
+                  if not (t.get("is_beta") and t.get("dry_run"))]
     # Pass bot.py's own parse_trade_ts so the dashboard buckets trades
     # into the same calendar day as the RiskManager halt timer does.
     result = compute_windows(
@@ -774,9 +783,13 @@ def _build_report(hours: int = 24) -> dict:
     cutoff  = now_utc - datetime.timedelta(hours=hours)
     cutoff_ms = int(cutoff.timestamp() * 1000)
 
+    # Real-money trades only: !dry_run is sufficient. Previously this
+    # also filtered is_beta, which excluded live-tiny beta fills (real
+    # money tagged is_beta=True). The dry_run check alone now includes
+    # live-tiny beta and excludes all paper.
     raw = [
         t for t in load_trades()
-        if not t.get("dry_run") and not t.get("is_beta")
+        if not t.get("dry_run")
     ]
 
     # Filter to window
