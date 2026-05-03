@@ -301,6 +301,23 @@ BRIDGE_COOLDOWN_S           = int(os.getenv("BRIDGE_COOLDOWN_S",           "120"
 # v1 used `count = stake / price`, which made a 2c NO and a 90c YES carry the
 # same downside but ~400x different upside — equal-cost / unequal-variance.
 BRIDGE_KELLY_ENABLED        = os.getenv("BRIDGE_KELLY_ENABLED", "true").lower() == "true"
+# ── BRIDGE live-tiny mode ─────────────────────────────────────────
+# Promotion bridge: paper-trades-only (default 0) vs real fills with a hard
+# per-trade dollar cap. Set BRIDGE_LIVE_STAKE > 0 to start placing actual
+# orders on Kalshi while still tagging is_beta=True (so the dashboard's
+# beta isolation continues — promotion-from-beta is a separate operator
+# action that flips is_beta=False).
+#
+# Hard ceiling of $2/trade is enforced regardless of the env value.  This
+# is the "spend $10-20 over a week to find out if BRIDGE survives the
+# paper→real transition before committing real capital" knob — see
+# docs/beta_promotion.md and the EXPIRY_DECAY post-promotion regression
+# (75.8% paper WR collapsed to 54.5% live).
+BRIDGE_LIVE_STAKE_CEILING   = 2.00  # do not raise without operator review
+BRIDGE_LIVE_STAKE           = min(
+    BRIDGE_LIVE_STAKE_CEILING,
+    max(0.0, float(os.getenv("BRIDGE_LIVE_STAKE", "0") or 0)),
+)
 
 # ── FADE beta tunables ──────────────────────────────────────────────
 # Mean-reversion model that fades overextended BTC moves. Contrarian to
@@ -3262,12 +3279,17 @@ class BridgeStrategy:
     """
 
     def __init__(self, stake_dollars, *,
-                 is_beta=True, beta_model_id="BRIDGE_V2"):
+                 is_beta=True, beta_model_id="BRIDGE_V2",
+                 live_stake_override=0.0):
         self.stake           = stake_dollars
         self.name            = "BRIDGE"
         self.is_beta         = is_beta
         self.beta_model_id   = beta_model_id
         self.last_fire_time  = 0.0
+        # If > 0, the beta-pass loop places real (capped) orders for this
+        # strategy instead of paper trades. See BRIDGE_LIVE_STAKE for the
+        # operator-facing env var and the safety ceiling.
+        self.live_stake_override = float(live_stake_override or 0.0)
 
     def evaluate(self, market, btc_feed, mins_left=None,
                  balance=None, score_mult=1.0):
@@ -3752,10 +3774,14 @@ class KalshiBot:
         # see commit log). This call-site tag takes precedence over the
         # __init__ default, so it must be updated when the model_id rolls.
         if BRIDGE_BETA_ENABLED:
+            # live_stake_override > 0 routes BRIDGE through the real order
+            # path with a per-fill cap; default 0 keeps the paper-only
+            # beta behavior. Value is already ceiling-clamped at module load.
             self.beta_strategies.append(BridgeStrategy(
                 max_stake,
                 is_beta=True,
                 beta_model_id="BRIDGE_V2",
+                live_stake_override=BRIDGE_LIVE_STAKE,
             ))
         # ── FADE_V1 beta (mean-reversion contrarian) ────────────────────
         if FADE_V1_BETA_ENABLED:
@@ -3864,11 +3890,18 @@ class KalshiBot:
             if not order_id:
                 order_id = order_result.get("order_id")
 
-        # Beta signals are ALWAYS dry-run regardless of global self.dry.
-        # Live signals inherit self.dry. This invariant is enforced here so no
-        # caller can accidentally log a beta trade as live.
+        # Beta signals default to dry-run regardless of global self.dry,
+        # UNLESS the beta-pass loop produced a real order via the live-tiny
+        # override path (see BRIDGE_LIVE_STAKE). In that case the order_result
+        # tells us whether the order was actually placed; we trust that
+        # signal so the trade is logged with its true dry/live state.
+        # Live (non-beta) signals always inherit self.dry.
         is_beta_signal = bool(signal.get("is_beta"))
-        record_dry_run = True if is_beta_signal else self.dry
+        order_is_dry   = bool(order_result.get("dry_run"))
+        if is_beta_signal:
+            record_dry_run = order_is_dry
+        else:
+            record_dry_run = self.dry
 
         # Phase-1 correlation instrumentation: annotate the signal with
         # kelly_stake_raw / corr_factor / corr_diag / kelly_stake_adjusted
@@ -4269,8 +4302,58 @@ class KalshiBot:
                 signal["is_beta"]       = True
                 signal["beta_model_id"] = model_id
 
-                self._print_signal(signal, dry=True)
-                order_result = {"dry_run": True, "reason": "beta"}
+                # Live-tiny mode: if the strategy declares a per-fill dollar
+                # ceiling > 0, we place a REAL Kalshi order (capped to that
+                # ceiling) instead of paper-trading. This is the bridge
+                # between paper validation and full promotion — see
+                # BRIDGE_LIVE_STAKE for the operator-facing knob.
+                live_cap = float(getattr(beta_strategy, "live_stake_override", 0.0) or 0.0)
+                going_live = live_cap > 0 and not self.dry
+
+                if going_live:
+                    # Cap count so cost <= live_cap. If even 1 share blows
+                    # the ceiling, skip — the entry is too expensive for
+                    # live-tiny mode.
+                    price_d = signal["price"] / 100.0
+                    if price_d <= 0 or price_d > live_cap:
+                        traded.add(ticker)
+                        continue
+                    capped_count   = max(1, min(int(signal["count"]),
+                                                int(live_cap / price_d)))
+                    capped_dollars = round(capped_count * price_d, 2)
+                    if capped_dollars > live_cap + 0.005:
+                        # Defensive: int() floor should prevent this, but if
+                        # rounding ever pushes us over, refuse the trade.
+                        traded.add(ticker)
+                        continue
+                    signal["count"]   = capped_count
+                    signal["dollars"] = capped_dollars
+                    signal["reason"]  = (signal.get("reason", "") +
+                                         f" [LIVE-TINY ${live_cap:.2f}]")
+
+                    self._print_signal(signal, dry=False)
+                    try:
+                        order_result = self.client.place_order(
+                            ticker=signal["ticker"],
+                            side=signal["side"],
+                            price_cents=signal["price"],
+                            count=signal["count"],
+                            strategy_tag=signal["strategy"],
+                        )
+                    except Exception as e:
+                        order_result = {"error": str(e)}
+                        print(Fore.RED + f"  [beta:{model_id}] order error: {e}",
+                              flush=True)
+
+                    if "error" in order_result and not order_result.get("dry_run"):
+                        # Order rejected — don't log as an open trade so
+                        # reconcile won't see a phantom entry.
+                        traded.add(ticker)
+                        continue
+                else:
+                    self._print_signal(signal, dry=True)
+                    order_result = {"dry_run": True, "reason": "beta"}
+
                 self._log_signal(signal, order_result)
                 traded.add(ticker)
                 # Track CONSENSUS_V1_WITH_EXIT entries for later edge-gone

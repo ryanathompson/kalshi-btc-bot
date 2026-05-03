@@ -27,6 +27,8 @@ PREFIX_TO_STRATEGY: dict[str, str] = {
     "SNI": "SNIPER",
     "EXP": "EXPIRY_DECAY",
     "EXT": "EARLY_EXIT",    # explicit override from KalshiClient.sell_order()
+    "BRI": "BRIDGE",        # beta — emitted whenever BRIDGE_LIVE_STAKE > 0
+    "FAD": "FADE",          # beta — same shape if FADE ever goes live
     "TAI": "TAIL",          # legacy — no live strategy emits this anymore;
                             # kept so historical TAI-prefixed fills still
                             # attribute correctly.
