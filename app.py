@@ -370,7 +370,11 @@ def api_status():
         # works on rolling settled-trade history, so the score will be empty
         # until the first live fire resolves (matches LAG/CONSENSUS/SNIPER
         # behavior at zero-history).
-        for name in ["LAG", "CONSENSUS", "SNIPER", "EXPIRY_DECAY"]:
+        # BRIDGE included since it can now produce live fills via
+        # BRIDGE_LIVE_STAKE > 0 (live-tiny mode); auto-score works on
+        # settled live trades, so the score remains empty until the first
+        # live BRIDGE fire resolves.
+        for name in ["LAG", "CONSENSUS", "SNIPER", "EXPIRY_DECAY", "BRIDGE"]:
             score_val, mult = scorer.score(name)
             status = "BLOCKED" if mult <= 0 else "THROTTLED" if mult < 1.0 else "FULL"
             strategy_scores[name] = {"score": round(score_val, 1), "mult": mult, "status": status}
@@ -411,6 +415,10 @@ def api_status():
         "con_stats":    _strat_stats(scoped, "CONSENSUS"),
         "snp_stats":    _strat_stats(scoped, "SNIPER"),
         "exp_stats":    _strat_stats(scoped, "EXPIRY_DECAY"),
+        # bri_stats: BRIDGE replaces CONSENSUS in the dashboard card row.
+        # con_stats is retained in the response for any other consumers,
+        # but the dashboard renders bri_stats in the second card slot.
+        "bri_stats":    _strat_stats(scoped, "BRIDGE"),
         "all_stats":    _strat_stats(scoped),
         # pnl_points is intentionally NOT scoped — the sparkline uses the
         # full chronological series and computes the "window start" offset
