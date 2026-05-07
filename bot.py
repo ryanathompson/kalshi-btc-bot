@@ -3373,6 +3373,18 @@ class BridgeStrategy:
             return None
         price_cents = int(round(price_dollars * 100))
 
+        # ---- Hard floor on entry price (matches SNIPER/CONSENSUS) ---------
+        # Live-tiny BRIDGE data through 2026-05-07 (N=12 settled): the
+        # lottery-side subset (≤4c entries) was 0W/4L for -$3.69 (-94% ROI),
+        # while the high-price subset (≥66c) was approximately break-even.
+        # The cheap-side bleed is the same pathology MIN_ENTRY_PRICE_CENTS
+        # was originally introduced to kill on SNIPER/CONSENSUS — see the
+        # config block at the top of bot.py for the prior 6.2% WR analysis
+        # that justified the 25c default. Applying the same global floor
+        # to BRIDGE for consistency.
+        if price_cents < MIN_ENTRY_PRICE_CENTS:
+            return None
+
         # ---- Sizing (v2) --------------------------------------------------
         # v1 used `count = stake / price`, which produced equal $ downside
         # but wildly different upside / variance per fire (a 2c NO @ $20
