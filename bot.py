@@ -242,7 +242,12 @@ EXPIRY_DECAY_MIN_PRICE_CENTS = int(os.getenv("EXPIRY_DECAY_MIN_PRICE_CENTS",    
 # remains correct, just unreachable via the order book. The 1/1 fill at
 # 84¢ supports a cap somewhere just above. SNIPER and CONSENSUS_V2 keep
 # operating in the deeper 5+ min book where higher prices still fill.
-EXPIRY_DECAY_MAX_PRICE_CENTS = int(os.getenv("EXPIRY_DECAY_MAX_PRICE_CENTS",    "88"))
+# v3.3 (2026-05-16): Lowered from 88c → 75c. At 79-89c entries the
+# risk/reward is structurally adverse (risk $0.79-0.89 to win $0.11-0.21,
+# need 79-89% WR to break even). Live data showed 3 small wins wiped by
+# 1 large loss repeatedly. 75c forces better asymmetry: risk $0.75 to
+# win $0.25, breakeven at 75% WR — within GBM model's calibrated range.
+EXPIRY_DECAY_MAX_PRICE_CENTS = int(os.getenv("EXPIRY_DECAY_MAX_PRICE_CENTS",    "75"))
 
 # v2.2 (2026-04-30): Fill buffer. First 3 live fires (08:57, 09:27, 09:58 ET)
 # all NO_FILL — bidding at the displayed ask in late-window markets doesn't
@@ -1768,9 +1773,76 @@ class PositionMonitor:
     Only Sniper Conviction trades (50-55c) are tracked — they have enough
     liquidity to sell back. If BTC reverses > 0.15%, selling at small loss
     beats riding to $0 settlement (~50% loss).
+
+    Positions are held in-memory but can be rehydrated from bot_trades.json
+    on startup so they survive Render restarts. Without rehydration, a restart
+    mid-position means the exit monitor forgets the position exists — the
+    sell order may still execute on Kalshi but the bot never increments
+    early_exits_triggered (the "ghost EXT" problem from v3.2 analysis).
     """
     def __init__(self):
         self.positions = {}
+
+    def rehydrate_from_trades(self, btc_price=None):
+        """On startup, repopulate tracker from open SNIPER Conviction trades.
+
+        Scans bot_trades.json for trades matching:
+          - strategy == "SNIPER"
+          - "CONVICTION" in reason
+          - result is None (unsettled)
+          - closed_by_exit is not True (not already exited)
+          - is_beta is not True
+
+        Uses the trade's timestamp for entry_time so min-hold gating stays
+        honest across restarts. entry_btc is approximated from the current
+        BTC price if available (conservative — slightly overestimates hold
+        duration's price change, making exits slightly easier to trigger).
+
+        Returns count of restored positions.
+        """
+        try:
+            trades = load_trades()
+        except Exception:
+            return 0
+        restored = 0
+        for t in trades:
+            if t.get("result"):
+                continue
+            if t.get("closed_by_exit"):
+                continue
+            if t.get("is_beta"):
+                continue
+            if t.get("strategy") != "SNIPER":
+                continue
+            reason = t.get("reason", "")
+            if "CONVICTION" not in reason:
+                continue
+            ticker = t.get("ticker")
+            if not ticker:
+                continue
+            # Derive entry_time from placement timestamp
+            entry_time = time.time()
+            entry_ts = t.get("timestamp")
+            if entry_ts:
+                try:
+                    dt = datetime.datetime.fromisoformat(entry_ts)
+                    entry_time = dt.timestamp()
+                except (ValueError, TypeError):
+                    pass
+            # entry_btc: not stored in trade record. Use current price as
+            # approximation — this means the first reversal check after
+            # restart measures from "now" not from actual entry. Slightly
+            # conservative (any reversal already in progress won't register
+            # until it extends further from current price).
+            self.positions[ticker] = {
+                "side": t.get("side"),
+                "entry_btc": btc_price if btc_price else 0,
+                "entry_time": entry_time,
+                "entry_price_cents": t.get("price", 0),
+                "count": t.get("count", 0),
+            }
+            restored += 1
+        return restored
 
     def track(self, signal, btc_price):
         reason = signal.get("reason", "")
@@ -2961,6 +3033,10 @@ class ExpiryDecayStrategy:
       ~2x the edge you'd demand from a live strategy before promoting.
 
     CHANGELOG:
+      v3.3 (2026-05-16): Price cap lowered 88c → 75c for risk/reward.
+        At 79-89c entries, risk $0.79-0.89 to win $0.11-0.21 (need 79-89%
+        WR). Live data: 3 wins repeatedly wiped by 1 loss. 75c forces
+        better asymmetry (risk $0.75 / win $0.25, breakeven 75% WR).
       v2.3 (2026-04-30): Upper price cap (EXPIRY_DECAY_MAX_PRICE_CENTS=88)
         + buffer bump (2¢ → 3¢). Post-v2.2 deploy at 10:36 ET, the next
         5 fires resolved 1 WIN / 4 NO_FILL — fills concentrated in the
@@ -3151,16 +3227,17 @@ class ExpiryDecayStrategy:
             )
             return None
 
-        # [v2.3] Upper price cap. The 90+¢ zone is structurally adverse:
-        # the snapshot shows asks that don't actually exist (holders of
-        # near-certain $1 contracts don't sell at 95¢). Even with the
-        # v2.2 buffer crossing the spread, there's no offered liquidity
-        # to cross to. Skip rather than log a guaranteed NO_FILL.
+        # [v2.3→v3.3] Upper price cap. Originally 88c for thin-book reasons
+        # (90+c asks are phantom). Lowered to 75c in v3.3 for risk/reward:
+        # at 79-89c entries you risk $0.79-0.89 to win $0.11-0.21, needing
+        # 79-89% WR to break even — live data showed repeated wipeouts where
+        # 1 loss erased 3+ wins. At 75c cap: risk $0.75 to win $0.25,
+        # breakeven at 75% WR, within GBM model's calibrated accuracy.
         if ask_cents > EXPIRY_DECAY_MAX_PRICE_CENTS:
             self._vlog(
                 ticker,
                 f"BLOCK price ceiling: {side.upper()} @ {ask_cents}c "
-                f"> max={EXPIRY_DECAY_MAX_PRICE_CENTS}c (v2.3 thin-book filter)"
+                f"> max={EXPIRY_DECAY_MAX_PRICE_CENTS}c (v3.3 risk/reward cap)"
             )
             return None
 
@@ -3818,6 +3895,15 @@ class KalshiBot:
         # [v2.0] New components
         self.scorer    = StrategyScorer()
         self.monitor   = PositionMonitor()
+        # [v3.3] Rehydrate early-exit positions from trade log so they
+        # survive Render restarts. Without this, a restart mid-position
+        # causes the monitor to forget the position → exit never fires →
+        # "ghost EXT" trades appear only via rebuild_trades_from_api.
+        if EARLY_EXIT_ENABLED:
+            restored = self.monitor.rehydrate_from_trades(btc_price=None)
+            if restored:
+                print(f"  [early-exit] Rehydrated {restored} open Conviction "
+                      f"position(s) from trade log", flush=True)
         # Beta edge-gone tracker. Self-contained from self.monitor (which
         # only touches SNIPER Conviction) so there's no risk of
         # double-tracking or misrouted exits.
@@ -3969,6 +4055,14 @@ class KalshiBot:
         if btc_price is None:
             print(Fore.YELLOW + "  BTC price unavailable, skipping cycle")
             return
+
+        # [v3.3] Backfill entry_btc for rehydrated positions (one-shot on
+        # first cycle where BTC is available). Uses current price as baseline
+        # — slightly conservative but ensures reversal checks work.
+        if self.monitor.positions:
+            for pos in self.monitor.positions.values():
+                if pos["entry_btc"] == 0:
+                    pos["entry_btc"] = btc_price
 
         # 2. Fetch active BTC 15-min markets
         try:
