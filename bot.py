@@ -231,7 +231,13 @@ EXPIRY_DECAY_COOLDOWN_S      = int(os.getenv("EXPIRY_DECAY_COOLDOWN_S",        "
 # cut: there were zero trades priced 5–10c in the sample, and floors of
 # 11c+ start dropping real winners (+$161 at 11c, +$85 at 19c). See
 # docs/expiry_decay_v2.md for the full breakdown.
-EXPIRY_DECAY_MIN_PRICE_CENTS = int(os.getenv("EXPIRY_DECAY_MIN_PRICE_CENTS",     "5"))
+# v3.3 (2026-05-17): Raised 5c → 40c. Paper backtest showed 5-24c band as
+# the PnL engine, but live data tells a different story: 0W/7L on May 16-17,
+# cumulative -$13 overall. GBM's σ_T calculation assumes smooth Brownian
+# motion but real BTC microstructure in the last 30-60s is lumpier — "2σ"
+# gaps get crossed more often than the model predicts. Restricting to 40c+
+# keeps the strategy in the mid-band (40-74c) where live wins concentrate.
+EXPIRY_DECAY_MIN_PRICE_CENTS = int(os.getenv("EXPIRY_DECAY_MIN_PRICE_CENTS",     "40"))
 
 # v2.3 (2026-04-30): Upper price cap. v2.2 buffer fix lifted fill rate from
 # 0/3 to 1/5 post-deploy, but the no-fills clustered at 95-97¢ — the ask
@@ -3005,7 +3011,7 @@ class ExpiryDecayStrategy:
          >= MIN_DIST_SIGMAS
       3. Model fair value - Kalshi ask >= MIN_EDGE_CENTS (after fees proxy)
       4. Book sum (yes_ask + no_ask) >= MIN_BOOK_SUM
-      5. [v2] Chosen-side ask >= EXPIRY_DECAY_MIN_PRICE_CENTS (default 5c)
+      5. [v2→v3.3] Chosen-side ask >= EXPIRY_DECAY_MIN_PRICE_CENTS (default 40c)
 
     FAIR VALUE:
       Simple GBM with zero drift over the remaining window. BTC realized
