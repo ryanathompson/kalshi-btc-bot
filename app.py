@@ -141,10 +141,14 @@ def _strat_stats(trades, name=None):
 def _entry_price_stats(trades, strategy=None):
     """Bucket settled trades by entry price (cents) and return win-rate per band.
 
-    Bands match the dashboard widget the user designed:
+    Bands match the dashboard widget the user designed, extended with two
+    upper bands so high-price strategies (e.g. BRIDGE at 90-98c) are bucketed
+    instead of silently dropped:
         1-24c   (deep underdog — historically 0% WR in live trading)
         25-39c  (mid underdog — historically ~18% WR)
         40-55c  (favored band — historically 75% WR; the only profitable zone)
+        56-79c  (strong favorite)
+        80-99c  (near-certain — BRIDGE scalp zone; high WR, fat-tail risk)
 
     The 'price' field on a trade is stored as integer cents (1-99). Trades
     without a settled `result` are skipped.
@@ -163,6 +167,8 @@ def _entry_price_stats(trades, strategy=None):
         {"label": "1-24c",  "lo": 1,  "hi": 24, "warn": True},
         {"label": "25-39c", "lo": 25, "hi": 39, "warn": True},
         {"label": "40-55c", "lo": 40, "hi": 55, "warn": False},
+        {"label": "56-79c", "lo": 56, "hi": 79, "warn": False},
+        {"label": "80-99c", "lo": 80, "hi": 99, "warn": False},
     ]
     for b in bands:
         b["trades"] = 0
@@ -799,16 +805,30 @@ def _build_report(hours: int = 24) -> dict:
         if ms is not None and ms >= cutoff_ms:
             trades.append(t)
 
-    # Overall + per-strategy stats (reuse existing helpers)
+    # Overall stats (reuse existing helpers)
     overall   = _strat_stats(trades) or {}
-    consensus = _strat_stats(trades, "CONSENSUS") or {}
-    sniper    = _strat_stats(trades, "SNIPER")    or {}
-    lag       = _strat_stats(trades, "LAG")       or {}
 
-    # Price bands — window-scoped, not cumulative
-    bands     = _entry_price_stats(trades)
-    bands_con = _entry_price_stats(trades, "CONSENSUS")
-    bands_snp = _entry_price_stats(trades, "SNIPER")
+    # Per-strategy stats — discover the strategies actually present in the
+    # window instead of hardcoding a fixed set. Hardcoding meant active
+    # strategies like BRIDGE never appeared in the report at all.
+    _PREFERRED_ORDER = ["CONSENSUS", "SNIPER", "LAG", "BRIDGE", "EARLY_EXIT"]
+    present = {t.get("strategy") for t in trades if t.get("strategy")}
+    ordered_names = ([n for n in _PREFERRED_ORDER if n in present]
+                     + sorted(present - set(_PREFERRED_ORDER)))
+    by_strategy = {}
+    for name in ordered_names:
+        st = _strat_stats(trades, name)
+        if st:
+            by_strategy[name] = st
+
+    # Price bands — window-scoped, not cumulative. Same discovery approach so
+    # high-price strategies (e.g. BRIDGE at 90-98c) get their own breakdown.
+    bands = _entry_price_stats(trades)
+    price_bands = {"all": bands}
+    for name in ordered_names:
+        pb = _entry_price_stats(trades, name)
+        if any(b.get("trades") for b in pb):
+            price_bands[name] = pb
 
     # STRONG-flag effect on CONSENSUS (STRONG x1.5 momentum boost)
     con_settled = [t for t in trades
@@ -909,16 +929,8 @@ def _build_report(hours: int = 24) -> dict:
             "last_cycle":  _state.last_cycle,
         },
         "summary":    overall,
-        "by_strategy": {
-            "CONSENSUS": consensus,
-            "SNIPER":    sniper,
-            "LAG":       lag,
-        },
-        "price_bands": {
-            "all":       bands,
-            "CONSENSUS": bands_con,
-            "SNIPER":    bands_snp,
-        },
+        "by_strategy": by_strategy,
+        "price_bands": price_bands,
         "consensus_strong_flag": strong_flag,
         "cheap_capped": {
             "count":      len(cheap_capped),
@@ -983,8 +995,7 @@ def _format_report_md(r: dict) -> str:
     out.append("")
     out.append("| Strategy | Attempts | Filled | W/L | WR | PnL | ROI |")
     out.append("| --- | --- | --- | --- | --- | --- | --- |")
-    for name in ("CONSENSUS", "SNIPER", "LAG"):
-        st = (r.get("by_strategy") or {}).get(name) or {}
+    for name, st in (r.get("by_strategy") or {}).items():
         if not st:
             continue
         out.append(
@@ -996,10 +1007,10 @@ def _format_report_md(r: dict) -> str:
 
     out.append("## Price bands (window-scoped)")
     out.append("")
-    for label, key in [("All strategies", "all"),
-                       ("CONSENSUS", "CONSENSUS"),
-                       ("SNIPER",    "SNIPER")]:
-        bands = (r.get("price_bands") or {}).get(key) or []
+    pb_all = r.get("price_bands") or {}
+    for key in (["all"] + [k for k in pb_all if k != "all"]):
+        label = "All strategies" if key == "all" else key
+        bands = pb_all.get(key) or []
         if not any(b.get("trades") for b in bands):
             continue
         out.append(f"**{label}**")
