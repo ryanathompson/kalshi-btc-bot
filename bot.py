@@ -305,6 +305,12 @@ BRIDGE_5M_MIN_MOMENTUM      = float(os.getenv("BRIDGE_5M_MIN_MOMENTUM",  "0.0006
 BRIDGE_60S_CONFIRM_MIN      = float(os.getenv("BRIDGE_60S_CONFIRM_MIN",  "0.0001"))  # same as SNIPER v3
 BRIDGE_MIN_DIST_SIGMAS      = float(os.getenv("BRIDGE_MIN_DIST_SIGMAS",    "1.5"))   # lighter than ED's 2.0
 BRIDGE_MIN_EDGE_CENTS       = int(os.getenv("BRIDGE_MIN_EDGE_CENTS",         "2"))   # lighter than ED's 3
+# [v3.4] Minimum ask price (cents) to fire. The GBM+realized-vol model is
+# overconfident at low/mid asks: live data was 0/3 at 25-55c (huge "edges"
+# that were really model-vs-market disagreement) vs 4/0 at 80-99c. Gate on
+# the market ask — the trustworthy signal — not the model's own probability.
+# Confines BRIDGE to its proven near-certainty zone. Set to 0 to disable.
+BRIDGE_MIN_ASK_CENTS        = int(os.getenv("BRIDGE_MIN_ASK_CENTS",         "80"))
 BRIDGE_VOL_WINDOW_S         = int(os.getenv("BRIDGE_VOL_WINDOW_S",         "900"))
 BRIDGE_COOLDOWN_S           = int(os.getenv("BRIDGE_COOLDOWN_S",           "120"))
 # v2 sizing toggle: route through kelly_size() with the GBM model probability
@@ -546,6 +552,18 @@ CONSENSUS_STRONG_ONLY = os.getenv("CONSENSUS_STRONG_ONLY", "true").lower() == "t
 # Set SNIPER_REQUIRE_60S_CONFIRM=false via env to disable.
 SNIPER_REQUIRE_60S_CONFIRM = os.getenv("SNIPER_REQUIRE_60S_CONFIRM", "true").lower() == "true"
 SNIPER_60S_CONFIRM_MIN     = float(os.getenv("SNIPER_60S_CONFIRM_MIN", "0.0001"))  # 0.01% — same direction required
+# [v3.4] Retention gate: the 60s reading must retain at least this fraction
+# of the 5m magnitude, else the move is fading and the entry is a coin flip
+# (negative-EV at 50c+ where break-even WR == entry price). 0 disables.
+SNIPER_60S_RETENTION_MIN   = float(os.getenv("SNIPER_60S_RETENTION_MIN", "0.5"))
+# [v3.4] Upper bound (cents) on the CONVICTION entry band (band is 50..this).
+# Break-even WR == entry price, so 53-55c entries are negative-EV at the
+# observed ~50% WR. But cent-level WR is noise at current volume (55c was
+# 3W/2L, 53c 1W/2L), and a hard 52c cap nearly disables the strategy without
+# clear evidence it removes the *losers* specifically. Default left at 55
+# (status-quo band) — the retention gate below is the active WR filter.
+# Lower this env var to throttle harder once more volume validates the edge.
+SNIPER_CONVICTION_MAX_CENTS = int(os.getenv("SNIPER_CONVICTION_MAX_CENTS", "55"))
 
 # [v3.2] Momentum divergence filter — block trades where the 5m momentum is
 # strong but 60s has largely faded, indicating the move already exhausted.
@@ -1114,12 +1132,25 @@ def rebuild_trades_from_api(client):
         price_cents = int(round(price_dollars * 100))
         dollars = round(total_count * price_dollars, 2)
 
+        # Recover strategy from client_order_id prefix if available;
+        # fall back to "RECOVERED" for legacy orders without a prefix.
+        recovered_strategy = order_id_to_strategy.get(order_id, "RECOVERED")
+
         # Check settlement
         sett = settlement_map.get(ticker)
         outcome = None
         result = None
         pnl = None
-        if sett:
+        # EARLY_EXIT (EXT-prefixed) orders are SELLS that close an existing
+        # position, not opening bets. Computing held-to-settlement PnL here
+        # fabricates a full-stake win/loss (verified: 250/250 rebuilt EXT
+        # losses booked the entire stake) and double-counts against the
+        # originating entry, which is also rebuilt with its own PnL. Leave
+        # result/pnl as None so these rows are excluded from PnL stats.
+        # NOTE: the true realized round-trip PnL of an early-exited position
+        # can't be reconstructed from fills alone — persist TRADES_LOG_PATH
+        # so rebuild rarely runs (see deploy notes).
+        if sett and recovered_strategy != "EARLY_EXIT":
             outcome = sett.get("market_result", None)
             if outcome:
                 won = (side == outcome)
@@ -1128,10 +1159,6 @@ def rebuild_trades_from_api(client):
                     pnl = round(dollars / price_dollars * (1 - price_dollars), 2)
                 else:
                     pnl = -round(dollars, 2)
-
-        # Recover strategy from client_order_id prefix if available;
-        # fall back to "RECOVERED" for legacy orders without a prefix.
-        recovered_strategy = order_id_to_strategy.get(order_id, "RECOVERED")
         trade = {
             "strategy":      recovered_strategy,
             "ticker":        ticker,
@@ -2681,6 +2708,12 @@ class SniperStrategy:
                              (mom_5m < 0 and mom_60s < -SNIPER_60S_CONFIRM_MIN)
             if not same_direction:
                 return None
+            # [v3.4] Retention gate — 60s must hold a min fraction of the 5m
+            # magnitude. A 60s collapsed toward zero means the move is fading;
+            # those entries are coin flips and lose at 50c+ (break-even == price).
+            if SNIPER_60S_RETENTION_MIN > 0 and \
+               abs(mom_60s) < SNIPER_60S_RETENTION_MIN * abs(mom_5m):
+                return None
 
         # [v3.2] Momentum divergence filter — exhausted-momentum detection.
         # If the gap between |5m| and |60s| exceeds the threshold, the bulk
@@ -2702,13 +2735,13 @@ class SniperStrategy:
             return None
 
         # -- Entry price zone filter ----------------------------------------
-        # LOTTERY: 1-10c | CONVICTION: 50-55c | KILL ZONE: 11-49c, 56c+
+        # LOTTERY: 1-10c | CONVICTION: 50..SNIPER_CONVICTION_MAX_CENTS | KILL ZONE: rest
         # NOTE: LOTTERY branch is now unreachable given the 25c floor above,
         # but kept for clarity and for restoring if MIN_ENTRY_PRICE_CENTS=0.
         if 1 <= price_cents <= 10:
             mode  = "LOTTERY"
             stake = self.lottery_stake
-        elif 50 <= price_cents <= 55:
+        elif 50 <= price_cents <= SNIPER_CONVICTION_MAX_CENTS:
             mode  = "CONVICTION"
             stake = self.conviction_stake
         else:
@@ -3455,6 +3488,12 @@ class BridgeStrategy:
         if price_dollars <= 0:
             return None
         price_cents = int(round(price_dollars * 100))
+
+        # ---- Confidence floor: confine BRIDGE to its proven near-certainty
+        # zone. Below this ask the model's "edge" is really model-vs-market
+        # disagreement (overconfident GBM at low vol); live data bled there. ---
+        if BRIDGE_MIN_ASK_CENTS > 0 and price_cents < BRIDGE_MIN_ASK_CENTS:
+            return None
 
         # ---- Hard floor on entry price (matches SNIPER/CONSENSUS) ---------
         # Live-tiny BRIDGE data through 2026-05-07 (N=12 settled): the
