@@ -958,6 +958,89 @@ class BTCPriceFeed:
         return self._ws_alive
 
 
+# ════════════════════════════════════════════════════════════
+# REGIME STAND-DOWN FILTER
+# ════════════════════════════════════════════════════════════
+# The GBM fair-value model used by BRIDGE and ExpiryDecay assumes ZERO
+# drift (z = ln(strike/btc) / sigma_T). That holds only in a flat or
+# mean-reverting market. In a sustained trend the model systematically
+# misprices the trending side — e.g. in a downtrend it overpays for YES
+# because it can't see that price is drifting below the strike. This
+# filter stands those model-based strategies down when BTC's multi-hour
+# trend is strong. Momentum strategies (SNIPER/LAG/CONSENSUS) are not
+# gated here — they have their own switches.
+#
+# The trend reference comes from a REST candle fetch, NOT the in-memory
+# tick feed: that feed only holds ~10-15 min and resets on restart, so it
+# can't see a multi-hour trend. The fetch is cached so per-market
+# evaluate() calls don't each hit the API.
+REGIME_FILTER_ENABLED = os.getenv("REGIME_FILTER_ENABLED", "true").lower() == "true"
+REGIME_LOOKBACK_HOURS = float(os.getenv("REGIME_LOOKBACK_HOURS", "4"))
+REGIME_MAX_TREND_PCT  = float(os.getenv("REGIME_MAX_TREND_PCT", "0.015"))  # |move| over lookback that triggers stand-down
+REGIME_REFRESH_S      = int(os.getenv("REGIME_REFRESH_S", "300"))          # how often to re-fetch the trend
+REGIME_STALE_MAX_S    = int(os.getenv("REGIME_STALE_MAX_S", "1800"))       # max age of a cached trend before it's unusable
+
+# {trend: signed pct or None, ts: last successful fetch epoch, last_log: throttle}
+_regime_cache = {"trend": None, "ts": 0.0, "last_log": 0.0}
+
+
+def _fetch_btc_trend_pct():
+    """Signed BTC % change over ~REGIME_LOOKBACK_HOURS via Binance hourly
+    klines. Positive = uptrend, negative = downtrend. None on any failure."""
+    try:
+        hours = max(1, int(round(REGIME_LOOKBACK_HOURS)))
+        url = ("https://api.binance.com/api/v3/klines"
+               f"?symbol=BTCUSDT&interval=1h&limit={hours + 1}")
+        candles = requests.get(url, timeout=(3, 4)).json()
+        if not isinstance(candles, list) or len(candles) < 2:
+            return None
+        past_close = float(candles[0][4])    # close of the oldest candle in window
+        now_close  = float(candles[-1][4])   # close of the most recent candle
+        if past_close <= 0:
+            return None
+        return (now_close - past_close) / past_close
+    except Exception:
+        return None
+
+
+def regime_trend_pct():
+    """Cached signed multi-hour BTC trend. Refetches at most every
+    REGIME_REFRESH_S. On a failed refresh keeps serving the last good value
+    until it ages past REGIME_STALE_MAX_S, then returns None (unknown)."""
+    now = time.time()
+    if now - _regime_cache["ts"] >= REGIME_REFRESH_S:
+        t = _fetch_btc_trend_pct()
+        if t is not None:
+            _regime_cache["trend"] = t
+            _regime_cache["ts"]    = now
+    if _regime_cache["trend"] is not None and \
+       (now - _regime_cache["ts"]) <= REGIME_STALE_MAX_S:
+        return _regime_cache["trend"]
+    return None
+
+
+def regime_stand_down():
+    """(blocked, trend) — blocked=True when the GBM-model strategies should
+    stand down due to a strong BTC trend. FAILS OPEN: if the trend is unknown
+    (just restarted, or data source down) returns False so a flaky feed can't
+    silently disable all model-based trading."""
+    if not REGIME_FILTER_ENABLED:
+        return False, None
+    trend = regime_trend_pct()
+    if trend is None:
+        return False, None
+    blocked = abs(trend) >= REGIME_MAX_TREND_PCT
+    if blocked:
+        now = time.time()
+        if now - _regime_cache["last_log"] >= REGIME_REFRESH_S:
+            _regime_cache["last_log"] = now
+            direction = "down" if trend < 0 else "up"
+            print(f"  [regime] BTC {trend*100:+.2f}% over ~{REGIME_LOOKBACK_HOURS:.0f}h "
+                  f"({direction}trend ≥ {REGIME_MAX_TREND_PCT*100:.1f}%) — GBM "
+                  f"strategies (BRIDGE/ExpiryDecay) standing down", flush=True)
+    return blocked, trend
+
+
 # âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 # TRADE LOG
 # âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
@@ -3162,6 +3245,12 @@ class ExpiryDecayStrategy:
                  balance=None, score_mult=1.0):
         ticker = market.get("ticker", "?")
 
+        # ---- Regime stand-down: GBM model unreliable in a strong BTC
+        # trend (see regime_stand_down). ----------------------------------
+        if regime_stand_down()[0]:
+            self._vlog(ticker, "BLOCK regime: strong multi-hour BTC trend")
+            return None
+
         # ---- Time gate (converts mins_left → seconds) -----------------
         if mins_left is None:
             self._vlog(ticker, "BLOCK time: mins_left=None")
@@ -3410,6 +3499,11 @@ class BridgeStrategy:
     def evaluate(self, market, btc_feed, mins_left=None,
                  balance=None, score_mult=1.0):
         ticker = market.get("ticker", "?")
+
+        # ---- Regime stand-down: the GBM model assumes zero drift, so skip
+        # in a strong multi-hour BTC trend where it systematically misprices. -
+        if regime_stand_down()[0]:
+            return None
 
         # ---- Time gate (3-5 min window) -----------------------------------
         if mins_left is None:
