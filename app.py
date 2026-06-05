@@ -31,6 +31,8 @@ from bot import (
     SNIPER_5M_MIN_MOMENTUM, SNIPER_REQUIRE_60S_CONFIRM,
     SNIPER_60S_CONFIRM_MIN,
     StrategyScorer,
+    regime_trend_pct, REGIME_FILTER_ENABLED,
+    REGIME_LOOKBACK_HOURS, REGIME_MAX_TREND_PCT,
 )
 
 from pnl_windows import compute_windows, build_windows, WINDOW_ORDER
@@ -914,12 +916,29 @@ def _build_report(hours: int = 24) -> dict:
             "cheap_caps_applied":    v2c.get("cheap_caps_applied", 0),
         }
 
+    # Regime status — shows whether the GBM strategies (BRIDGE/ExpiryDecay)
+    # are currently standing down due to a strong BTC trend. Reads the shared
+    # cache (refreshes at most every REGIME_REFRESH_S); fails to None offline.
+    try:
+        _trend = regime_trend_pct()
+    except Exception:
+        _trend = None
+    regime = {
+        "enabled":        REGIME_FILTER_ENABLED,
+        "trend_pct":      _trend,
+        "lookback_hours": REGIME_LOOKBACK_HOURS,
+        "threshold_pct":  REGIME_MAX_TREND_PCT,
+        "standing_down":  bool(REGIME_FILTER_ENABLED and _trend is not None
+                               and abs(_trend) >= REGIME_MAX_TREND_PCT),
+    }
+
     return {
         "window": {
             "hours":      hours,
             "cutoff_utc": cutoff.isoformat(),
             "now_utc":    now_utc.isoformat(),
         },
+        "regime":     regime,
         "bot_state": {
             "balance":     _state.balance,
             "halted":      _state.halted,
@@ -981,6 +1000,21 @@ def _format_report_md(r: dict) -> str:
     if bs.get("halted") and bs.get("halt_reason"):
         out.append("")
         out.append(f"> ⚠️ **Halt reason:** {bs.get('halt_reason')}")
+
+    # Regime status — only meaningful when the filter is enabled.
+    rg = r.get("regime") or {}
+    if rg.get("enabled"):
+        tp = rg.get("trend_pct")
+        lb = rg.get("lookback_hours")
+        thr = rg.get("threshold_pct")
+        if tp is None:
+            trend_str = "unknown (fail-open: trading allowed)"
+        else:
+            trend_str = f"{tp*100:+.2f}% / ~{lb:.0f}h"
+        state = ("🛑 **STANDING DOWN** (BRIDGE/ExpiryDecay paused)"
+                 if rg.get("standing_down") else "✅ trading")
+        out.append("")
+        out.append(f"Regime: {trend_str} · threshold ±{thr*100:.1f}% · {state}")
     out.append("")
 
     s = r.get("summary") or {}
