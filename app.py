@@ -976,6 +976,11 @@ def _format_report_md(r: dict) -> str:
     out.append("")
     out.append(f"Balance **${bs.get('balance')}** · daily limit **${bs.get('daily_limit')}** "
                f"· halted: **{bs.get('halted')}** · last cycle: {bs.get('last_cycle')}")
+    # Surface WHY when halted — otherwise an outage shows "halted: True" with
+    # no cause and you have to dig through Render logs to find the reason.
+    if bs.get("halted") and bs.get("halt_reason"):
+        out.append("")
+        out.append(f"> ⚠️ **Halt reason:** {bs.get('halt_reason')}")
     out.append("")
 
     s = r.get("summary") or {}
