@@ -3947,15 +3947,19 @@ class RiskManager:
         if len(open_trades) >= self.max_open:
             return False, f"Max open trades ({self.max_open}) reached"
 
-        # Balance sanity check
-        try:
-            bal = client.get_balance()
-            if bal < 10:
-                self._halted      = True
-                self._halt_reason = f"Balance too low (${bal:.2f})"
-                return False, self._halt_reason
-        except Exception:
-            pass
+        # Balance sanity check — LIVE only. In dry/test mode no real capital is
+        # at risk, so a depleted real account must not halt paper trading (else
+        # you can't test new models on a drawn-down balance). Real loss-limit
+        # halts above already exclude dry_run trades, so test mode is unhalted.
+        if not self.dry:
+            try:
+                bal = client.get_balance()
+                if bal < 10:
+                    self._halted      = True
+                    self._halt_reason = f"Balance too low (${bal:.2f})"
+                    return False, self._halt_reason
+            except Exception:
+                pass
 
         return True, "OK"
 
