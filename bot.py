@@ -3944,7 +3944,7 @@ class RiskManager:
         self._halt_date   = None          # date the halt was triggered
         self._override_date = None        # date of manual daily-loss override (bypass until next ET midnight)
 
-    def check(self, client):
+    def check(self, client, dry=False):
         today = today_et()
 
         # Auto-reset halt at ET midnight — new trading day, clean slate
@@ -4040,7 +4040,7 @@ class RiskManager:
         # at risk, so a depleted real account must not halt paper trading (else
         # you can't test new models on a drawn-down balance). Real loss-limit
         # halts above already exclude dry_run trades, so test mode is unhalted.
-        if not self.dry:
+        if not dry:
             try:
                 bal = client.get_balance()
                 if bal < 10:
@@ -4400,7 +4400,7 @@ class KalshiBot:
                 _bs.last_result_time = self.consensus.last_result_time
 
         # 4. Risk check
-        ok, reason = self.risk.check(self.client)
+        ok, reason = self.risk.check(self.client, self.dry)
         if not ok:
             print(Fore.RED + f"  ð Risk halt: {reason}")
             return
