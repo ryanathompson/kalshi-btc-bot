@@ -175,7 +175,12 @@ COINBASE_WS_URL = "wss://advanced-trade-ws.coinbase.com"
 LOG_FILE       = os.getenv("TRADES_LOG_PATH", "bot_trades.json")
 
 # Strategy thresholds (tune these after paper trading)
-LAG_THRESHOLD_PCT   = 0.003  # BTC must move >0.3% in 90s for lag signal
+# [v3.4] Lowered 0.3%→0.2% and made env-tunable to widen LAG's fire rate
+# (it fired only ~5x in 2 months at 0.3%). LAG is a STRUCTURAL edge — a stale
+# quote is a real mispricing — so a lower bar adds genuine (if smaller) edges,
+# unlike SNIPER where lowering just adds noise. Watch fill quality: too low and
+# the "stale" Kalshi quote may actually still be correctly priced.
+LAG_THRESHOLD_PCT   = float(os.getenv("LAG_THRESHOLD_PCT", "0.002"))  # BTC move in 90s to flag a lagging Kalshi quote
 LAG_MAX_REPRICE_AGE = 90     # seconds since last Kalshi price change to consider stale
 CONSENSUS_MAX_PRICE = 0.55   # only trade consensus when price <= 55¢
 MOMENTUM_WINDOW     = 60     # seconds for BTC momentum calculation
@@ -364,6 +369,17 @@ CONSENSUS_V2_5M_MIN_MOMENTUM = float(os.getenv("CONSENSUS_V2_5M_MIN_MOMENTUM", "
 CONSENSUS_V2_60S_CONFIRM_MIN = float(os.getenv("CONSENSUS_V2_60S_CONFIRM_MIN", "0.0001"))  # same as SNIPER v3
 CONSENSUS_V2_MIN_PRICE_CENTS = int(os.getenv("CONSENSUS_V2_MIN_PRICE_CENTS",     "36"))
 CONSENSUS_V2_MAX_PRICE_CENTS = int(os.getenv("CONSENSUS_V2_MAX_PRICE_CENTS",     "45"))
+# [v3.4] Live-tiny trial knob (mirrors BRIDGE_LIVE_STAKE). CONSENSUS_V2 has a
+# strong PAPER record (+$264, 58.7% WR) but paper P&L here is synthetic and has
+# proven wildly optimistic live (EXPIRY_DECAY_V2: +$1294 paper → -$58 live). Set
+# CONSENSUS_V2_LIVE_STAKE > 0 to route it through the REAL (capped) order path
+# for live validation before any full promotion. Default 0 = paper only. The
+# generic beta-pass live-tiny loop handles capping/placement — see live_cap.
+CONSENSUS_V2_LIVE_STAKE_CEILING = 2.00  # do not raise without operator review
+CONSENSUS_V2_LIVE_STAKE = min(
+    CONSENSUS_V2_LIVE_STAKE_CEILING,
+    max(0.0, float(os.getenv("CONSENSUS_V2_LIVE_STAKE", "0") or 0)),
+)
 CONSENSUS_V2_COOLDOWN_S      = int(os.getenv("CONSENSUS_V2_COOLDOWN_S",         "300"))  # 5 min
 CONSENSUS_V2_MIN_MINS_LEFT   = float(os.getenv("CONSENSUS_V2_MIN_MINS_LEFT",      "5"))
 
@@ -2540,7 +2556,8 @@ class ConsensusV2Strategy:
       - No STRONG-only gate needed (0.07% floor is already above STRONG)
     """
 
-    def __init__(self, stake_dollars, *, is_beta=False, beta_model_id=None):
+    def __init__(self, stake_dollars, *, is_beta=False, beta_model_id=None,
+                 live_stake_override=0.0):
         self.stake          = stake_dollars
         self.name           = "CONSENSUS_V2"
         self.is_beta        = is_beta
@@ -2550,6 +2567,10 @@ class ConsensusV2Strategy:
         self.last_ticker    = None
         self.last_trade_time = 0
         self._last_prev_check = 0
+        # If > 0, the beta-pass loop places real (capped) orders for this
+        # strategy instead of paper. See CONSENSUS_V2_LIVE_STAKE for the
+        # operator knob and safety ceiling.
+        self.live_stake_override = float(live_stake_override or 0.0)
 
     def update_previous(self, markets, client):
         """Check recently closed markets for previous result.
@@ -4029,6 +4050,7 @@ class KalshiBot:
                 max_stake,
                 is_beta=True,
                 beta_model_id="CONSENSUS_V2",
+                live_stake_override=CONSENSUS_V2_LIVE_STAKE,
             )
             self.beta_strategies.append(self.consensus_v2)
         # [v2.0] New components
