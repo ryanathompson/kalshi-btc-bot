@@ -1057,6 +1057,95 @@ def regime_stand_down():
     return blocked, trend
 
 
+# ════════════════════════════════════════════════════════════
+# SHADOW-FILL BOOK — realistic fills for paper / test mode
+# ════════════════════════════════════════════════════════════
+# A naive paper trade assumes the limit order at the signal-time ask always
+# fills. But a live resting limit is ADVERSELY SELECTED: it fills when price
+# moves against you (your side gets cheaper, the limit crosses) and misses
+# when price runs your way (your side gets pricier, the limit doesn't cross).
+# Archive data: would-be losers fill ~100%, would-be winners ~57% — a +43pt
+# gap that makes naive paper P&L systematically optimistic.
+#
+# This defers each PAPER signal and only "fills" it if, after a short delay,
+# the live ask still crosses the limit — reproducing the bias with no capital
+# at risk. Pending orders resolve on a later cycle against fresh top-of-book.
+# Strictly paper-only and gated by SHADOW_FILL_ENABLED (default off); the live
+# order path is never touched.
+SHADOW_FILL_ENABLED       = os.getenv("SHADOW_FILL_ENABLED", "false").lower() == "true"
+SHADOW_FILL_CHECK_DELAY_S = float(os.getenv("SHADOW_FILL_CHECK_DELAY_S", "10"))  # min wait before first fill check
+SHADOW_FILL_MAX_WAIT_S    = float(os.getenv("SHADOW_FILL_MAX_WAIT_S", "45"))     # give up (NO_FILL) after this
+
+
+class ShadowFillBook:
+    """Holds pending paper signals and resolves them against a later live book
+    so paper fills mirror live adverse selection instead of assuming 100%
+    fills. Paper-only; see SHADOW_FILL_ENABLED."""
+
+    def __init__(self, check_delay_s=SHADOW_FILL_CHECK_DELAY_S,
+                 max_wait_s=SHADOW_FILL_MAX_WAIT_S):
+        self.pending = []
+        self.check_delay_s = check_delay_s
+        self.max_wait_s = max_wait_s
+
+    def enqueue(self, signal, order_result):
+        self.pending.append({
+            "signal": dict(signal),
+            "order_result": dict(order_result) if isinstance(order_result, dict) else {},
+            "ts": time.time(),
+        })
+
+    @staticmethod
+    def _ask_for(market, side):
+        """Current ask (dollars) for `side`, bid as fallback. None if absent."""
+        if not market:
+            return None
+        v = market.get(f"{side}_ask_dollars", market.get(f"{side}_bid_dollars"))
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            return None
+        return v if v > 0 else None
+
+    def resolve(self, markets, log_fn):
+        """Resolve due pending orders against current quotes. log_fn(signal,
+        order_result, forced_result=) logs a fill (None) or NO_FILL. Orders not
+        yet past check_delay, or still uncrossed but under max_wait, stay
+        pending. Returns (filled, no_filled) counts."""
+        if not self.pending:
+            return 0, 0
+        now = time.time()
+        mkt = {m.get("ticker"): m for m in (markets or [])}
+        still = []
+        filled = nofilled = 0
+        for p in self.pending:
+            age = now - p["ts"]
+            if age < self.check_delay_s:
+                still.append(p)
+                continue
+            sig     = p["signal"]
+            side    = sig.get("side")
+            limit_d = (sig.get("price") or 0) / 100.0
+            ask_d   = self._ask_for(mkt.get(sig.get("ticker")), side)
+            crossed = ask_d is not None and limit_d > 0 and ask_d <= limit_d + 1e-9
+            if crossed:
+                res = dict(p["order_result"]); res["shadow_fill"] = True
+                sig2 = dict(sig)
+                sig2["reason"] = (sig.get("reason", "") + " [SHADOW-FILL]")
+                log_fn(sig2, res, _from_shadow=True)
+                filled += 1
+            elif age >= self.max_wait_s:
+                res = dict(p["order_result"]); res["shadow_no_fill"] = True
+                sig2 = dict(sig)
+                sig2["reason"] = (sig.get("reason", "") + " [SHADOW-NOFILL]")
+                log_fn(sig2, res, forced_result="NO_FILL", _from_shadow=True)
+                nofilled += 1
+            else:
+                still.append(p)
+        self.pending = still
+        return filled, nofilled
+
+
 # âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 # TRADE LOG
 # âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
@@ -4087,6 +4176,9 @@ class KalshiBot:
             "kelly_active": KELLY_ENABLED,
             "last_kelly_sizes": {},  # strategy name → last kelly stake
         }
+        # Shadow-fill book: defers paper signals so they fill realistically
+        # against a later book (see ShadowFillBook / SHADOW_FILL_ENABLED).
+        self.shadow_book = ShadowFillBook()
         # Seed from existing open trades so we never double up on a market
         # after a Render restart (rebuild_trades_from_api creates RECOVERED
         # records, but traded_this_market was empty → strategies would fire
@@ -4141,7 +4233,18 @@ class KalshiBot:
             book.append(t)
         return book
 
-    def _log_signal(self, signal, order_result):
+    def _log_signal(self, signal, order_result, forced_result=None,
+                    _from_shadow=False):
+        # Shadow-fill: defer PAPER signals so they fill realistically against a
+        # later book instead of always filling at the signal-time ask. Only
+        # paper (dry_run) signals are deferred; real fills log immediately.
+        # _from_shadow=True is the resolve callback re-entering to actually log.
+        if (SHADOW_FILL_ENABLED and not _from_shadow and forced_result is None
+                and isinstance(order_result, dict)
+                and order_result.get("dry_run")):
+            self.shadow_book.enqueue(signal, order_result)
+            return None
+
         # Extract order_id from Kalshi's response so update_fill_times()
         # can later join this trade against /portfolio/fills by order_id.
         # Kalshi wraps the created order under an "order" key on 201.
@@ -4191,8 +4294,11 @@ class KalshiBot:
             "fill_timestamp":  None,   # populated by update_fill_times()
             "fill_latency_s":  None,   # populated by update_fill_times()
             "outcome":         None,
-            "result":          None,
-            "pnl":             None,
+            # forced_result is set only by the shadow-fill resolver for a
+            # modeled NO_FILL; resolve_trades skips any trade with a result so
+            # it won't be re-settled into a WIN/LOSS.
+            "result":          forced_result,
+            "pnl":             (0 if forced_result == "NO_FILL" else None),
         }
         save_trade(record)
         return record
@@ -4241,6 +4347,14 @@ class KalshiBot:
             return
 
         self._last_markets = markets  # expose for dashboard
+
+        # Resolve any pending shadow-fill orders against this cycle's fresh book
+        # before evaluating new signals (paper realism — see ShadowFillBook).
+        if SHADOW_FILL_ENABLED and self.shadow_book.pending:
+            sf, sn = self.shadow_book.resolve(markets, self._log_signal)
+            if sf or sn:
+                print(f"  [shadow] resolved fills={sf} no_fills={sn} "
+                      f"pending={len(self.shadow_book.pending)}", flush=True)
 
         # One-shot diagnostic dump so we can see the full Kalshi market shape
         # (looking for reference_price / underlying_value / subtitle fields).
