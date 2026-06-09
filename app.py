@@ -916,6 +916,30 @@ def _build_report(hours: int = 24) -> dict:
             "cheap_caps_applied":    v2c.get("cheap_caps_applied", 0),
         }
 
+    # Fill quality / adverse selection. We know each LIVE trade's side and the
+    # settled `outcome` even on NO_FILLs, so we can ask: did would-be WINNERS
+    # fill less often than would-be LOSERS? A stale limit at the ask is
+    # adversely selected — it misses the trades that run your way and fills the
+    # ones moving against you. A positive "adverse gap" quantifies exactly that.
+    fq = [t for t in trades
+          if t.get("result") in ("WIN", "LOSS", "NO_FILL")
+          and t.get("outcome") and t.get("side")]
+    def _fill_rate(grp):
+        n = len(grp)
+        filled = sum(1 for t in grp if t.get("result") in ("WIN", "LOSS"))
+        return filled, n, (round(100 * filled / n, 1) if n else None)
+    would_win = [t for t in fq if t.get("side") == t.get("outcome")]
+    would_los = [t for t in fq if t.get("side") != t.get("outcome")]
+    wwf, wwn, wwr = _fill_rate(would_win)
+    wlf, wln, wlr = _fill_rate(would_los)
+    fill_quality = {
+        "n":                    len(fq),
+        "would_win_filled":     wwf, "would_win_total": wwn, "would_win_rate": wwr,
+        "would_lose_filled":    wlf, "would_lose_total": wln, "would_lose_rate": wlr,
+        "adverse_gap": (round(wlr - wwr, 1)
+                        if (wwr is not None and wlr is not None) else None),
+    }
+
     # Regime status — shows whether the GBM strategies (BRIDGE/ExpiryDecay)
     # are currently standing down due to a strong BTC trend. Reads the shared
     # cache (refreshes at most every REGIME_REFRESH_S); fails to None offline.
@@ -939,6 +963,7 @@ def _build_report(hours: int = 24) -> dict:
             "now_utc":    now_utc.isoformat(),
         },
         "regime":     regime,
+        "fill_quality": fill_quality,
         "bot_state": {
             "balance":     _state.balance,
             "halted":      _state.halted,
@@ -1029,6 +1054,29 @@ def _format_report_md(r: dict) -> str:
     out.append(f"- Wagered: **${s.get('wagered', 0)}** · "
                f"PnL: **${s.get('pnl', 0)}** · ROI: **{s.get('roi', 0)}%**")
     out.append("")
+
+    # Fill quality — only meaningful when there are live no-fills to compare.
+    fqd = r.get("fill_quality") or {}
+    if fqd.get("n") and (fqd.get("would_win_total") and fqd.get("would_lose_total")):
+        gap = fqd.get("adverse_gap")
+        out.append("## Fill quality (live adverse selection)")
+        out.append("")
+        out.append("| Group | Filled / Total | Fill rate |")
+        out.append("| --- | --- | --- |")
+        out.append(f"| Would-be winners | {fqd.get('would_win_filled')}/"
+                   f"{fqd.get('would_win_total')} | {fqd.get('would_win_rate')}% |")
+        out.append(f"| Would-be losers | {fqd.get('would_lose_filled')}/"
+                   f"{fqd.get('would_lose_total')} | {fqd.get('would_lose_rate')}% |")
+        out.append("")
+        if gap is not None and gap > 0:
+            out.append(f"> ⚠️ **Adverse selection: +{gap} pts** — winners fill "
+                       f"less than losers. The stale limit-at-ask misses the "
+                       f"trades that run your way. Paper P&L (always fills) "
+                       f"overstates the real edge.")
+        elif gap is not None:
+            out.append(f"> Adverse gap {gap} pts (winners fill ≥ losers — no "
+                       f"adverse selection this window).")
+        out.append("")
 
     out.append("## By strategy")
     out.append("")
