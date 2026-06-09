@@ -311,8 +311,12 @@ def health():
 @app.route("/api/status")
 def api_status():
     trades = load_trades()
-    # [v2.1] Dry-run filter: exclude simulated trades unless ?include_dry_run=1
-    include_dry = request.args.get("include_dry_run", "0") == "1"
+    # [v2.1] Dry-run filter: exclude simulated trades unless ?include_dry_run=1.
+    # [v3.4] In DRY RUN / test mode there are no live trades, so dry trades ARE
+    # the data — default to showing them, else the dashboard reads empty even
+    # while paper/shadow trades accumulate. Live mode is unchanged.
+    include_dry = (request.args.get("include_dry_run", "0") == "1"
+                   or bool(_state.dry_run))
     if not include_dry:
         trades = [t for t in trades if not t.get("dry_run")]
     # Beta filter: main dashboard hides PAPER beta trades by default —
@@ -563,8 +567,10 @@ def api_pnl_windows():
     so they surface even if the dashboard is closed.
     """
     trades = load_trades()
-    # [v2.1] Dry-run filter: match /api/status behaviour
-    include_dry = request.args.get("include_dry_run", "0") == "1"
+    # [v2.1] Dry-run filter: match /api/status behaviour.
+    # [v3.4] Default to showing dry trades while in DRY RUN / test mode.
+    include_dry = (request.args.get("include_dry_run", "0") == "1"
+                   or bool(_state.dry_run))
     if not include_dry:
         trades = [t for t in trades if not t.get("dry_run")]
     # Beta filter: PnL windows are real-money-only by default.
