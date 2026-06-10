@@ -1073,14 +1073,22 @@ def regime_stand_down():
 # Strictly paper-only and gated by SHADOW_FILL_ENABLED (default off); the live
 # order path is never touched.
 SHADOW_FILL_ENABLED       = os.getenv("SHADOW_FILL_ENABLED", "false").lower() == "true"
-SHADOW_FILL_CHECK_DELAY_S = float(os.getenv("SHADOW_FILL_CHECK_DELAY_S", "10"))  # min wait before first fill check
-SHADOW_FILL_MAX_WAIT_S    = float(os.getenv("SHADOW_FILL_MAX_WAIT_S", "45"))     # give up (NO_FILL) after this
+SHADOW_FILL_CHECK_DELAY_S = float(os.getenv("SHADOW_FILL_CHECK_DELAY_S", "10"))  # min wait before first fill check (models order latency)
+# A real resting limit lives until its market closes, so the PRIMARY no-fill
+# trigger is the market leaving the open-markets list (see resolve) — that
+# reproduces "winner runs away over minutes and never fills", the dominant live
+# adverse-selection effect. This is just a backstop cap so a pending order
+# can't leak if a market vanishes oddly; set safely longer than a 15-min market.
+SHADOW_FILL_MAX_WAIT_S    = float(os.getenv("SHADOW_FILL_MAX_WAIT_S", "1200"))   # 20-min backstop
 
 
 class ShadowFillBook:
-    """Holds pending paper signals and resolves them against a later live book
-    so paper fills mirror live adverse selection instead of assuming 100%
-    fills. Paper-only; see SHADOW_FILL_ENABLED."""
+    """Holds pending paper signals and resolves them like a resting limit
+    order: each rests until its market closes, filling the first time the live
+    ask crosses the limit, and counting as NO_FILL only if it never crosses
+    over the order's whole life. That mirrors live adverse selection (winners
+    run the price away and never fill) instead of assuming 100% fills.
+    Paper-only; see SHADOW_FILL_ENABLED."""
 
     def __init__(self, check_delay_s=SHADOW_FILL_CHECK_DELAY_S,
                  max_wait_s=SHADOW_FILL_MAX_WAIT_S):
@@ -1126,21 +1134,31 @@ class ShadowFillBook:
             sig     = p["signal"]
             side    = sig.get("side")
             limit_d = (sig.get("price") or 0) / 100.0
-            ask_d   = self._ask_for(mkt.get(sig.get("ticker")), side)
-            crossed = ask_d is not None and limit_d > 0 and ask_d <= limit_d + 1e-9
+            market  = mkt.get(sig.get("ticker"))
+            ask_d   = self._ask_for(market, side)
+            crossed = (market is not None and ask_d is not None
+                       and limit_d > 0 and ask_d <= limit_d + 1e-9)
             if crossed:
+                # First time the resting limit crosses -> fill.
                 res = dict(p["order_result"]); res["shadow_fill"] = True
                 sig2 = dict(sig)
                 sig2["reason"] = (sig.get("reason", "") + " [SHADOW-FILL]")
                 log_fn(sig2, res, _from_shadow=True)
                 filled += 1
-            elif age >= self.max_wait_s:
+            elif market is None or age >= self.max_wait_s:
+                # Market has closed (left the open-markets list) without the
+                # limit ever crossing -> the order rested its entire life and
+                # never filled. This is the dominant adverse-selection case:
+                # the price ran the bet's way, the ask stayed past the limit,
+                # and a real order would have missed too. max_wait_s is a
+                # backstop so a pending order can't leak if a market vanishes.
                 res = dict(p["order_result"]); res["shadow_no_fill"] = True
                 sig2 = dict(sig)
                 sig2["reason"] = (sig.get("reason", "") + " [SHADOW-NOFILL]")
                 log_fn(sig2, res, forced_result="NO_FILL", _from_shadow=True)
                 nofilled += 1
             else:
+                # Market still open, limit not yet crossed -> keep resting.
                 still.append(p)
         self.pending = still
         return filled, nofilled
