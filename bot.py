@@ -182,6 +182,16 @@ LOG_FILE       = os.getenv("TRADES_LOG_PATH", "bot_trades.json")
 # the "stale" Kalshi quote may actually still be correctly priced.
 LAG_THRESHOLD_PCT   = float(os.getenv("LAG_THRESHOLD_PCT", "0.002"))  # BTC move in 90s to flag a lagging Kalshi quote
 LAG_MAX_REPRICE_AGE = 90     # seconds since last Kalshi price change to consider stale
+# [v3.4] LAG marketable test. LAG has a real latency edge but a passive limit
+# at the stale ask never fills — the quote corrects before the order lands. To
+# test whether the edge is CAPTURABLE, cross the spread: bid LAG_CROSS_CENTS
+# above the ask so the order is marketable (a taker) and fills against the
+# offer. The question is whether the captured move beats the cross cost +
+# whatever correction already happened. In shadow this fills at the CURRENT
+# (possibly corrected) ask, capped at the cross limit — an honest, if slightly
+# pessimistic, model (the shadow's ~5s cadence is coarser than LAG's edge).
+LAG_MARKETABLE      = os.getenv("LAG_MARKETABLE", "true").lower() == "true"
+LAG_CROSS_CENTS     = int(float(os.getenv("LAG_CROSS_CENTS", "3")))  # cents above the ask to bid
 CONSENSUS_MAX_PRICE = 0.55   # only trade consensus when price <= 55¢
 MOMENTUM_WINDOW     = 60     # seconds for BTC momentum calculation
 MIN_BOOK_SUM        = 0.97   # yes+no must sum >= 0.97 (liquid market check)
@@ -1080,6 +1090,13 @@ SHADOW_FILL_CHECK_DELAY_S = float(os.getenv("SHADOW_FILL_CHECK_DELAY_S", "10")) 
 # adverse-selection effect. This is just a backstop cap so a pending order
 # can't leak if a market vanishes oddly; set safely longer than a 15-min market.
 SHADOW_FILL_MAX_WAIT_S    = float(os.getenv("SHADOW_FILL_MAX_WAIT_S", "1200"))   # 20-min backstop
+# Queue/latency haircut: posting at the signal-time ask puts you at the BACK of
+# the queue at that price, so a mere touch (ask == limit) shouldn't auto-fill —
+# the market has to trade THROUGH your level for a seller to reach you. Filling
+# on touch over-fills (~84% vs live ~65%). Require the ask to be this many cents
+# below the limit before filling. Tune against the observed shadow fill rate:
+# raise toward live ~65%, lower if too few fills. 0 = old touch-fill behaviour.
+SHADOW_FILL_THROUGH_CENTS = float(os.getenv("SHADOW_FILL_THROUGH_CENTS", "1"))
 
 
 class ShadowFillBook:
@@ -1127,17 +1144,54 @@ class ShadowFillBook:
         still = []
         filled = nofilled = 0
         for p in self.pending:
-            age = now - p["ts"]
-            if age < self.check_delay_s:
-                still.append(p)
-                continue
+            age     = now - p["ts"]
             sig     = p["signal"]
             side    = sig.get("side")
             limit_d = (sig.get("price") or 0) / 100.0
             market  = mkt.get(sig.get("ticker"))
             ask_d   = self._ask_for(market, side)
+            marketable = bool(sig.get("marketable"))
+
+            # Marketable (taker) orders fill on arrival, so check at the first
+            # opportunity; passive (maker) orders wait the latency delay.
+            if age < (0.0 if marketable else self.check_delay_s):
+                still.append(p)
+                continue
+
+            if marketable:
+                # Taker: crosses the spread and lifts the current offer if it is
+                # still within the cross limit. You pay the CURRENT (possibly
+                # corrected) ask, not the limit — that is the real capture cost.
+                # If the quote ran past the cross limit, the remainder rests at
+                # the limit and NO_FILLs only when the market closes.
+                if (market is not None and ask_d is not None
+                        and limit_d > 0 and ask_d <= limit_d + 1e-9):
+                    fill_c = max(1, int(round(ask_d * 100)))
+                    cnt    = sig.get("count") or 0
+                    res = dict(p["order_result"]); res["shadow_fill"] = True
+                    sig2 = dict(sig)
+                    sig2["price"]   = fill_c
+                    sig2["dollars"] = round(cnt * fill_c / 100.0, 2)
+                    sig2["reason"]  = (sig.get("reason", "") + f" [SHADOW-FILL @{fill_c}c]")
+                    log_fn(sig2, res, _from_shadow=True)
+                    filled += 1
+                elif market is None or age >= self.max_wait_s:
+                    res = dict(p["order_result"]); res["shadow_no_fill"] = True
+                    sig2 = dict(sig)
+                    sig2["reason"] = (sig.get("reason", "") + " [SHADOW-NOFILL]")
+                    log_fn(sig2, res, forced_result="NO_FILL", _from_shadow=True)
+                    nofilled += 1
+                else:
+                    still.append(p)
+                continue
+
+            # Passive (maker) path: fill only when the ask trades THROUGH the
+            # limit by the queue haircut (see SHADOW_FILL_THROUGH_CENTS) — a
+            # touch isn't enough since you joined the queue at the ask. This
+            # reproduces the live ~65% fill rate; touch-fill gave ~84%.
+            limit_fill = limit_d - (SHADOW_FILL_THROUGH_CENTS / 100.0)
             crossed = (market is not None and ask_d is not None
-                       and limit_d > 0 and ask_d <= limit_d + 1e-9)
+                       and limit_d > 0 and ask_d <= limit_fill + 1e-9)
             if crossed:
                 # First time the resting limit crosses -> fill.
                 res = dict(p["order_result"]); res["shadow_fill"] = True
@@ -1605,6 +1659,18 @@ def resolve_trades(client):
 
     for t in trades:
         if t.get("result"):
+            # Already settled — skip. Exception: a NO_FILL (esp. a shadow
+            # no-fill) holds no position but we still want its WOULD-BE outcome
+            # recorded so adverse-selection analysis can ask "did would-be
+            # winners fill less than losers?". Stamp `outcome` only; never flip
+            # result/pnl. One get_market per no-fill until it settles, then it's
+            # skipped (outcome set).
+            if t.get("result") == "NO_FILL" and not t.get("outcome"):
+                nf_mkt = client.get_market(t["ticker"])
+                nf_oc  = nf_mkt.get("result") if nf_mkt else None
+                if nf_oc:
+                    t["outcome"] = nf_oc
+                    changed += 1
             continue
 
         mkt = client.get_market(t["ticker"])
@@ -2401,26 +2467,41 @@ class LagStrategy:
         # Determine direction
         side          = "yes" if btc_change > 0 else "no"
         price_dollars = yes_px if side == "yes" else no_px
-        price_cents   = int(price_dollars * 100)
+        ask_cents     = int(price_dollars * 100)
+
+        # [v3.4] Marketable test: cross the spread so the order actually fills.
+        # The order limit is ask + LAG_CROSS_CENTS (capped at 99). Size and
+        # P&L use this limit (worst-case cost); the shadow records the real
+        # fill at the current ask. A passive (non-marketable) LAG just bids the
+        # stale ask as before.
+        marketable    = LAG_MARKETABLE
+        order_cents   = min(99, ask_cents + LAG_CROSS_CENTS) if marketable else ask_cents
+        if order_cents <= 0:
+            return None
+        order_dollars = order_cents / 100.0
+
         # [v2.0] Kelly sizing (Lag uses flat stake — structural edge, not statistical)
         effective_stake = self.stake
         kelly_stake = None
         if KELLY_ENABLED and balance:
             ks = kelly_size(balance, KELLY_PRIORS["LAG"]["win_rate"],
-                           price_dollars, fallback_stake=self.stake)
+                           order_dollars, fallback_stake=self.stake)
             if ks > 0:
                 effective_stake = ks
                 kelly_stake = round(ks, 2)
-        count = max(1, int(effective_stake / price_dollars))
+        count = max(1, int(effective_stake / order_dollars))
 
+        mkt_tag = f" [MKT +{LAG_CROSS_CENTS}c -> {order_cents}c]" if marketable else ""
         signal = {
             "strategy": self.name,
             "ticker":   ticker,
             "side":     side,
-            "price":    price_cents,
+            "price":    order_cents,
             "count":    count,
-            "dollars":  round(count * price_dollars, 2),
-            "reason":   f"BTC {btc_change*100:+.2f}% in {LAG_MAX_REPRICE_AGE}s, Kalshi stale {staleness:.0f}s",
+            "dollars":  round(count * order_dollars, 2),
+            "marketable":       marketable,
+            "signal_ask_cents": ask_cents,
+            "reason":   f"BTC {btc_change*100:+.2f}% in {LAG_MAX_REPRICE_AGE}s, Kalshi stale {staleness:.0f}s{mkt_tag}",
         }
         if kelly_stake is not None:
             signal["kelly_stake"] = kelly_stake
