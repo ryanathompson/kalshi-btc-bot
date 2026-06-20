@@ -192,6 +192,11 @@ LAG_MAX_REPRICE_AGE = 90     # seconds since last Kalshi price change to conside
 # pessimistic, model (the shadow's ~5s cadence is coarser than LAG's edge).
 LAG_MARKETABLE      = os.getenv("LAG_MARKETABLE", "true").lower() == "true"
 LAG_CROSS_CENTS     = int(float(os.getenv("LAG_CROSS_CENTS", "3")))  # cents above the ask to bid
+# Hard per-trade cap — LAG is a high-variance edge and the flat $20 stake blew
+# past a small balance (saw ~$19 bets on a $10 balance, same blowup class as
+# FADE). Never risk more than LAG_MAX_STAKE, nor LAG_MAX_BALANCE_PCT of balance.
+LAG_MAX_STAKE       = float(os.getenv("LAG_MAX_STAKE", "2"))
+LAG_MAX_BALANCE_PCT = float(os.getenv("LAG_MAX_BALANCE_PCT", "0.20"))
 CONSENSUS_MAX_PRICE = 0.55   # only trade consensus when price <= 55¢
 MOMENTUM_WINDOW     = 60     # seconds for BTC momentum calculation
 MIN_BOOK_SUM        = 0.97   # yes+no must sum >= 0.97 (liquid market check)
@@ -2489,6 +2494,12 @@ class LagStrategy:
             if ks > 0:
                 effective_stake = ks
                 kelly_stake = round(ks, 2)
+        # [v3.4] Hard cap regardless of Kelly/flat-stake path — bounds the
+        # high-variance LAG bet so a small balance can't be over-risked.
+        cap = LAG_MAX_STAKE
+        if balance:
+            cap = min(cap, balance * LAG_MAX_BALANCE_PCT)
+        effective_stake = min(effective_stake, cap)
         count = max(1, int(effective_stake / order_dollars))
 
         mkt_tag = f" [MKT +{LAG_CROSS_CENTS}c -> {order_cents}c]" if marketable else ""
